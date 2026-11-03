@@ -3,7 +3,7 @@
 This is a fork of [Niko1221/Strata](https://github.com/Niko1221/Strata), based on commit `c62d5e3` (engine 0.1.55). It makes Qwen3.8-Flash-Next IQ3_S
 generate faster on one PC by changing software only: same model, quant, context, RAM and VRAM use.
 
-**See every changed line:** [compare with upstream](https://github.com/Niko1221/Strata/compare/main...YOUR-USERNAME:Strata:speed-fork).
+**See every changed line:** [compare with upstream](https://github.com/Niko1221/Strata/compare/main...rafid-dev:Strata-32GB:speed-fork).
 **See every test, including what failed:** [docs/fork/WORKLOG.md](docs/fork/WORKLOG.md).
 
 ## Result

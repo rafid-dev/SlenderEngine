@@ -31,8 +31,8 @@ This uses most of your PC's memory while it runs. In testing, free RAM dropped t
 ## Easy setup
 
 ```bat
-git clone https://github.com/YOUR-USERNAME/Strata.git
-cd Strata
+git clone https://github.com/rafid-dev/Strata-32GB.git
+cd Strata-32GB
 FAST-SETUP.bat
 ```
 
