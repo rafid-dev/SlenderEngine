@@ -171,7 +171,10 @@ It was built and tested as a separate setup: `run-strata-candidate.bat`, `strata
 - **Stop drafting on low joint chance (`STRATA_SPEC_CUM_MIN`), 3 runs each:** reference 52.2, 0.3 53.3, 0.4 53.2, 0.5 50.2 tok/s. Within noise or worse. Not kept. All of this batch ran slower than the batch before it, while the PC was also in use; order was mixed.
 - **96 swaps again, this batch:** 49.9 against 52.2 tok/s; hit rate 61.5% against 56.9%, but +1.57 (+-0.90) ms per window at the same draft size, nearly all adapt wait.
 - **Each extra draft row costs 11-12 ms; acceptance is 79-83%, 70% and 61% for rows 1-3.**
-- **Runs fall into two modes with the same settings:** swap wait 0.04 or about 0.75 ms per window. The slow mode costs 1.37 ms per window overall. Cause not established; thread placement is being tested.
+- **Runs fall into two modes with the same settings:** swap wait 0.04 or about 0.75 ms per window. The slow mode costs 1.37 ms per window overall. Cause not established.
+- **Thread placement, 3 runs each:** reference 52.4 tok/s (48.9-55.7). Adapt job thread on an E-core (`STRATA_ADAPT_JOB_CPU=26`) 51.4. Host on logical 1 (`STRATA_HOST_CORE=sibling`) 35.1, with one run at 19.3 and GPU wait of 33 ms: rejected. Both together 53.1 (52.7-53.5), -1.19 (+-0.91) ms per window at the same draft size, which is not beyond noise. Not kept.
+- **Job thread on an E-core ended the slow swap mode in this batch:** tick 0.03-0.04 ms in all 6 runs, against 0.04-0.71 for the reference. But the draft got 0.6-0.8 ms slower, so the net gain is about zero.
+- **`FAST-SETUP.bat` output:** started from the generated launcher, ready in 26 s, 7 workers on the P-cores, 50.8 tok/s on one 400-token answer, stopped cleanly. A clean-clone install has not been run.
 
 ## Candidate screening (2026-11-03, 43 runs, mirrored order, 2 runs per candidate unless noted, reference 5 runs at 49.9 tok/s)
 
