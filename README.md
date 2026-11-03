@@ -1,6 +1,6 @@
 # Strata for 32 GB
 
-**Run Qwen3.8-Flash-Next with a 262K context on a normal 32 GB gaming PC, at 57 tok/s.**
+**Run Qwen3.8-Flash-Next IQ3_S with a 262K context on a normal 32 GB gaming PC, at 57 tok/s.**
 
 This is a speed-focused fork of [Strata](https://github.com/Niko1221/Strata). Strata streams a model too big for your GPU between VRAM, RAM and your SSD. This fork tunes that for one common kind of PC, and adds an option most PCs can already use: streaming the model from **two SSDs at once**.
 
@@ -36,7 +36,7 @@ cd Strata
 FAST-SETUP.bat
 ```
 
-That's the whole install. On the first run it downloads the model and builds the engine. Then it checks your PC, picks the settings and offers dual SSD streaming. When it finishes, start the model with:
+That's the whole install. On the first run it downloads Qwen3.8-Flash-Next IQ3_S and builds the engine. Then it checks your PC, picks the settings and offers dual SSD streaming. When it finishes, start the model with:
 
 ```bat
 run-fast.bat
