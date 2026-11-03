@@ -1735,6 +1735,7 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
         tl = Clock::now();
         wait_step(0);
         if (dt) g_dt.wait0_ms += hms(tl);
+        if (top2_env()) record_top2(0);
         drafts[0] = ((volatile int32_t*) h_out_)[0];
         float pj = ((volatile float*) h_prob_)[0];
         if (probs) probs[0] = pj;
@@ -1753,6 +1754,7 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
             tl = Clock::now();
             wait_step(j);
             if (dt) g_dt.waitj_ms += hms(tl);
+            if (top2_env()) record_top2(j);
             drafts[j] = ((volatile int32_t*) h_out_)[j];
             pj = ((volatile float*) h_prob_)[j];
             if (probs) probs[j] = pj;

@@ -56,8 +56,18 @@ int main() {
     // the other cards: sm_120 (RTX 50) and sm_100 get nothing from this file; the sm_86 / sm_60 tables are unchanged by the flag
     CHECK(nv_default_env(12, 0, false).empty());
     CHECK(nv_default_env(10, 0, false).empty());
-    CHECK(nv_default_env(8, 9, false).empty());
     CHECK(nv_default_env(7, 5, false).empty());
+    // sm_89 (RTX 40): the exact kernels, without the sm_86 table's adaptive-tier timing switches; STRATA_SM89_PERF=0 empties it
+    unset("STRATA_SM89_PERF");
+    {
+        const auto t = nv_default_env(8, 9, false);
+        CHECK(t.size() == 7);
+        CHECK(find(t, "STRATA_ATTN_DAILY") && *find(t, "STRATA_ATTN_DAILY") == "1");
+        CHECK(!find(t, "STRATA_ADAPT_NOWAIT") && !find(t, "STRATA_ADAPT_LAG"));
+    }
+    put("STRATA_SM89_PERF", "0");
+    CHECK(nv_default_env(8, 9, false).empty());
+    unset("STRATA_SM89_PERF");
     {
         const auto a = nv_default_env(8, 6, false), b = nv_default_env(8, 6, true);
         CHECK(!a.empty() && a == b);               // STRATA_DEFAULTS=026 does not touch the 2026-10 sm_86 table

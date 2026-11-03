@@ -38,6 +38,19 @@ std::vector<std::pair<std::string, std::string>> nv_default_env(int major, int m
             {"STRATA_QSA_ROWS", "1"},            // -0.5, -1.2
             {"STRATA_B6_MMVQ_ROWS", "1"},        // A4000 0, 3060 -1.7
         };
+    } else if (mj == 8 && mn == 9) {
+        if (off("STRATA_SM89_PERF")) return t;
+        t = {
+            // The sm_86 table's exact kernels (not its two adaptive-tier timing switches).  RTX 4070 Ti, IQ3_S, --adapt-async 1,
+            // 3 interleaved rounds of fresh engines: 38.2 -> 40.3 tok/s (+5.5%, every run above every reference run).
+            {"STRATA_CPU_IQ_ALL_EXACT1", "1"},
+            {"STRATA_SIDE_MIXER", "2"},
+            {"STRATA_ATTN_DAILY", "1"},
+            {"STRATA_GR_UP75", "1"},
+            {"STRATA_GU_SWIGLU", "1"},
+            {"STRATA_QSA_ROWS", "1"},
+            {"STRATA_B6_MMVQ_ROWS", "1"},
+        };
     } else if (mj == 6 && mn == 0) {
         if (off("STRATA_SM60_PERF")) return t;
         t = {
@@ -92,13 +105,14 @@ std::vector<std::string> apply_nv_defaults(int major, int minor) {
         set.push_back(kv.first);
     }
     if (!set.empty()) {
-        const bool sm86 = mj == 8;
+        const bool sm86 = mj == 8 && mn == 6;
+        const bool sm89 = mj == 8 && mn == 9;
         const bool sm121 = mj == 12 && mn == 1;
         // sm_86 / sm_60: bit-exact switches.  sm_121: the fused prompt path and the FP4-activation NVFP4 prompt round differently from the
         // paths they replace (24 of 24 greedy answers were identical on the Spark; no KL run), so the line does not say "exact".
         std::fprintf(stderr, "strata: %s: %zu %sspeed switches on by default (%s=0 turns them off%s; a switch you set is kept): ",
-                     sm86 ? "sm_86 (Ampere)" : sm121 ? "sm_121 (GB10)" : "sm_60 (Pascal)", set.size(), sm121 ? "" : "exact ",
-                     sm86 ? "STRATA_SM86_PERF" : sm121 ? "STRATA_SM121_PERF" : "STRATA_SM60_PERF",
+                     sm86 ? "sm_86 (Ampere)" : sm89 ? "sm_89 (Ada)" : sm121 ? "sm_121 (GB10)" : "sm_60 (Pascal)", set.size(), sm121 ? "" : "exact ",
+                     sm86 ? "STRATA_SM86_PERF" : sm89 ? "STRATA_SM89_PERF" : sm121 ? "STRATA_SM121_PERF" : "STRATA_SM60_PERF",
                      sm121 ? ", as does STRATA_DEFAULTS=026" : "");
         for (size_t i = 0; i < set.size(); ++i) std::fprintf(stderr, "%s%s", i ? " " : "", set[i].c_str() + 7);
         std::fprintf(stderr, "\n");

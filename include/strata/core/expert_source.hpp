@@ -833,6 +833,9 @@ public:
     /// STRATA_RAM_ADAPT: the same move as replace_resident, but `in` is copied out of the finished stage buffer
     /// a demand read left it in (no file read).  False, nothing changed, when `in` is not staged or still filling.
     bool replace_resident_staged(int64_t layer, int64_t in, int64_t out);
+    /// STRATA_RAM_ADAPT_PAR=1: a round's staged moves together, the copies shared with the kept reader threads.  moved[i]: pair i moved.
+    struct RamMove { int32_t layer, in, out; };
+    void replace_resident_staged_many(const RamMove* m, int n, uint8_t* moved, bool during_round = false);
     int64_t ram_adapts() const { return ram_adapts_; }
     int64_t ram_staged() const { return ram_staged_; }   ///< of ram_adapts(): copied out of a stage buffer
     // ---- 149-prefetch (STRATA_RAM_ADAPT2): the same promotion, staged.  `ram_stage` queues the read of `in` on an I/O thread
@@ -942,7 +945,15 @@ public:
     bool io_sched() const { return io_sched_; }
     bool wants_scores() const override { return io_sched_ && io_pf_; }
     /// Not when the reads are unbuffered: the warmed pages would be read through the file cache, a second time.
-    bool warms() const override { return (!role_ptr_.empty() || io_pf_) && direct_.empty(); }
+    bool warms() const override { return direct_.empty() ? !role_ptr_.empty() || io_pf_ : direct_ahead_; }
+    /// Windows, an unbuffered experts.bin (STRATA_DIRECT_AHEAD, default 2 threads, 0 off): `warm` reads the predicted blobs into
+    /// the stage buffers on `threads` threads, so the layer that routes to them finds them there or on the way.  Only reads
+    /// ahead: what `blob` returns is unchanged.
+    void set_direct_ahead(int threads);
+    int64_t direct_ahead_read() const { return da_read_.load(std::memory_order_relaxed); }
+    int64_t direct_ahead_late() const { return da_late_.load(std::memory_order_relaxed); }
+    int64_t direct_ahead_used() const { return io_pf_used_.load(std::memory_order_relaxed); }
+    int64_t direct_ahead_unused() const { return io_pf_unused_.load(std::memory_order_relaxed); }
     /// Of the blobs the file tier read for the decode, how many had been warmed for their layer beforehand.
     int64_t warmed_hits() const { return warm_hits_.load(std::memory_order_relaxed); }
     int64_t warmed() const { return warm_count_.load(std::memory_order_relaxed); }
@@ -999,7 +1010,7 @@ private:
     bool claim_stage(int64_t key, size_t& v, bool& fill, bool ahead = false);
     bool fill_stage(size_t v, int64_t layer, int64_t expert, uint8_t* dst);
     void publish_stage(size_t v, int64_t layer, bool ok, double us);
-    struct Fill { size_t v; int64_t layer, e; uint8_t* dst; };
+    struct Fill { size_t v; int64_t layer, e; uint8_t* dst; bool in_place = false; };   ///< in_place: see stage_in_place_
     /// The claimed buffers' blobs: one overlapped batch when unbuffered, else the fetch threads' mapped copies.
     void fill_many(const std::vector<Fill>& todo);
     /// 149-cold: the claim half of `prefetch` (the blobs this call must fill; pending[i] = 1 for those, if given)
@@ -1061,6 +1072,24 @@ private:
     int64_t gate_closed_w_ = 0, gate_flips_ = 0;
     std::vector<Fill> async_todo_;
     std::vector<std::thread> async_th_;
+    // STRATA_COLD_KEPT_READERS=1 (with STRATA_COLD_OVERLAP=1): the reads on threads kept between layers, not started per layer
+    struct KeptReaders {
+        ~KeptReaders();
+        void run(int n, std::function<void()> f);
+        void wait();
+        bool busy() const { return left.load(std::memory_order_acquire) > 0; }
+    private:
+        void loop(int idx);
+        std::vector<std::thread> th;
+        std::mutex m;
+        std::condition_variable cv;
+        std::function<void()> work;
+        std::atomic<uint64_t> gen{0};
+        std::atomic<int> left{0};
+        int want = 0;
+        bool stop = false, sleeping0 = false;
+    };
+    KeptReaders kept_readers_;
     std::atomic<size_t> async_next_{0};
     std::atomic<int64_t> async_end_ns_{0};
     std::chrono::steady_clock::time_point async_t0_{};
@@ -1074,6 +1103,7 @@ private:
     std::vector<std::string> paths_;          ///< the mapped files, as maps_
     std::vector<void*> pdirect_;              ///< open_prompt_direct: O_DIRECT fds for copy_blobs only
     std::vector<void*> direct_;               ///< #286: per file, an unbuffered handle (Windows) or O_DIRECT fd (Linux)
+    void* direct_mirror_ = nullptr;           ///< Windows, STRATA_EXPERTS_MIRROR: experts.bin's copy on another drive; each read is split between the two
     std::vector<int> role_file_;              ///< 3 x n_layers: index into maps_ / direct_
     /// blobs assembled in the stage buffers (`blob` hands those out): the GGUF in place, or any unbuffered source
     bool staged() const { return !role_ptr_.empty() || !direct_.empty() || io_pf_; }
@@ -1104,11 +1134,28 @@ private:
     // the transfer rate, with the calling thread doing it.  `pinned` picks the free (defined in the .cpp: the
     // header has no cuda_runtime.h).
     struct StageBufFree {
-        bool pinned = false;
+        bool pinned = false, aligned = false;
         void operator()(uint8_t* p) const noexcept;
     };
     std::mutex stage_mu_;
     std::vector<std::unique_ptr<uint8_t[], StageBufFree>> stage_buf_;
+    // Windows, an unbuffered experts.bin (STRATA_DIRECT_IN_PLACE=0: off): the buffers are sector-aligned and the drive reads the
+    // blob's sectors straight into one, the blob `stage_skip_` bytes in, with no copy out of a scratch buffer.
+    std::vector<uint32_t> stage_skip_;
+    std::vector<char> stage_in_place_;
+    uint8_t* stage_ptr(size_t v) const { return stage_buf_[v].get() + stage_skip_[v]; }
+    Fill stage_fill(size_t v, int64_t layer, int64_t e) const { return {v, layer, e, stage_ptr(v), stage_in_place_[v] != 0}; }
+    // set_direct_ahead: the read-ahead's queue and threads
+    struct AheadItem { int64_t layer, e; uint64_t epoch; };
+    void direct_ahead_run();
+    void direct_ahead_stop();
+    bool direct_ahead_ = false;
+    bool da_quit_ = false;
+    std::deque<AheadItem> da_q_;
+    std::mutex da_mu_;
+    std::condition_variable da_cv_;
+    std::vector<std::thread> da_workers_;
+    std::atomic<int64_t> da_read_{0}, da_late_{0};
     std::vector<int64_t> stage_key_;
     std::vector<uint64_t> stage_epoch_, stage_used_;
     std::vector<char> stage_busy_;            ///< being filled (outside stage_mu_): never a victim

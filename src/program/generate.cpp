@@ -2898,6 +2898,17 @@ int main(int argc, char** argv) {
     // pipe or a file is block-buffered, so a program that dies loses every line it had already printed - which
     // turns "it crashed at step 7" into "it crashed somewhere", and the difference is a debugging session.
     std::setvbuf(stdout, nullptr, _IONBF, 0);
+#if defined(_WIN32)
+    // STRATA_PROC_HIGH=1 (opt-in): above other apps, and never power-throttled onto slower clocks when the window is in the background
+    if (const char* e = std::getenv("STRATA_PROC_HIGH"); e != nullptr && e[0] == '1') {
+        (void) SetPriorityClass(GetCurrentProcess(), HIGH_PRIORITY_CLASS);
+        PROCESS_POWER_THROTTLING_STATE pt{};
+        pt.Version = PROCESS_POWER_THROTTLING_CURRENT_VERSION;
+        pt.ControlMask = PROCESS_POWER_THROTTLING_EXECUTION_SPEED;
+        pt.StateMask = 0;
+        (void) SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &pt, sizeof pt);
+    }
+#endif
 #if defined(STRATA_USE_HIP) && defined(_WIN32)
     {   // 0.2.1.2: hipblas / libhipblaslt / rocblas are delay-loaded (CMakeLists.txt) and live in <exe folder>\rocm\bin, which only the
         // launcher puts on PATH; make the folder part of this process's DLL search, so `strata.exe --version` run straight from the
@@ -7738,6 +7749,12 @@ int main(int argc, char** argv) {
                           [] { const char* v = std::getenv("STRATA_FS_AHEAD"); return v == nullptr || std::atoi(v) != 0; }();
     // STRATA_LOOKAHEAD_STATS=1 (measurement only): run the predictor on any tier and score it against the real routing
     const bool la_stats = srcp != nullptr && [] { const char* v = std::getenv("STRATA_LOOKAHEAD_STATS"); return v != nullptr && std::atoi(v) != 0; }();
+    // Windows, an unbuffered experts.bin: the prediction reads ahead into the stage buffers (STRATA_DIRECT_AHEAD: threads,
+    // default off: on an RTX 4070 Ti only about 28% of the blobs read were used, and text ran about 18% slower with it on)
+    if (srcp == &src) {
+        const char* v = std::getenv("STRATA_DIRECT_AHEAD");
+        src.set_direct_ahead(v != nullptr ? std::atoi(v) : 0);
+    }
     if (srcp != nullptr && ((srcp == &src && src.warms()) || fs_ahead || la_stats) &&
         [] { const char* v = std::getenv("STRATA_LOOKAHEAD"); return v == nullptr || std::atoi(v) != 0; }()) {
         std::vector<std::vector<uint16_t>> routers((size_t) g.n_layers);
@@ -11670,6 +11687,14 @@ int main(int argc, char** argv) {
         struct AHome { strata::core::ExpertCache* cache; cudaStream_t stream; cudaEvent_t ev; int dev; bool used; };
         enum class AState { Idle, Pick, CopyBack, SwapIn, RamFence, Commit };
         AState astate = AState::Idle;
+        // STRATA_ADAPT_TIMING=1: where the wait before a window goes (ms, summed over a request)
+        static const bool at_on = std::getenv("STRATA_ADAPT_TIMING") != nullptr;
+        double at_ram = 0, at_snap = 0, at_back = 0, at_res = 0, at_flip = 0, at_rel = 0, at_pend = 0, at_tick = 0;
+        struct AtT {
+            double& acc;
+            Clock::time_point t0 = at_on ? Clock::now() : Clock::time_point{};
+            ~AtT() { if (at_on) acc += std::chrono::duration<double, std::milli>(Clock::now() - t0).count(); }
+        };
         std::vector<ASwap> aswaps;
         std::vector<float> a_usage;
         std::vector<int32_t> a_res;
@@ -11681,6 +11706,7 @@ int main(int argc, char** argv) {
         size_t a_lo = 0, a_hi = 0, a_bi = 0;   // the batch being copied in (a_copy_in), and where the next one starts
         std::vector<AHome> ahomes;   // [0] = CUDA0's cache, [k] = layer split stage k's
         std::unique_ptr<JobThread> ajob;
+        std::unique_ptr<JobThread> ram_bg_job;   // STRATA_RAM_ADAPT_BG
         // the arena mode (srcp == &arena_src): every expert is in the arena already, so a round is a copy in only - no
         // exchange buffers, no RAM moves (see a_arena below)
         const bool a_arena = srcp == &arena_src;
@@ -11729,6 +11755,7 @@ int main(int argc, char** argv) {
             (void) cudaStreamQuery(h.stream);
             h.used = true;
         };
+        static const float a_ssd_boost = [] { const char* v = std::getenv("STRATA_ADAPT_SSD_BOOST"); return v != nullptr ? (float) std::atof(v) : 1.0f; }();
         auto a_pick = [&]() {   // step 1's choice (host work)
             struct C { float gain; int32_t layer, in, out; };
             std::vector<C> all;
@@ -11739,7 +11766,8 @@ int main(int argc, char** argv) {
                 const float* u = a_usage.data() + l * g.n_expert;
                 const int32_t* r = a_res.data() + l * g.n_expert;
                 for (int32_t e = 0; e < (int32_t) g.n_expert; ++e) {
-                    if (r[e] < 0) { if (u[e] >= 2.0f && !helper_holds(l, e)) cand.emplace_back(u[e], e); }
+                    // STRATA_ADAPT_SSD_BOOST=B (opt-in, default 1): a candidate the RAM copy lacks counts B times, as each of its misses is a file read
+                    if (r[e] < 0) { if (u[e] >= 2.0f && !helper_holds(l, e)) cand.emplace_back(a_ssd_boost != 1.0f && !src.has_resident(l, e) ? u[e] * a_ssd_boost : u[e], e); }
                     else vict.emplace_back(u[e], e);
                 }
                 if (cand.empty() || vict.empty()) continue;
@@ -11903,11 +11931,14 @@ int main(int argc, char** argv) {
                     a_last = a_win;
                     ++a_rounds;
                     a_t0 = Clock::now();
-                    a_usage = drive.d.usage;
-                    a_res = host_res;
-                    // #477: the routing counted, as adapt() counts it (--expert-profile-save; else `heat` is empty)
-                    for (size_t i = 0; i < heat.size(); ++i) heat[i] += (double) drive.d.usage[i];
-                    for (float& v : drive.d.usage) v *= o.adapt_decay;
+                    {
+                        const AtT at{at_snap};
+                        a_usage = drive.d.usage;
+                        a_res = host_res;
+                        // #477: the routing counted, as adapt() counts it (--expert-profile-save; else `heat` is empty)
+                        for (size_t i = 0; i < heat.size(); ++i) heat[i] += (double) drive.d.usage[i];
+                        for (float& v : drive.d.usage) v *= o.adapt_decay;
+                    }
                     if (a_inline) {   // the arena: choose here (no copy back to wait for), then straight on to step 2
                         const Clock::time_point tp0 = Clock::now();
                         a_pick();
@@ -11935,6 +11966,7 @@ int main(int argc, char** argv) {
                     if (a_due(a_back_due)) return true;   // (pipelined) a card not seen idle since the choice
                     if (!a_ready(drain)) return true;
                     if (a_err.load()) return false;
+                    const AtT at_b{at_back};
                     size_t k = 0;
                     for (size_t i = 0; i < aswaps.size(); ++i) {
                         const ASwap w = aswaps[i];
@@ -11961,7 +11993,7 @@ int main(int argc, char** argv) {
                         for (const ASwap& w : aswaps) a_in_due[(size_t) w.home] = 1;
                         ajob->post(a_stage_in);
                     } else {
-                        res_upload();
+                        { const AtT at{at_res}; res_upload(); }
                         a_lo = a_hi = a_bi = 0;
                         a_post_batch();
                     }
@@ -11973,13 +12005,16 @@ int main(int argc, char** argv) {
                     if (a_due(a_in_due)) return true;   // (pipelined) a card not seen idle since step 2
                     if (!a_ready(drain || a_wait)) return true;
                     if (a_err.load()) return false;
+                    {
+                    const AtT at_r{at_rel};
                     for (size_t i = pl ? 0 : a_lo; i < (pl ? aswaps.size() : a_hi); ++i) {   // (the batch just landed)
                         const ASwap& w = aswaps[i];
                         host_res[(size_t) w.layer * g.n_expert + w.in] = w.slot;
                         srcp->release(w.layer, w.in);
                     }
+                    }
                     if (pl) a_res_dirty = true;
-                    else res_upload();
+                    else { const AtT at{at_res}; res_upload(); }
                     a_swapped += pl ? (int64_t) aswaps.size() : (int64_t) (a_hi - a_lo);
                     if (!pl && a_bi < aswaps.size()) {   // the arena's cap: the next batch goes now
                         for (AHome& h : ahomes) h.used = false;
@@ -12012,8 +12047,8 @@ int main(int argc, char** argv) {
                 case AState::Commit:   // step 4
                     if (!a_ready(drain)) return true;
                     if (a_err.load()) return false;
-                    if (!a_arena) src.commit_flip();
-                    a_ms += std::chrono::duration<double, std::milli>(Clock::now() - a_t0).count();
+                    if (!a_arena) { const AtT at{at_flip}; src.commit_flip(); }
+                    a_ms +=std::chrono::duration<double, std::milli>(Clock::now() - a_t0).count();
                     aswaps.clear();
                     astate = AState::Idle;
                     continue;   // a round due now starts at this same boundary
@@ -12150,6 +12185,25 @@ int main(int argc, char** argv) {
                 float* sd = ram_adapt2.seed.data() + l * g.n_expert;
                 for (int64_t i = 0; i < n; ++i)
                     if (ids[i] >= 0 && ids[i] < g.n_expert) sd[ids[i]] += per;
+            };
+        }
+        // STRATA_PROMPT_TRACE=<path> (measurement only): the prompt's routing per layer and chunk: int64 microseconds, int32 layer,
+        // int32 entries, then one int32 count per expert
+        if (const char* ptv = std::getenv("STRATA_PROMPT_TRACE"); ptv != nullptr && *ptv != 0) {
+            static std::FILE* ptf = std::fopen(ptv, "ab");
+            auto seed_routes = std::move(sp.on_routes);
+            sp.on_routes = [seed_routes = std::move(seed_routes), ne = g.n_expert](int64_t l, const int32_t* ids, int64_t n) {
+                if (seed_routes) seed_routes(l, ids, n);
+                if (ptf == nullptr) return;
+                std::vector<int32_t> h((size_t) ne, 0);
+                for (int64_t i = 0; i < n; ++i)
+                    if (ids[i] >= 0 && ids[i] < ne) ++h[(size_t) ids[i]];
+                const int64_t us = std::chrono::duration_cast<std::chrono::microseconds>(Clock::now().time_since_epoch()).count();
+                const int32_t head[2] = {(int32_t) l, (int32_t) n};
+                std::fwrite(&us, sizeof us, 1, ptf);
+                std::fwrite(head, sizeof head, 1, ptf);
+                std::fwrite(h.data(), sizeof(int32_t), h.size(), ptf);
+                std::fflush(ptf);
             };
         }
         // STRATA_TRACE=1: one stderr line per step of a request (the log shows where a request stops)
@@ -16756,7 +16810,11 @@ int main(int argc, char** argv) {
                         T = std::clamp(chain_rows, 1, S_mtp);
                     } else if (use_mtp && req_spec_min_p > 0.0) {
                         T = 1;
-                        while (T < S_mtp && dprob[(size_t) T - 1] >= (float) req_spec_min_p) ++T;
+                        // STRATA_SPEC_CUM_MIN=x (opt-in): also stop when the chance that every draft so far holds falls below x: a row is paid
+                        // for whether or not it is reached
+                        static const float spec_cum_min = [] { const char* v = std::getenv("STRATA_SPEC_CUM_MIN"); return v != nullptr ? (float) std::atof(v) : 0.0f; }();
+                        float spec_cum = 1.0f;
+                        while (T < S_mtp && dprob[(size_t) T - 1] >= (float) req_spec_min_p && (spec_cum *= dprob[(size_t) T - 1]) >= spec_cum_min) ++T;
                     }
                     if (first_window) T = merge_T > 0 ? merge_T : 1;
                     // a repeat of earlier context (prompt lookup) where the MTP's own first guess agrees: the policy takes it
@@ -16838,6 +16896,80 @@ int main(int argc, char** argv) {
                     const char* e = std::getenv("STRATA_RAM_ADAPT");
                     return e != nullptr ? std::max(0, std::atoi(e)) : 0;
                 }();
+                // STRATA_RAM_ADAPT_BG=1 (opt-in): the RAM moves below run on a helper thread during the draft, which reads nothing of the
+                // copy, and are joined right after it, instead of holding the host before the window.  The same moves, a window's copy earlier.
+                static const bool ram_adapt_bg = [] { const char* e = std::getenv("STRATA_RAM_ADAPT_BG"); return e != nullptr && e[0] == '1'; }();
+                // STRATA_RAM_ADAPT_ANY=1 (opt-in, with _BG): the RAM moves also run while a VRAM round is in flight, leaving out that round's
+                // experts.  Only during the draft (no window reads anything) and with the round's job idle (it may be choosing otherwise).
+                static const bool ram_adapt_any = [] { const char* e = std::getenv("STRATA_RAM_ADAPT_ANY"); return ram_adapt_bg && e != nullptr && e[0] == '1'; }();
+                auto ram_adapt_round_due = [&]() {
+                    return ram_adapt_n > 0 && !first_window && !drive.d.usage.empty() && pending.empty() &&
+                           (!ajob || astate == AState::Idle || (ram_adapt_any && ajob->idle())) && src.complement_ready() && !multi_gpu && !peer.valid() &&
+                           !remote_opt && o.batch == 0;
+                };
+                auto ram_adapt_round = [&]() {
+                    // up to kRamAdaptPerLayer pairs a layer: the layer's most routed experts outside the copy against its least
+                    // routed ones in it, paired in that order while the outgoing one is still unused
+                    // (STRATA_RAM_ADAPT_ROUTED, STRATA_RAM_ADAPT_UNUSED: the two counts)
+                    static const float kRamAdaptRouted = [] { const char* v = std::getenv("STRATA_RAM_ADAPT_ROUTED"); return v != nullptr ? (float) std::atof(v) : 2.0f; }();
+                    static const float kRamAdaptUnused = [] { const char* v = std::getenv("STRATA_RAM_ADAPT_UNUSED"); return v != nullptr ? (float) std::atof(v) : 0.5f; }();
+                    static const size_t kRamAdaptPerLayer = [] { const char* v = std::getenv("STRATA_RAM_ADAPT_PER"); return v != nullptr ? (size_t) std::max(1, std::atoi(v)) : (size_t) 4; }();
+                    struct RamSwap { float gain; int32_t layer, in, out; };
+                    std::vector<RamSwap> swaps;
+                    std::vector<int32_t> ins, outs;
+                    const bool in_round = ajob && astate != AState::Idle;
+                    static std::vector<uint8_t> round_excl;
+                    if (in_round) {
+                        round_excl.assign((size_t) (g.n_layers * g.n_expert), 0);
+                        for (const ASwap& w : aswaps) {
+                            round_excl[(size_t) w.layer * g.n_expert + w.in] = 1;
+                            round_excl[(size_t) w.layer * g.n_expert + w.out] = 1;
+                        }
+                    }
+                    for (int64_t l = 0; l < g.n_layers; ++l) {
+                        const float* u = drive.d.usage.data() + l * g.n_expert;
+                        const int32_t* r = host_res.data() + l * g.n_expert;
+                        const uint8_t* ex = in_round ? round_excl.data() + l * g.n_expert : nullptr;
+                        ins.clear();
+                        outs.clear();
+                        for (int32_t e = 0; e < (int32_t) g.n_expert; ++e) {
+                            if (r[e] >= 0) continue;   // in VRAM: the RAM copy does not hold it
+                            if (ex != nullptr && ex[e]) continue;   // the round in flight is moving it
+                            if (src.has_resident(l, e)) outs.push_back(e);
+                            else if (u[e] >= kRamAdaptRouted) ins.push_back(e);
+                        }
+                        const size_t ni = std::min(ins.size(), kRamAdaptPerLayer), no = std::min(outs.size(), kRamAdaptPerLayer);
+                        std::partial_sort(ins.begin(), ins.begin() + (std::ptrdiff_t) ni, ins.end(),
+                                          [&](int32_t a, int32_t b) { return u[a] > u[b]; });
+                        std::partial_sort(outs.begin(), outs.begin() + (std::ptrdiff_t) no, outs.end(),
+                                          [&](int32_t a, int32_t b) { return u[a] < u[b]; });
+                        for (size_t i = 0; i < ni && i < no && u[outs[i]] < kRamAdaptUnused; ++i) {
+                            if (ram_adapt_any && u[ins[i]] <= u[outs[i]]) break;   // with a low bar the pairs could undo each other
+                            swaps.push_back({u[ins[i]] - u[outs[i]], (int32_t) l, ins[i], outs[i]});
+                        }
+                    }
+                    std::sort(swaps.begin(), swaps.end(),
+                              [](const RamSwap& a, const RamSwap& b) { return a.gain > b.gain; });
+                    // the incoming expert was usually just read for the window before: a pair whose `in` still sits in that
+                    // read's stage buffer moves with a copy out of it (no file read); n caps only the pairs that need the file read
+                    int file_left = ram_adapt_n;
+                    // STRATA_RAM_ADAPT_PAR=1 (opt-in): the staged copies of the round together, on several threads (the same moves)
+                    static const bool ram_adapt_par = [] { const char* e = std::getenv("STRATA_RAM_ADAPT_PAR"); return e != nullptr && e[0] == '1'; }();
+                    if (ram_adapt_par) {
+                        std::vector<strata::core::FileExpertSource::RamMove> many;
+                        many.reserve(swaps.size());
+                        for (const RamSwap& x : swaps) many.push_back({x.layer, x.in, x.out});
+                        std::vector<uint8_t> moved(swaps.size());
+                        src.replace_resident_staged_many(many.data(), (int) many.size(), moved.data(), in_round);
+                        for (size_t i = 0; i < swaps.size() && file_left > 0 && !in_round; ++i)
+                            if (!moved[i]) { --file_left; src.replace_resident(swaps[i].layer, swaps[i].in, swaps[i].out); }
+                        return;
+                    }
+                    for (const RamSwap& x : swaps) {
+                        if (src.replace_resident_staged(x.layer, x.in, x.out)) continue;
+                        if (file_left > 0) { --file_left; src.replace_resident(x.layer, x.in, x.out); }
+                    }
+                };
                 if (ram_adapt_n > 0 && ram_adapt2.on && !first_window && !drive.d.usage.empty() && pending.empty() &&
                     (!ajob || astate == AState::Idle) && src.complement_ready() && !multi_gpu && !peer.valid() &&
                     !remote_opt && o.batch == 0) {
@@ -16910,46 +17042,13 @@ int main(int argc, char** argv) {
                         if (staged_n >= ram_adapt_n) break;
                         if (src.ram_stage(x.layer, x.in, x.out)) ++staged_n;
                     }
-                } else
-                if (ram_adapt_n > 0 && !first_window && !drive.d.usage.empty() && pending.empty() &&
-                    (!ajob || astate == AState::Idle) && src.complement_ready() && !multi_gpu && !peer.valid() &&
-                    !remote_opt && o.batch == 0) {
-                    // up to kRamAdaptPerLayer pairs a layer: the layer's most routed experts outside the copy against its least
-                    // routed ones in it, paired in that order while the outgoing one is still unused
-                    constexpr float kRamAdaptRouted = 2.0f, kRamAdaptUnused = 0.5f;
-                    constexpr size_t kRamAdaptPerLayer = 4;
-                    struct RamSwap { float gain; int32_t layer, in, out; };
-                    std::vector<RamSwap> swaps;
-                    std::vector<int32_t> ins, outs;
-                    for (int64_t l = 0; l < g.n_layers; ++l) {
-                        const float* u = drive.d.usage.data() + l * g.n_expert;
-                        const int32_t* r = host_res.data() + l * g.n_expert;
-                        ins.clear();
-                        outs.clear();
-                        for (int32_t e = 0; e < (int32_t) g.n_expert; ++e) {
-                            if (r[e] >= 0) continue;   // in VRAM: the RAM copy does not hold it
-                            if (src.has_resident(l, e)) outs.push_back(e);
-                            else if (u[e] >= kRamAdaptRouted) ins.push_back(e);
-                        }
-                        const size_t ni = std::min(ins.size(), kRamAdaptPerLayer), no = std::min(outs.size(), kRamAdaptPerLayer);
-                        std::partial_sort(ins.begin(), ins.begin() + (std::ptrdiff_t) ni, ins.end(),
-                                          [&](int32_t a, int32_t b) { return u[a] > u[b]; });
-                        std::partial_sort(outs.begin(), outs.begin() + (std::ptrdiff_t) no, outs.end(),
-                                          [&](int32_t a, int32_t b) { return u[a] < u[b]; });
-                        for (size_t i = 0; i < ni && i < no && u[outs[i]] < kRamAdaptUnused; ++i)
-                            swaps.push_back({u[ins[i]] - u[outs[i]], (int32_t) l, ins[i], outs[i]});
-                    }
-                    std::sort(swaps.begin(), swaps.end(),
-                              [](const RamSwap& a, const RamSwap& b) { return a.gain > b.gain; });
-                    // the incoming expert was usually just read for the window before: a pair whose `in` still sits in that
-                    // read's stage buffer moves with a copy out of it (no file read); n caps only the pairs that need the file read
-                    int file_left = ram_adapt_n;
-                    for (const RamSwap& x : swaps) {
-                        if (src.replace_resident_staged(x.layer, x.in, x.out)) continue;
-                        if (file_left > 0) { --file_left; src.replace_resident(x.layer, x.in, x.out); }
-                    }
+                } else if (!ram_adapt_bg && ram_adapt_round_due()) {
+                    const AtT at{at_ram};
+                    ram_adapt_round();
                 }
-                if (!adapt_tick(false)) {   // --adapt-async: the round in flight moves on a step when it can
+                bool tick_ok;
+                { const AtT at_tk{at_tick}; tick_ok = adapt_tick(false); }
+                if (!tick_ok) {   // --adapt-async: the round in flight moves on a step when it can
                     std::printf("ERR an adaptive refill failed\n");
                     return 1;
                 }
@@ -17001,6 +17100,19 @@ int main(int argc, char** argv) {
                 }
                 int a = merged ? T - 1 : 0;   // a merged window commits every row, as the prompt windows do
                 while (a < T - 1 && window[(size_t) a + 1] == outv[(size_t) a]) ++a;
+                // STRATA_WINDOW_TRACE=<path> (measurement only): one text line per decode window, in the order of STRATA_ROUTE_TRACE's
+                // layer-0 records: microseconds, 1 for a request's first window, merged, T, accepted, the input tokens, the output after them
+                static std::FILE* wtrace = [] {
+                    const char* v = std::getenv("STRATA_WINDOW_TRACE");
+                    return v != nullptr && *v != 0 ? std::fopen(v, "a") : nullptr;
+                }();
+                if (wtrace != nullptr) {
+                    std::fprintf(wtrace, "%lld %d %d %d %d", (long long) std::chrono::duration_cast<std::chrono::microseconds>(Clock::now().time_since_epoch()).count(),
+                                 first_window ? 1 : 0, merged ? 1 : 0, T, a);
+                    for (int i = 0; i < T; ++i) std::fprintf(wtrace, " %d", (int) window[(size_t) i]);
+                    std::fprintf(wtrace, " %d\n", (int) outv[(size_t) a]);
+                    std::fflush(wtrace);
+                }
                 if (from_sfx) { ++sfx_windows; sfx_drafts += T - 1; sfx_ok += a; }
                 if (chain_n > 0) { ++chain_windows; chain_drafts += chain_n; chain_ok += std::max(0, a - (T_mtp - 1)); }
                 if (!from_sfx && !first_window)
@@ -17062,10 +17174,16 @@ int main(int argc, char** argv) {
                 if (use_mtp && hist_n > 0 && mtp.coupled() && !eos && produced_n < max_new)
                     mtp.set_draft_history(consumed.data(), (int64_t) consumed.size(), outv[(size_t) a]);
                 generation = {};   // a skipped or failed production must not expose an older q view
+                const bool ram_bg_now = ram_adapt_bg && !ram_adapt2.on && !eos && ram_adapt_round_due();
+                if (ram_bg_now) {
+                    if (!ram_bg_job) ram_bg_job = std::make_unique<JobThread>();
+                    ram_bg_job->post(ram_adapt_round);
+                }
                 const GatedDraftLimit draft_limit(mtp, gated_proposal, S_mtp, p + a + 1, o.max_context);
                 const bool drafted = !use_mtp || eos || produced_n >= max_new ||
                                      mtp.draft(T, outv.data(), p, a, drafts.data(), err, dprob.data(), (float) req_spec_min_p,
                                                nullptr, gated_proposal ? &generation : nullptr);
+                if (ram_bg_now) ram_bg_job->wait();
                 {
                     const Clock::time_point tw3 = Clock::now();
                     auto msd = [](Clock::time_point a0, Clock::time_point b0) { return std::chrono::duration<double, std::milli>(b0 - a0).count(); };
@@ -17163,6 +17281,11 @@ int main(int argc, char** argv) {
                                  (d1.host - ds0.host) / w, dt_commit / w, dt_draft / w, (d1.misses - ds0.misses) / (w * L),
                                  (d1.entries - ds0.entries) / (w * L), (d1.hits - ds0.hits) / (w * L), (d1.pcie - ds0.pcie) / (w * L),
                                  dt_adapt_wait / w, dt_adapt_join / w, (double) ((ajob ? a_swapped : adapt_nswaps) - dt_sw0) / w);
+                }
+                if (at_on) {
+                    std::fprintf(stderr, "strata adapt timing: RAM moves %.2f, snapshot %.2f, copies back %.2f (table upload %.2f), flip %.2f, release %.2f, pending %.2f, whole tick %.2f ms/window\n",
+                                 at_ram / w, at_snap / w, at_back / w, at_res / w, at_flip / w, at_rel / w, at_pend / w, at_tick / w);
+                    at_ram = at_snap = at_back = at_res = at_flip = at_rel = at_pend = at_tick = 0;
                 }
                 if (aov)
                     std::fprintf(stderr, "strata decode adapt overlap: %lld windows took swaps still landing, a layer waited %.2f ms in all so far\n",
@@ -17576,6 +17699,10 @@ int main(int argc, char** argv) {
                     fb_prev = fb;
                 }
             }
+            if (src.direct_ahead_read() > 0)   // cumulative
+                std::fprintf(stderr, "strata serve: read-ahead: %lld blobs read, %lld used by a layer, %lld never asked for, %lld too late to read\n",
+                             (long long) src.direct_ahead_read(), (long long) src.direct_ahead_used(),
+                             (long long) src.direct_ahead_unused(), (long long) src.direct_ahead_late());
             static const bool cold_log = std::getenv("STRATA_COLD_OVERLAP") != nullptr || std::getenv("STRATA_IO_STATS") != nullptr;
             if (drive.d.cold_mode != 0 && cold_log) {   // 149-cold STRATA_COLD_OVERLAP: this request's layers that had a blob to read
                 static strata::core::ExpertDispatch cp;
