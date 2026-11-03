@@ -33,7 +33,7 @@ This has only been measured on the PC above. Other cards and CPUs may gain less 
 
 ## Settings used for the result
 
-These are upstream options plus the switches above. Adjust the CPU numbers and the path for your PC.
+`FAST-SETUP.bat` works these out for your PC ([README](README.md#easy-setup)). By hand, they are upstream options plus the switches above. Adjust the CPU numbers and the path for your PC.
 
 ```bat
 set STRATA_RAM_ADAPT=1

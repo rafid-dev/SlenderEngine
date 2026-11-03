@@ -1,196 +1,112 @@
-> **This is a speed-focused fork of [Niko1221/Strata](https://github.com/Niko1221/Strata).** Qwen3.8-Flash-Next IQ3_S went from 37.6 to 57.3 tok/s on one RTX 4070 Ti PC, software only. [See what changed and how it was measured.](FORK.md)
+# Strata for 32 GB
 
-<p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="apps/host/public/brand/strata-lockup-dark.svg">
-    <img src="apps/host/public/brand/strata-lockup-light.svg" alt="Strata" width="340">
-  </picture>
-</p>
+**Run Qwen3.8-Flash-Next with a 262K context on a normal 32 GB gaming PC, at 57 tok/s.**
 
-<h3 align="center">Run powerful AI on your own computer.</h3>
-<p align="center">Chat, code and work with images, locally.</p>
+This is a speed-focused fork of [Strata](https://github.com/Niko1221/Strata). Strata streams a model too big for your GPU between VRAM, RAM and your SSD. This fork tunes that for one common kind of PC, and adds an option most PCs can already use: streaming the model from **two SSDs at once**.
 
-<p align="center">
-  <a href="#models">Models</a> · <a href="#install"><b>Install</b></a> ·
-  <a href="#hardware">Hardware</a> · <a href="#tools">Tools</a> ·
-  <a href="#help">Help</a> · <a href="#support-strata">Support</a>
-</p>
+Software only: the model, quant and memory use are unchanged.
 
-<p align="center">
-  <a href="https://github.com/Niko1221/Strata/releases/latest"><img src="https://img.shields.io/github/v/release/Niko1221/Strata?label=download&color=0ab887" alt="Download Strata"></a>
-  <a href="LICENSE"><img src="https://img.shields.io/github/license/Niko1221/Strata" alt="MIT license"></a>
-  <a href="https://buymeacoffee.com/strataengine"><img src="https://img.shields.io/badge/Buy_me_a_coffee-FFDD00?logo=buymeacoffee&logoColor=000" alt="Support Strata on Buy Me a Coffee"></a>
-</p>
+| Measured, 5 runs each, same day | Strata | This fork |
+|---|---|---|
+| **Text generation** | 37.6 tok/s | **57.3 tok/s** (+52%) |
+| Generating after reading a 26K file | 28.2 tok/s | **45.5 tok/s** (+61%) |
+| Follow-up question | 32.1 tok/s | **51.5 tok/s** (+60%) |
+| Answering about an image | 24.2 tok/s | **47.0 tok/s** (+94%) |
+| Reading a prompt | 989 tok/s | **1,496 tok/s** (+51%) |
 
-<p align="center"><sub><b>English</b> · <a href="README.zh-CN.md">简体中文</a> · <a href="README.ja.md">日本語</a> · <a href="README.de.md">Deutsch</a> · <a href="README.fr.md">Français</a> · <a href="README.es.md">Español</a> · <a href="README.pt-BR.md">Português</a> · <a href="README.pl.md">Polski</a></sub></p>
+Measured on an i7-14700KF, 32 GB DDR5-6000, RTX 4070 Ti 12 GB and two 990 PRO 1 TB, on Windows 11, with Qwen3.8-Flash-Next IQ3_S, `--kv int8` and 262K context. This is the only PC it has been measured on, so your numbers will differ.
 
-**Free, open source, and yours to run.** Use Strata on your desktop or with your favorite coding tools. No account needed.
+## Is this for you?
 
-## Models
+| | What you need |
+|---|---|
+| **RAM** | 32 GB. This is what it's tuned for. Other sizes work, but those settings haven't been measured. |
+| **GPU** | NVIDIA, ideally 12 GB. The biggest kernel gains are specific to RTX 40 cards. |
+| **CPU** | A hybrid Intel CPU with P-cores and E-cores gets the measured thread layout. Other CPUs keep Strata's default layout. |
+| **Disk** | About 120 GB for the first download. A second SSD with 52 GB free for dual SSD streaming (optional). |
+| **System** | Windows. The Visual Studio 2022 Build Tools (C++ workload), the CUDA toolkit and CMake, because the engine is built from this code. |
 
-We recommend **ISTA-DASLab first**, then **Unsloth** and other providers, where a compatible model fits.
+This uses most of your PC's memory while it runs. In testing, free RAM dropped to about 2 GB, and 1.5 GB at the lowest, so close your browser and other large programs first.
 
-<details>
-<summary><img src="docs/media/models/qwen.svg" width="22" alt="" align="middle"> &nbsp;<b>Qwen3.8-Flash-Next</b></summary>
+## Easy setup
 
-| Provider | Choices |
-| --- | --- |
-| **ISTA-DASLab · recommended** | Q2\_0, IQ2\_XS, IQ3\_XXS, IQ3\_S. [Coder: IQ1\_M](docs/MODELS.md#coder) for coding. |
-| **Unsloth** | UD-IQ4\_XS, UD-Q4\_K\_XL, UD-Q5\_K\_XL, UD-Q6\_K\_XL, Q8\_0 |
-| **Gyro · agentionai** | [Gyro-S, Gyro-M](https://huggingface.co/agentionai/Qwen3.8-Flash-Next-Gyro-GGUF). Lower memory use but slower. |
-| **Other options** | [Swift 1.5](docs/MODELS.md#swift-15), [NVFP4](docs/NVFP4.md), [OrcaRouter](docs/ORCA.md) |
-
-[Compare sizes, memory needs and compatibility](docs/MODELS.md).
-
-</details>
-
-<details>
-<summary><img src="docs/media/models/qwen.svg" width="22" alt="" align="middle"> &nbsp;<b>Qwen3.6-35B-A3B</b></summary>
-
-**Unsloth:** UD-Q4_K_XL, UD-Q6_K_XL, Q8_0. These are the currently documented packs for this model.
-
-[Model guide and compatibility](docs/QWEN36.md).
-
-</details>
-
-<details>
-<summary><img src="docs/media/models/deepseek.svg" width="22" alt="" align="middle"> &nbsp;<b>DeepSeekV4.1-Flash-1017</b></summary>
-
-In the **desktop app** and the **Terminal**. What does not fit in memory is read from your SSD, so it needs a lot of free
-disk space.
-
-| Set (IST-DAS) | Download | Free disk needed |
-| --- | ---: | ---: |
-| 1.75 bpw | 239 GB | about 245 GB |
-| 2.00 bpw | 257 GB | about 265 GB |
-| 2.25 bpw | 274 GB | about 280 GB |
-
-Runs on NVIDIA RTX 30, 40 and 50 series (Windows and Linux), AMD Radeon AI PRO R9700 (Linux), AMD Ryzen AI Max — Strix Halo
-(Windows), and Apple Silicon Macs with 64 GB or more, text only ([Mac](docs/DEEPSEEK_MAC.md)). Setup downloads the files and the DeepSeek engine, then starts the model.
-
-```sh
-strata launch --family deepseek41 --model ist-das-2.00bpw --plan
+```bat
+git clone https://github.com/YOUR-USERNAME/Strata.git
+cd Strata
+FAST-SETUP.bat
 ```
 
-Measured with the 2.00 bpw set on Strata 0.2.5 (Strix Halo: 0.2.7). Output is the speed of the answer, prompt is how fast Strata reads your input.
+That's the whole install. On the first run it downloads the model and builds the engine. Then it checks your PC, picks the settings and offers dual SSD streaming. When it finishes, start the model with:
 
-| Hardware | Output | Prompt |
-| --- | ---: | ---: |
-| RTX 5070 12 GB, 64 GB RAM | 4 to 6 tokens/s | about 110 tokens/s (4K) |
-| RTX 3060 12 GB, 46 GB RAM | 9 to 11 tokens/s | about 155 tokens/s (4K) |
-| 1x Radeon AI PRO R9700, 251 GB RAM | 21 to 25 tokens/s | 320 to 360 tokens/s (8K) |
-| 4x Radeon AI PRO R9700 | 74 to 77 tokens/s | 400 to 450 tokens/s (8K) |
-| Ryzen AI Max+ 395 (Strix Halo), 128 GB unified | 19 to 21 tokens/s (code), 11 (chat) | 87 tokens/s (4K), 125 tokens/s (8K) |
-
-[Memory, disk and details](docs/DEEPSEEK41.md) · [Release notes](https://github.com/Niko1221/Strata/releases)
-
-</details>
-
-<a id="the-other-sizes"></a>
-
-Not sure what fits? [Choose a model for your computer](docs/MODELS.md#pick-by-memory).
-
-## Install
-
-<a id="option-a-the-strata-app"></a>
-
-### Desktop app
-
-**[Download Strata for Windows, Linux or Mac →](https://github.com/Niko1221/Strata/releases/latest)**
-
-Install the app, choose a model, and start chatting. There is one installer for each system. On first start the app
-downloads the engine for your graphics card. [Help with the installer](docs/INSTALL.md#the-app).
-
-<sub>Files: `Strata-0.2.9-windows-x64-setup.exe` · `Strata-0.2.9-linux-x86_64.AppImage` · `Strata-0.2.9-macos-arm64.dmg`</sub>
-
-<p align="center">
-  <img src="docs/media/app-chat.png" width="900" alt="Strata desktop app with a chat and live code preview side by side">
-  <br><sub>Chat, files and a live preview in one window.</sub>
-</p>
-
-<a id="option-b-the-terminal-one-line"></a>
-
-### Terminal app
-
-Prefer the terminal? Install Strata, then run **`strata launch`**.
-
-<details open>
-<summary><b>Install commands</b></summary>
-
-**Linux / Mac**
-
-```sh
-curl -fsSL https://github.com/Niko1221/Strata/releases/latest/download/install.sh -o install.sh && sh install.sh
+```bat
+run-fast.bat
 ```
 
-**Windows PowerShell**
+Your chat page opens at http://127.0.0.1:8080. Apps can connect there too, because it speaks the OpenAI and Anthropic APIs.
 
-```powershell
-irm https://github.com/Niko1221/Strata/releases/latest/download/install.ps1 | iex
+Run `FAST-SETUP.bat` again at any time to change your choices.
+
+## Dual SSD streaming
+
+Most of the model lives on your SSD, and each answer keeps reading from it. If you have a second SSD, keep a copy of the model's largest file (`experts.bin`, 47 GB) there too, and every read of 256 KiB or more comes half from each drive.
+
+**To turn it on:** run `FAST-SETUP.bat` and pick the drive when asked. It copies the file, checks the copy against the original by hash, and turns it on.
+
+| Measured with two 990 PRO, 4 runs each | One SSD | Two SSDs | Gain |
+|---|---|---|---|
+| Text generation | 42.2 tok/s | 47.4 tok/s | +12% |
+| Reading a prompt | 997 tok/s | 1,389 tok/s | +39% |
+| Generating after a 26K file | 31.4 tok/s | 37.3 tok/s | +19% |
+| Follow-up question | 34.5 tok/s | 41.5 tok/s | +20% |
+| Answering about an image | 24.8 tok/s | 31.6 tok/s | +28% |
+
+Those runs are from an earlier stage of this fork, before the later speed-ups. The gain with everything on hasn't been measured separately.
+
+**Good to know:**
+- **Which drive:** it must be a different physical SSD, not a second partition of the same one. Setup refuses the same disk, and leaves out hard disks and USB drives.
+- **SSD wear:** reading doesn't meaningfully wear an SSD. The copy writes 47 GB once.
+- **No second SSD?** Press Enter when asked. Every other change still applies.
+- **To turn it off:** run `FAST-SETUP.bat --no-mirror`, then delete the `StrataMirror` folder.
+- **If the model changes:** the engine only compares file sizes, so run `FAST-SETUP.bat --verify` after a pack update, and delete the copy if it reports a difference.
+
+**Already set up by hand?** Set this before starting the engine:
+
+```bat
+set STRATA_EXPERTS_MIRROR=E:\StrataMirror\experts.bin
 ```
 
-On Windows, open a new terminal afterwards. Then:
+## Setup options
 
-```sh
-strata launch
-```
+| Command | What it does |
+|---|---|
+| `FAST-SETUP.bat --dry-run` | Shows what it would do and changes nothing |
+| `FAST-SETUP.bat --yes` | Asks nothing and picks the best second drive |
+| `FAST-SETUP.bat --no-mirror` | Uses one drive only |
+| `FAST-SETUP.bat --mirror-dir E:\StrataMirror` | Puts the copy in a folder you choose |
+| `FAST-SETUP.bat --verify` | Also compares an existing copy by hash |
 
-Follow the prompts to download and start a model. [Terminal guide](docs/TERMINAL_LAUNCH.md).
+Setup writes only `strata-fast.json` and `run-fast.bat`, plus the copy if you ask for one. To undo it, delete those. The normal Strata config beside them isn't changed.
 
-</details>
+## What's different from Strata
 
-<p align="center">
-  <img src="docs/media/terminal-monitor.png" width="900" alt="Strata terminal app showing model activity, speed, memory and recent requests">
-  <br><sub>Watch your model and hardware while it runs.</sub>
-</p>
+- **RTX 40 kernels:** turns on 7 exact kernels this card family had no settings for.
+- **No extra copy on SSD reads:** data goes straight into its buffer.
+- **Two-SSD reads:** described above.
+- **Better thread placement:** workers run on P-cores only, and SSD readers stay alive on E-cores, so ready work computes while reads finish.
+- **Parallel RAM moves:** the RAM cache updates during drafting, while nothing else needs it.
+- **Deeper drafts:** `--spec 4`.
 
-<a id="build-from-source"></a>
+[FORK.md](FORK.md) lists each change with its switch and files. [The worklog](docs/fork/WORKLOG.md) has every test, including the ones that failed.
 
-[Build from source](docs/SOURCE_INSTALL.md) · [Docker](docs/DOCKER.md) · [Full install guide](docs/INSTALL.md)
+## Known limits
 
-<a id="what-you-need"></a>
+- **One PC:** only Windows with CUDA on the PC above has been measured.
+- **Fresh install:** the first-run download and build path uses Strata's own setup, and hasn't been run from a clean clone yet.
+- **Answers:** `--spec 4` changes wording compared with `--spec 3`, on stock Strata too. In a controlled test, the other speed changes left answers byte-identical on 3 short prompts, but partial page-locking's PCIe path and the RAM moves weren't part of that test. Answers can also vary a little between runs on any engine.
+- **Other models:** this is tuned for Qwen3.8-Flash-Next IQ3_S.
 
-## Hardware
+## Credit
 
-| Supported hardware | Guide |
-| --- | --- |
-| **NVIDIA GeForce RTX 20 / 30 / 40 / 50 series** | [NVIDIA setup](docs/INSTALL.md#what-you-need) |
-| **AMD Radeon RX 7700 / 7800 / 7900, RX 9060 / 9070, AI PRO R9700** | [AMD setup](docs/AMD_HIP.md) |
-| **AMD Radeon RX 6800 / 6900 · experimental** | [RX 6000 setup](docs/AMD_HIP.md#rdna2-gfx1030) |
-| **Intel Arc · Linux** | [Intel setup](docs/INTEL_ARC.md) |
-| **Apple Silicon · M1 or newer** | [Mac setup](docs/MAC.md) |
-| **AMD Ryzen AI Max · Strix Halo** | [Strix Halo setup](docs/STRIX_HALO.md) |
-| **NVIDIA DGX Spark · Linux** | [DGX Spark setup](docs/DGX_SPARK_LINUX.md) |
+All of the engine is the work of [Niko1221 and the Strata contributors](https://github.com/Niko1221/Strata). For anything not covered here, such as other models, AMD, Mac, the desktop app or multiple GPUs, see the [original project](https://github.com/Niko1221/Strata) and the [docs](docs/DETAILS.md) in this repo.
 
-<a id="using-it"></a>
-
-## Tools
-
-**Claude Code · Codex CLI · OpenCode · oh-my-pi · pi.dev · Hermes Agent · OpenClaw**, and more through the OpenAI- and Anthropic-compatible APIs.
-
-Run **`strata connect`** to see setup instructions for your tool. [Connection guide](docs/TERMINAL_LAUNCH.md#connect-your-apps-strata-connect).
-
-<a id="guides"></a>
-<a id="how-fast-is-it"></a>
-<a id="how-does-it-work"></a>
-<a id="something-went-wrong"></a>
-
-## Help
-
-[All guides](docs) · [Troubleshooting](docs/TROUBLESHOOTING.md) · [Report a bug](https://github.com/Niko1221/Strata/issues/new/choose) ·
-[Benchmarks](docs/COMMUNITY_BENCHMARKS.md) · [How it works](docs/HOW_IT_WORKS.md) · [Contribute](CONTRIBUTING.md)
-
-## Support Strata
-
-**Help keep local AI open to everyone.** A coffee helps fund development and testing on more hardware.
-
-<a href="https://buymeacoffee.com/strataengine"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me a Coffee: support Strata" height="48"></a>
-
-[MIT license](LICENSE) · [Credits and model licenses](docs/HOW_IT_WORKS.md#credits) · [Privacy](docs/SAFETY.md)
-
-<a id="option-c-let-your-ai-set-it-up"></a>
-
-<sub>For AI tools and automated readers: <a href="AGENTS.md">technical reference</a> · <a href="docs/AI_SETUP.md">setup instructions</a>.</sub>
-
-**Sponsorships, hardware partnerships or collaborations:** [niko.veit@outlook.com](mailto:niko.veit@outlook.com).
-
+MIT licensed, the same as Strata. See [LICENSE](LICENSE).
