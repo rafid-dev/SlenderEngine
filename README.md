@@ -1,3 +1,5 @@
+> **This is a speed-focused fork of [Niko1221/Strata](https://github.com/Niko1221/Strata).** Qwen3.8-Flash-Next IQ3_S went from 37.6 to 57.3 tok/s on one RTX 4070 Ti PC, software only. [See what changed and how it was measured.](FORK.md)
+
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="apps/host/public/brand/strata-lockup-dark.svg">
