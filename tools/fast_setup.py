@@ -6,7 +6,8 @@ Setup's files are not changed. Nothing is written with --dry-run. FAST-SETUP.bat
 
   --dry-run           show what would happen and stop
   --yes               no questions: the settings, and the best second drive unless --no-mirror
-  --mirror-dir PATH   the folder for the copy of experts.bin (it must be on another physical drive)
+  --ram-gib N         GiB of RAM for the experts, without asking (default on a 32 GB PC: 10)
+  --mirror-dir PATH  the folder for the copy of experts.bin (it must be on another physical drive)
   --no-mirror         one drive only
   --verify            compare an existing copy with the original by hash, too
   --config PATH       the config to start from (default strata-iq3_s.json, else strata-iq3_xxs.json)
@@ -33,12 +34,6 @@ SETUP_ARGS = "--family qwen --model IQ3_S --build --context 262144 --kv int8 --v
 
 def say(text=""):
     print(text, flush=True)
-
-
-def ask(text, yes):
-    if yes:
-        return True
-    return input(f"{text} [y/N] ").strip().lower() in ("y", "yes")
 
 
 def total_ram_gib():
@@ -200,6 +195,40 @@ def choose_mirror(a, src, vols):
     return dst
 
 
+def choose_ram(a, ram):
+    """GiB of RAM for the experts: --ram-gib, else the person's answer, else the default. Above the safe line it warns, because Windows then pages."""
+    measured = 28 <= ram <= 36
+    default = 10 if measured else max(4, min(48, round(ram) - 22))
+    top = max(1, round(ram) - 8)
+    safe = max(default, round(ram) - 18)
+    if a.ram_gib is not None:
+        pick = a.ram_gib
+    elif a.yes:
+        pick = default
+    else:
+        say("How much RAM should hold the model's experts? More is faster, but leaves less for other apps.")
+        say("  Measured on 32 GB: 10 GiB gave 48 tok/s with at least 3.3 GiB free; 14 GiB gave 52 tok/s with 0.7 GiB free and more writes to the page file.")
+        say("  The engine uses about 8 GiB more on top of this. Other amounts have not been measured on their own.")
+        while True:
+            ans = input(f"GiB of RAM, 1-{top}, or Enter for {default}: ").strip()
+            if not ans:
+                pick = default
+                break
+            try:
+                pick = float(ans)
+            except ValueError:
+                continue
+            if 1 <= pick <= top:
+                break
+    if not 1 <= pick <= top:
+        sys.exit(f"--ram-gib must be between 1 and {top} on this PC.")
+    if not measured:
+        say(f"This fork is tuned for 32 GB. {pick:g} GiB of experts on a {ram:.0f} GB PC has not been measured.")
+    if pick > safe:
+        say(f"{pick:g} GiB leaves little free RAM: close other large programs, or Windows will page heavily, which writes to your SSD.")
+    return pick
+
+
 def set_arg(args, name, value):
     if name in args:
         args[args.index(name) + 1] = value
@@ -221,6 +250,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--yes", action="store_true")
+    ap.add_argument("--ram-gib", type=float)
     ap.add_argument("--mirror-dir")
     ap.add_argument("--no-mirror", action="store_true")
     ap.add_argument("--verify", action="store_true")
@@ -253,13 +283,7 @@ def main():
     say(f"RAM {ram:.0f} GB. GPU {gpu or 'not found'}{f', {vram:.0f} GB' if gpu else ''}. CPU {cpu['p']} {'P-cores' if cpu['hybrid'] else 'cores'}{f', {cpu["e"]} E-core threads' if cpu['hybrid'] else ''}.")
     if gpu is None:
         sys.exit("No NVIDIA card found. These settings were only measured on NVIDIA, with the CUDA engine.")
-    if 28 <= ram <= 36:
-        budget = 14
-    else:
-        budget = max(4, min(48, round(ram) - 18))
-        say(f"This fork is tuned for 32 GB. With {ram:.0f} GB it would keep {budget} GiB of experts in RAM, which has not been measured.")
-        if not ask("Carry on?", a.yes):
-            return 1
+    budget = choose_ram(a, ram)
     if vram < 11:
         say(f"Measured on 12 GB of VRAM. With {vram:.0f} GB, fewer experts fit on the card, so expect less speed.")
     if not cpu["hybrid"]:
@@ -270,8 +294,8 @@ def main():
     vols = volumes()
     mirror = choose_mirror(a, src, vols)
 
-    for k, v in (("--spec", "4"), ("--spec-min-p", "0.5"), ("--resident-budget-gib", str(budget)), ("--adapt-every", "4"), ("--adapt-swaps", "24"),
-                 ("--adapt-async", "1"), ("--kv-resident", "32768"), ("--conversation-cache-mib", "2048")):
+    for k, v in (("--spec", "4"), ("--spec-min-p", "0.5"), ("--resident-budget-gib", f"{budget:g}"), ("--adapt-every", "4"), ("--adapt-swaps", "24"),
+                 ("--adapt-async", "1"), ("--kv-resident", "32768"), ("--conversation-cache-mib", "0")):
         set_arg(args, k, v)
     env = {"STRATA_UNBUFFERED_LOAD": "1", "STRATA_RESIDENT_HEADROOM_GIB": "1.5", "STRATA_RAM_ADAPT": "1", "STRATA_COLD_OVERLAP": "1", "STRATA_COLD_KEPT_READERS": "1",
            "STRATA_PARTIAL_PIN": "1", "STRATA_RAM_ADAPT_PAR": "1", "STRATA_RAM_ADAPT_BG": "1"}
@@ -293,7 +317,7 @@ def main():
     say("Settings:")
     for k, v in env.items():
         say(f"  {k}={v}")
-    say("  " + " ".join(args[args.index("--spec"):args.index("--spec") + 2]) + f", {budget} GiB of experts in RAM")
+    say("  " + " ".join(args[args.index("--spec"):args.index("--spec") + 2]) + f", {budget:g} GiB of experts in RAM, conversations not saved in RAM")
     if a.dry_run:
         say("\nDry run: nothing was written.")
         return 0

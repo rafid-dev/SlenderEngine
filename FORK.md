@@ -1,7 +1,7 @@
 # What this fork changes
 
 This is a fork of [Niko1221/Strata](https://github.com/Niko1221/Strata), based on commit `c62d5e3` (engine 0.1.55). It makes Qwen3.8-Flash-Next IQ3_S
-generate faster on one PC by changing software only: same model, quant, context, RAM and VRAM use.
+generate faster on one PC by changing software only: same model, quant, context and RAM tier size.
 
 **See every changed line:** [compare with upstream](https://github.com/Niko1221/Strata/compare/main...rafid-dev:Strata-32GB:speed-fork).
 **See every test, including what failed:** [docs/fork/WORKLOG.md](docs/fork/WORKLOG.md).
@@ -18,6 +18,8 @@ Measured 2026-11-03, 5 runs each, mixed order, same day. i7-14700KF, 32 GB DDR5-
 | Follow-up | 32.1 tok/s | 51.5 tok/s | +60% |
 | Image answer | 24.2 tok/s | 47.0 tok/s | +94% |
 | Prompt reading | 989 tok/s | 1,496 tok/s | +51% |
+
+Upstream ran at `--spec 3` with 13 workers on one SSD; this fork ran at `--spec 4` with 7 workers on the P-cores and two SSDs. So the table shows the gain from code and settings together. The same settings on both engines haven't been measured yet, and Strata 0.2.10 hasn't been tested.
 
 This has only been measured on the PC above. Other cards and CPUs may gain less or lose speed. The placement settings below are for this CPU's layout.
 
@@ -52,6 +54,8 @@ Engine args: `--pool-workers 7 --spec 4 --spec-min-p 0.5 --adapt-swaps 24 --resi
 
 The dual SSD copy must be the same file as the pack's `experts.bin`. The engine only compares file sizes, so copy it again if the pack changes.
 
+`FAST-SETUP.bat` no longer writes 14 GiB. It asks how much RAM to use, defaulting to 10 GiB on a 32 GB PC, and writes `--conversation-cache-mib 0`. [README](README.md#memory-settings) has the numbers for that setting and for running beside a large app.
+
 ## Answers
 
 With `STRATA_IQ_MT_MIN=1`, `STRATA_ROUTE_TAIL_SKIP=0`, `STRATA_PREFILL_CPU_SHARE=0` and `--prompt-cache 0 --adapt-swaps 0 --pcie-frac 0`, upstream, this fork
@@ -69,6 +73,9 @@ PCIe path and the RAM moves did not run in that check. In normal use answers can
 | `STRATA_ADAPT_TAIL_WEIGHT`, `STRATA_ADAPT_SSD_BOOST` | Cache scoring | Not used |
 | `STRATA_DIRECT_AHEAD` | Read-ahead from the router's prediction | About 18% slower |
 | `STRATA_DIRECT_POLL`, `STRATA_PROC_HIGH` | Polling and process priority | No gain |
+| `STRATA_PARK_TAIL_MAX` | Skips saving a conversation when only its last tokens were rewritten | Saved nothing: the RAM floor already refused those saves |
+| `STRATA_TIER_LOW_MIB`, `_HIGH_MIB`, `_STEP_MIB` | Resizes the RAM tier while running | Not used, no result recorded |
+| `STRATA_ROUTE_TAIL_SKIP_FILE=R` | The route tail skip from rank R, only for experts that would be read from the file. Changes answers | Not measured yet |
 
 ## Limits
 

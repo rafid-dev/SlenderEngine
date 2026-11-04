@@ -216,6 +216,8 @@ public:
     /// Plan v0.3 P5: whether `blob(layer, expert)` lies in page-locked, CUDA-registered memory, so an
     /// asynchronous host-to-device copy can DMA it directly (no staging copy on the CPU).
     virtual bool pinned(int64_t layer, int64_t expert) const { (void) layer; (void) expert; return false; }
+    /// STRATA_ROUTE_TAIL_SKIP_FILE: false only where reading the expert means going to the file.
+    virtual bool in_ram_tier(int64_t layer, int64_t expert) const { (void) layer; (void) expert; return true; }
 
     /// Called once before the first expert of a layer.  A source that reads from disk wants to start the read
     /// here so it overlaps the quantisation, and a prefetching source in Phase 3 wants the ids.
@@ -788,6 +790,7 @@ public:
     // differ in block size keeps spares per size).
     /// Whether the compact copy holds `(layer, expert)`.
     bool has_resident(int64_t layer, int64_t expert) const;
+    bool in_ram_tier(int64_t layer, int64_t expert) const override { return has_resident(layer, expert); }
     /// Host room for `n` evicted blobs (page-locked when possible).  Idempotent for the same or a smaller `n`.
     /// `bounce`: how many of the last buffers are only staged through and never hold an exchange (STRATA_EXCHANGE_ROTATE
     /// keeps those in the largest block size alone).
@@ -833,6 +836,12 @@ public:
     /// STRATA_RAM_ADAPT: the same move as replace_resident, but `in` is copied out of the finished stage buffer
     /// a demand read left it in (no file read).  False, nothing changed, when `in` is not staged or still filling.
     bool replace_resident_staged(int64_t layer, int64_t in, int64_t out);
+    /// STRATA_TIER_LOW_MIB: balances the copy against the PC's free RAM. Under `low` bytes available, the copy's unregistered
+    /// tail is released `step` bytes at a time, down to the part registered for the GPU: those blobs are read from the file
+    /// again when wanted, and being copies of it they leave without a write to the page file. Over `high` available, a
+    /// minute after the last release, up to `step` bytes come back. Same rules as replace_resident: the caller's thread,
+    /// nothing reading the copy, no adaptive round in flight. Windows; elsewhere it does nothing.
+    void balance_resident(uint64_t low, uint64_t high, uint64_t step);
     /// STRATA_RAM_ADAPT_PAR=1: a round's staged moves together, the copies shared with the kept reader threads.  moved[i]: pair i moved.
     struct RamMove { int32_t layer, in, out; };
     void replace_resident_staged_many(const RamMove* m, int n, uint8_t* moved, bool during_round = false);
@@ -1260,6 +1269,9 @@ private:
     bool complement_registered_ = false;      ///< the arena is ordinary memory registered with cudaHostRegister (not cudaHostAlloc)
     uint64_t complement_pin_limit_ = 0;
     uint64_t complement_lock_off_ = 0;        ///< the working-set lock covers [lock_off, lock_off + locked)
+    uint64_t tier_end_ = 0;                   ///< STRATA_TIER_LOW_MIB: the copy holds blobs below this offset (0: not started)
+    std::vector<std::pair<size_t, uint64_t>> tier_released_;   ///< ...and the (index, offset) it released, to bring back
+    std::chrono::steady_clock::time_point tier_last_release_{};
     bool complement_ready_ = false;
     uint64_t complement_locked_ = 0;          ///< bytes held in the working set (pin refused)
     int64_t complement_lent_slots_ = 0;

@@ -4670,6 +4670,71 @@ bool FileExpertSource::replace_resident(int64_t layer, int64_t in, int64_t out) 
     return install_resident(layer, in, out, ram_adapt_buf_.data());
 }
 
+void FileExpertSource::balance_resident(uint64_t low, uint64_t high, uint64_t step) {
+#if defined(_WIN32)
+    if (!complement_ready_ || complement_host_ == nullptr || exchange_storage_.active() || !staged_.empty() ||
+        complement_locked_ == 0 || step == 0) return;
+    if (tier_end_ == 0) tier_end_ = complement_bytes_;
+    uint64_t avail = 0;
+    if (!available_memory_bytes(avail)) return;
+    const uint64_t floor = complement_lock_off_;
+    constexpr uint64_t kPage = 4096;
+    uint8_t* host = (uint8_t*) complement_host_;
+    const uint64_t start_end = tier_end_;
+    while (avail < low && tier_end_ > floor) {
+        const uint64_t target = tier_end_ - std::min<uint64_t>(step, tier_end_ - floor);
+        uint64_t start = tier_end_;
+        for (size_t i = 0; i < complement_offsets_.size(); ++i) {
+            const uint64_t at = complement_offsets_[i];
+            if (at == kNoComplement || at < floor || at >= tier_end_ || at + layer_blob_bytes_[i / (size_t) n_expert_] <= target) continue;
+            tier_released_.emplace_back(i, at);
+            complement_offsets_[i] = kNoComplement;
+            start = std::min(start, at);
+        }
+        const uint64_t a = ((uint64_t) (uintptr_t) (host + start) + kPage - 1) / kPage * kPage;
+        const uint64_t b = (uint64_t) (uintptr_t) (host + tier_end_) / kPage * kPage;
+        if (b > a) {
+            (void) VirtualUnlock((LPVOID) (uintptr_t) a, (SIZE_T) (b - a));   // FALSE / ERROR_NOT_LOCKED also trims
+            using Discard = DWORD(WINAPI*)(PVOID, SIZE_T);
+            static const Discard discard = (Discard) (void*) GetProcAddress(GetModuleHandleA("kernel32.dll"), "DiscardVirtualMemory");
+            if (discard == nullptr || discard((PVOID) (uintptr_t) a, (SIZE_T) (b - a)) != ERROR_SUCCESS)
+                (void) VirtualAlloc((LPVOID) (uintptr_t) a, (SIZE_T) (b - a), MEM_RESET, PAGE_READWRITE);
+        }
+        tier_end_ = start;
+        tier_last_release_ = std::chrono::steady_clock::now();
+        if (!available_memory_bytes(avail)) break;
+    }
+    if (tier_end_ != start_end) {
+        std::fprintf(stderr, "strata serve: RAM tier: released %.2f GiB, now %.2f GiB (%.2f GiB available, wanted %.2f)\n",
+                     (double) (start_end - tier_end_) / 1073741824.0, (double) tier_end_ / 1073741824.0,
+                     (double) avail / 1073741824.0, (double) low / 1073741824.0);
+        return;
+    }
+    if (tier_released_.empty() || avail < high ||
+        std::chrono::steady_clock::now() - tier_last_release_ < std::chrono::seconds(60)) return;
+    std::sort(tier_released_.begin(), tier_released_.end(), [](const auto& x, const auto& y) { return x.second < y.second; });
+    uint64_t back = 0;
+    size_t done = 0;
+    for (; done < tier_released_.size() && back < step; ++done) {
+        const auto [i, at] = tier_released_[done];
+        const uint64_t bytes = layer_blob_bytes_[i / (size_t) n_expert_];
+        // this expert may have come back another way (a RAM move): its old place then stays empty for now
+        if (complement_offsets_[i] == kNoComplement) {
+            if (!copy_from_files((int64_t) (i / (size_t) n_expert_), (int64_t) (i % (size_t) n_expert_), host + at)) break;
+            complement_offsets_[i] = at;
+        }
+        back += bytes;
+        tier_end_ = std::max(tier_end_, at + bytes);
+    }
+    tier_released_.erase(tier_released_.begin(), tier_released_.begin() + (std::ptrdiff_t) done);
+    if (done > 0)
+        std::fprintf(stderr, "strata serve: RAM tier: brought back %.2f GiB, now %.2f GiB (%.2f GiB available)\n",
+                     (double) back / 1073741824.0, (double) tier_end_ / 1073741824.0, (double) avail / 1073741824.0);
+#else
+    (void) low; (void) high; (void) step;
+#endif
+}
+
 bool FileExpertSource::replace_resident_staged(int64_t layer, int64_t in, int64_t out) {
     if (!complement_ready_ || complement_host_ == nullptr || exchange_storage_.active() || !staged_.empty() ||
         layer < 0 || layer >= n_layers_ || in < 0 || out < 0 || in >= n_expert_ || out >= n_expert_ || in == out)
@@ -5280,6 +5345,15 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         // only at rank >= R (the smallest weights of the top-10) is neither copied nor computed; its contribution is
         // zero, without renormalisation (the others keep the weight the router gave them).  Less PCIe and CPU work.
         const int tail_rank = tail_skip_rank();
+        // STRATA_ROUTE_TAIL_SKIP_FILE=R (opt-in, 1-9, changes the output): the same skip from rank R up, but only for an expert that
+        // would be read from the file.  One in the RAM tier keeps the STRATA_ROUTE_TAIL_SKIP rank.  Needs that skip on.
+        static const int tail_file_rank = [] {
+            const char* v = std::getenv("STRATA_ROUTE_TAIL_SKIP_FILE");
+            const int r = v != nullptr ? std::atoi(v) : 0;
+            if (r > 0 && r < 10) std::fprintf(stderr, "strata serve: STRATA_ROUTE_TAIL_SKIP_FILE=%d is on: a file read routed at rank %d or lower by every token of a window is skipped\n", r, r);
+            return r > 0 && r < 10 ? r : 0;
+        }();
+        const int tail_low = tail_file_rank > 0 && tail_file_rank < tail_rank ? tail_file_rank : tail_rank;
         bool skip_d[kMaxWindowEntries];
         for (int q = 0; q < nd; ++q) skip_d[q] = false;
         if (tail_rank > 0 && d.peer == nullptr && d.remote_count == 0) {
@@ -5292,8 +5366,9 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
             }
             for (int q = 0; q < nd; ++q) {
                 const int32_t e = ids[distinct[q]];
-                if (e < 0 || e >= d.n_expert || minr[q] < tail_rank) continue;
+                if (e < 0 || e >= d.n_expert || minr[q] < tail_low) continue;
                 if (d.host_res[(size_t) d.layers * (size_t) d.n_expert + (size_t) e] >= 0) continue;   // resident
+                if (minr[q] < tail_rank && d.src->in_ram_tier(d.layers, e)) continue;   // STRATA_ROUTE_TAIL_SKIP_FILE: in RAM, so kept
                 skip_d[q] = true;
                 --nmiss;
                 ++d.tail_experts;

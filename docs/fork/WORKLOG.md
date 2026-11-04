@@ -22,7 +22,42 @@ Changes made to reach higher speeds, measured against the vanilla engine.
 
 Text ranges do not overlap. Same model, quant, context, 14 GiB RAM tier and VRAM use (11.93-11.95 GB) in all three. Every text run stays well short of the 70 tok/s target.
 
-Nothing is committed to git. Every change is an uncommitted source edit or a local file.
+This table is the 14 GiB setting. Daily since 2026-11-04: `--resident-budget-gib 10 --conversation-cache-mib 0`, coding answers 48.2 tok/s, see the sections below.
+
+## Comparison video recording (2026-11-03)
+
+Vanilla against installed, 5 runs each, fresh engine per run, mixed order (VFFVFVVFVF), the same four coding prompts as the table above but streamed. `demo\compare\strata-vs-fork.mp4` and `.gif`.
+
+| | Vanilla | Installed | Installed against vanilla |
+|---|---|---|---|
+| Text | 36.0 tok/s (34.1-38.2) | 55.6 tok/s (53.0-56.5) | +54% |
+| Prompt reading | 1,003 tok/s | 1,484 tok/s | +48% |
+| Code clip, thinking off, one prompt | 33.1 tok/s (31.8-36.5) | 62.3 tok/s (60.5-64.7) | +88% |
+| Generating 150 tokens after the big file | 18.5 tok/s | 34.5 tok/s | +86% |
+
+- **Agreement:** text and prompt reading are close to the table above. No damaged answers.
+- **Code clip:** the race on screen shows this, so it looks wider than the +54% on the end card. Why code with thinking off gains more was not established.
+- **After the big file:** both engines came in well below the 28.2 and 45.5 in the table above, and the cause wasn't established, so this row was left off the video.
+- **Vanilla drift:** its text speed fell from 38.2 to 34.1 across the session while installed stayed at 53.0-56.5. The cause wasn't established.
+
+## SSD writes and paging (2026-11-03)
+
+Windows counters sampled every 5 s on the installed engine, mixed coding session (`soak.py`). Writes are for the whole PC, both SSDs together.
+
+| Session | Disk writes | Paged out | Paged in | Available RAM, lowest / median | Page file, highest |
+|---|---|---|---|---|---|
+| Strata stopped, 1.9 min | 3.0 GB/h | 0 | 0.08 GB | 20.0 GB lowest | 2.5% |
+| Normal, 20.4 min, 105 requests | 4.2 GB/h | 0.3 GB/h | 9.16 GB | 0.28 / 1.13 GB | 2.5% |
+| Pressure test, no extra app, 4.8 min | 6.2 GB/h | 4.3 GB/h | 2.02 GB | 0.25 / 1.22 GB | 3.2% |
+| With a 4 GB app, 4.8 min | 5.2 GB/h | 2.6 GB/h | 6.28 GB | 0.03 / 0.49 GB | 6.1% |
+| With an 8 GB app, 4.5 min | 145.6 GB/h | 138.8 GB/h | 36.20 GB | 0.00 / 0.27 GB | 9.0% |
+
+- **Extra app:** another process rewrote every page of its memory every 5 s, which is harsher than a real app. Its own pages are part of the paging figures; the split between it and Strata was not measured.
+- **Strata's working set:** 19.2 GB, then 16.9 GB with the 4 GB app and 10.2 GB with the 8 GB app, so Windows took memory from Strata.
+- **Reliability:** no failed or damaged requests in 172 requests across both sessions. Strata's own file writes were about 0.
+- **Lifespan against a 600 TBW drive, 8 h a day:** about 49 years at 4.2 GB/h, about 1.4 years if the 8 GB case ran all the time.
+- **Reads:** 3,729 GB in the normal session, about 3 GB/s. Reads don't count toward the rating. Drive temperature was not measured.
+- **Limit:** the two no-extra-app runs differ by 14 times in paged out (0.3 and 4.3 GB/h), so small figures here are noisy.
 
 ## Install of the candidate (2026-11-03)
 
@@ -263,6 +298,330 @@ All with read overlap, 7 P workers, parallel RAM moves during the draft and, exc
 - **`--spec 4` changes the wording:** 2 of 3 prompts differ from `--spec 3`, from character 398 of the first. Vanilla, installed and candidate at `--spec 4` all give the same answers as each other, so this comes from the stock option and not from the patches. Why depth 4 differs while depth 2 doesn't was not established, and answer quality at each depth was not measured. `--spec 0` isn't a valid setting for this pack (it needs at least 2), so there is no no-draft reference.
 - **Not covered:** adaptive swaps were off and the logs show 0 exchanged, and `--pcie-frac 0` keeps the GPU from using page-locked RAM. So the page-lock PCIe path and the parallel RAM moves weren't exercised, and PCIe work can change rounding according to the docs. Only 3 short prompts of up to 300 tokens were compared. In normal use the CPU share, tail skip, PCIe work and swaps stay on, so answers can still vary between runs on every engine.
 - **Earlier result replaced:** the first version of this check called the result inconclusive because the share was still on, so the control differed from itself.
+
+## `STRATA_PREFILL_CPU_SHARE=auto` (2026-11-03, stopped early)
+A friend reported about 60% faster prompt reading with no decode loss on 8 GB VRAM, DDR4 and a lower-end SSD. Tested here against unset on the daily setting, fresh engine per run; stopped at the user's request after 2 unset and 3 auto runs (one auto run unfinished), and the 8 GB app runs never ran. Not enough to decide, and not this PC's case: the engine's log showed the share already on in the unset runs.
+- **Prompt reading, first round, unset against auto:** 300 tokens 112-116 against 112-114 tok/s; 2,500 tokens 631-635 against 594-615; 26,000 tokens 1,410-1,428 against 1,388-1,404. No gain, if anything slightly slower.
+- **Decode:** 55.2-55.6 against 56.1-56.4 tok/s in the finished runs; the unfinished auto run was at 50.7.
+- **Paged out:** 0.6-13.1 against 16.9-24.2 GB/h over windows of about 2 minutes, too short to rely on.
+- **Lowest available RAM:** 1.64-1.71 against 1.56-1.63 GiB.
+
+## `--resident-budget-gib` 10 against 14 (2026-11-04)
+Daily setting, two SSDs, fresh engine per run. 4 runs at 10 GiB; 1 run at 14 GiB, run just before and not alternated, so the gaps are rough.
+
+| | 14 GiB (1 run) | 10 GiB (4 runs) |
+|---|---:|---:|
+| Coding answers | 51.5 tok/s | 48.2 tok/s (47.3-49.4) |
+| Prompt, 26K tokens | 1,491 tok/s | 1,424 tok/s (1,421-1,427) |
+| After that prompt | 42.6 tok/s | 34.6 tok/s (32.5-37.0) |
+| Follow-up | 50.5 tok/s | 40.0 tok/s (39.1-41.2) |
+| Image | 40.4 tok/s | 29.4 tok/s (27.0-30.7) |
+| Lowest available RAM | 0.7 GiB | 3.46 GiB (3.27-3.58) |
+| Paged out | 2.5 GB/h | 0.0-0.5 GB/h |
+| Damaged answers | 0 | 0 |
+
+- A later rerun at 10 GiB, stopped after 3 finished runs: coding answers 45.6, 47.0 and 46.3 tok/s, prompt 1,411, 1,429 and 1,437, after the prompt 26.4, 33.5 and 33.1, follow-up 41.0, 41.2 and 38.7, image 33.0, 32.3 and 33.1, lowest available RAM 4.46, 4.11 and 3.56 GiB, paged out 1.0, 0 and 0 GB/h.
+- The same four coding prompts gave 55.2-56.4 tok/s at 14 GiB in the CPU share test, so the coding loss at 10 GiB is about 6-14%.
+- At 10 GiB the whole tier page-locks ("page-locked and mapped", 3 s); at 14 GiB page-locking was refused and the tier took 12 s. The engine was ready in 12 s against 21 s.
+- Paging windows were about 1.5 minutes, too short for an SSD-wear figure.
+- **Test script flaw:** the "8 GB app" in `pressure_test.py`, `share_test.py` and `budget_test.py` grows with `held[0] += bytearray(...)`, which from the code briefly holds about twice the memory (not measured). The 145.6 GB/h paging figure above came from this script and may be too high. One 10 GiB run with the app was left out of the table.
+
+## What is in the engine's memory (2026-11-04)
+Stock model, 10 GiB tier, one short session; `memtools/mem_map.py` walks the address space with `VirtualQueryEx` and `QueryWorkingSetEx`. One run.
+
+| In RAM, GiB | Ready | After an 88K prompt |
+|---|---:|---:|
+| Expert tier | 10.00 | 10.00 |
+| Blocks of 64-256 MiB (checkpoints and parked conversations; this session parked 2) | 0.32 | 1.51 |
+| Blocks of 16-64 MiB | 0.09 | 0.73 |
+| K/V regions (13 of 266 MiB, 1 of 324 MiB) | 0.00 | 0.35 |
+| Under 16 MiB (3,938 to 4,503 regions), not yet identified | 1.61 | 2.95 |
+| **Total private** | **12.02** | **15.54** |
+
+- About 14.7 GiB more is committed but not in RAM at the end, including 3.34 GiB of K/V not yet filled and 122 blocks of 64 MiB that hold almost nothing. That costs commit limit, not RAM.
+- **This map misses memory the driver pinned:** it doesn't appear in the process working set. The ledger below finds it, and the K/V row above is therefore too low.
+- The 1,466 and 2,018 MiB of weights in the log are not held twice in the process's own memory: the blocks that size hold almost nothing. The map can't rule out a copy pinned by the driver.
+
+## Whole-PC memory ledger (2026-11-04)
+Stock model, 10 GiB tier, one conversation of three large turns reaching 85K tokens, no parking, no images, browser closed. `memtools/ledger.py`, one run. Free RAM with the engine off: 22.62 GiB of 31.8.
+
+| GiB | Ready | 85K context | After a minute idle |
+|---|---:|---:|---:|
+| Available (almost all standby) | 5.80 | 2.62 | 2.38 |
+| Engine, working set | 12.06 | 16.56 | 16.56 |
+| Engine, not in its working set (change in unaccounted RAM against engine off) | about 3.7 | about 3.0 | about 3.0 |
+| GPU counter `Shared Usage` | 14.52 | 14.52 | 14.52 |
+| GPU counter `Dedicated Usage` | 10.35 | 10.48 | 10.48 |
+| Page file | 2.1% | 2.1% | |
+
+- **The K/V looks pinned from the start:** about 3-3.7 GiB is held outside the working set from startup, which fits the logged 3.09 GiB. This is inferred from the accounting, not traced.
+- **Growth:** the working set rose 4.5 GiB by 85K tokens, in steps: +0.86 after a short request, +1.14, +0.23, then +2.27 on the last turn. It didn't fall during a minute idle. Most of it isn't identified; checkpoints account for about 0.6.
+- **No leak at exit:** available RAM returned to 22.49 GiB after the engine stopped.
+- **No paging in this run,** at 2.38 GiB available.
+- **Image encoder:** not running without an image, so it costs nothing until one is sent.
+- **Correction:** this run did park. The +2.27 GiB on the last turn was a 1,557 MiB snapshot of the same conversation, taken because the prompt differed 308 tokens from its end.
+
+## What the engine's memory growth is (2026-11-04)
+`memtools/mem_diff.py` diffs every private allocation turn by turn. One conversation to 114K tokens, one run, no large park.
+
+| Added to the working set | Size | What it is |
+|---|---:|---|
+| 256 blocks of 2.5 MiB, filled on the first request | 640 MiB | Expert stage buffers, from the code's "pool grows to ~257 buffers" |
+| 6 blocks of 112 MiB, then replaced one for one | 672 MiB | Checkpoints |
+| 33 blocks of about 21 MiB, on the first long prompt | 650 MiB | Not identified |
+
+The working set was flat from 85K to 114K tokens (14.58 GiB) and peaked at 14.4-14.6 GiB in all four runs below. So growth is bounded: nothing here climbs with context beyond these, apart from parked snapshots, which are capped by `--conversation-cache-mib`.
+
+## `STRATA_PARK_TAIL_MAX` (2026-11-04, off by default, not installed)
+Skips parking when a request is the same conversation with at most its last N tokens rewritten. Test engine `engine-memtest`, 2,048 tokens, client rewriting the end of its last answer on every turn, 2 runs each, about 116K tokens.
+
+| | Off | On |
+|---|---:|---:|
+| Peak working set | 14.62 GiB | 14.52 GiB |
+| Lowest available RAM | 2.0 GiB | 2.01 GiB |
+| Tokens read | 233,305 | 233,289 |
+| Decode | 43.6 tok/s | 43.5 tok/s |
+| Damaged answers | 0 | 0 |
+
+- **It works but saved nothing here:** it did skip all 4 parks, but with it off those parks were already refused by the RAM floor (`skip parking`). It can only help when more than the snapshot plus 2,560 MiB is free, and then the park doesn't take RAM below that floor. Not worth installing on this evidence.
+- **Bigger finding:** after one short side request, the 116K conversation was read again from the start in both settings: about 116,780 tokens, 77-79 s. The conversation's snapshot no longer fits the cache or the floor, so it's lost.
+
+## Real Claude Code session, saving off (2026-11-04)
+Installed engine, 10 GiB tier, `--conversation-cache-mib 0`, Claude Code doing a code review on copies of 5 engine files, 25 minutes, stopped by the time limit. `memtools/real_session.py`, one run.
+
+| | |
+|---|---:|
+| Paged out | 0.43 GB, 1.0 GB/h, 2 bursts of 20 MB/s or more (target: 0.3 GB/h) |
+| Page file | 3.1% to 4.4% |
+| Peak engine working set | 14.48 GiB |
+| Available RAM | lowest 3.33 GiB, median 4.23 GiB |
+| Requests | 22, up to 217K tokens, then compaction |
+| Speed | 44.4 tok/s over 56,946 tokens |
+| Long-context re-reads | 1, 14 s, after the compaction |
+
+- **Not comparable with the OpenCode session's 4.2 GB/h:** different harness, task and apps open. Saving off may have helped, but this doesn't show how much.
+- **No side requests:** the log shows no parking attempts, and `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1` was set. So the cost of saving off on a real conversation switch wasn't tested here.
+- **When it paged:** all 0.43 GB fell in 3 samples, 3-7 minutes into the session (36, 28 and 16 MB/s), with 3.7-4.3 GiB available and the engine's working set unchanged. Nothing of 5 MB/s or more in the remaining 18 minutes. So in this run it was one push when the load started, not a steady rate.
+- **Engine off, 10 minutes, apps open:** paged out 0.00 GB, available RAM at least 18.9 GiB, all disk writes 7.7 GB/h. So the paging comes from the engine's memory pressure, not from Windows on its own.
+
+## `--lookup-chain 3` (2026-11-04, no gain, not adopted)
+Installed engine, 10 GiB tier, saving off, fresh engine per run, 3 runs with the flag on. `memtools/lookup_test.py`. No off runs in this test: compared with the 10 GiB section above, so only a clear gap would count.
+
+| | `--lookup-chain 3` (3 runs) | Earlier 10 GiB, off |
+|---|---:|---:|
+| Coding answers | 48.5 tok/s (47.2-49.7) | 48.2 (47.3-49.4), rerun 45.6-47.0 |
+| Prompt, 26K tokens | 1,434 tok/s (1,432-1,436) | 1,424 (1,421-1,427), rerun 1,411-1,437 |
+| After that prompt | 35.3 tok/s (34.4-36.5) | 34.6 (32.5-37.0), rerun 26.4-33.5 |
+| File rewrite, 700 tokens | 33.1 tok/s (32.6-33.6) | none |
+| Damaged answers | 0 | 0 |
+
+- **Chain drafts were rare:** 11-28 of about 1,100-1,200 windows used one, and accepted chain drafts were 0.44%, 0.58% and 1.45% of the output. That is too few to move the speed.
+- **Suffix drafting probably already covers this:** it is on by default. In the first run's rewrite it drafted in 101 of 119 windows with 553 of 556 accepted; the chain added 9 drafts in 4 windows. That it leaves the chain little to do is an inference, not tested with suffix drafting off.
+- **Cost:** 522-525 MiB of VRAM free at start against 593 in the earlier real session, one slot fewer (1,977 against 1,978), lowest free 358-373 MiB. Different runs and app state, so the gap is rough.
+- **Follow-up not compared:** 31.3 tok/s (30.1-32.2) against 40.0, but the old prompt is lost with its script and this answer was short (126 tokens in the first run).
+- **Rewrite is slow although almost every draft is right:** the SSD wait is the whole drop. First run, rewrite against the coding request just before it (one request each; all 3 runs gave 32.6-33.6 tok/s and the first two hit rates checked were 33%):
+
+| | Coding (450 tokens) | Rewrite (700 tokens) |
+|---|---:|---:|
+| Per token | 22.1 ms | 30.1 ms |
+| SSD wait per token | 8.9 ms | 18.8 ms |
+| Everything else per token | 13.2 ms | 11.3 ms |
+| Tokens per window | 1.9 | 5.9 |
+| Experts served from VRAM / RAM / SSD | 60 / 29 / 11% | 40 / 22 / 37% |
+| Expert blobs from SSD per token | 55 | 122 |
+| Read from SSD while generating | 43.6 GB (4.4 GB/s) | about 174 GB (8.3 GB/s), worked out as 84,211 experts at 2.07 MB; the log's 209 GB seems to include the prompt read, since the 300-token answer after the 26K prompt shows 199 GB |
+| Experts per layer that needed a read | 3.3 | 14.8 |
+| Cache swaps per token | 3.2 | 1.0 |
+
+- **Why the SSD share rises, not established:** swaps run every 4 windows, so with bigger windows the cache learns about 3 times slower per token (the comment at `generate.cpp:3847` describes the same effect). The new text and the 1,657-token prompt before it may also count: the requests after the 26K file had 2.2-2.9 tokens per window and still only 36.6-41.9% hits. Earlier tests rule out the easy setting on coding prompts: `--adapt-every 2` gave 35.4 tok/s and 48 or 96 swaps gave no gain. Neither was tried on a rewrite.
+
+### `--suffix-draft 0` on the same workload (2 runs, against the 3 `--lookup-chain 3` runs above, not alternated)
+`memtools/suffix1`. The chain fired too rarely to matter, so those runs stand in for the default. Coding prompts had thinking on; the rewrite and the requests after the file had it off, so thinking and text type are not separated.
+
+| | Suffix drafting on | Off |
+|---|---:|---:|
+| Coding answers | 48.5 tok/s (47.2-49.7) | 45.4 (44.3-46.5) |
+| File rewrite | 33.1 tok/s (32.6-33.6) | 31.6 (30.6-32.5) |
+| Rewrite tokens per step | 5.9 | about 3.7 (700 tokens, 511-512 accepted drafts) |
+| Rewrite hit rate | 32.9-34.2% | 39.8-42.5% |
+| Rewrite experts from SSD | 36-37% | 29-32% |
+| Rewrite blobs from SSD per token | 119-122 | 106-117 |
+| Rewrite SSD wait per token | 18.0-18.8 ms | 18.3-20.2 ms |
+| Rewrite everything else per token | 11.3-11.9 ms | 12.5 ms |
+| After the 26K file | 35.3 tok/s (34.4-36.5) | 28.4 (26.5-30.3) |
+| Damaged answers | 0 | 0 |
+
+- **Big steps are not the main cause of the slow rewrite.** Smaller steps raised the hit rate, but SSD reads per token barely fell and SSD wait did not fall. Steps only shrank to about 3.7 tokens, not to the coding 1.9, so this does not rule out a part for step size.
+- **Reading per expert was not slower in the rewrite:** 0.18 ms per expert against 0.26 on coding (R per layer divided by experts per layer, first run), so the count of reads is the problem, not the drives slowing down.
+- Suffix drafting stays on. `--lookup-chain 3` left 522-525 MiB free and 1,977 slots here against 555-584 MiB and 1,980 slots without it, so it does cost a little VRAM.
+
+### Coding prompts with thinking off (2 runs, default flags, against the 3 `--lookup-chain 3` runs above, not alternated)
+`memtools/nothink1`, broken down with `memtools/req_breakdown.py`. Only the four coding prompts changed; the rewrite and the requests after the file had thinking off in both.
+
+| | Thinking on | Thinking off |
+|---|---:|---:|
+| First coding request | 39.7-42.0 tok/s | 32.9-34.2 |
+| Its SSD blobs per token | 52-56 | 101-102 |
+| Other three coding requests, mean | 51.0 tok/s (45.3-54.9) | 56.8 (50.8-62.1) |
+| Their SSD blobs per token | 34-55 | 40-54 |
+| Their tokens per step | about 1.9 (not recounted per request) | 3.1-3.4 |
+| Their everything-else time per token | 12.9-14.2 ms | 9.8-11.3 ms |
+| Rewrite afterwards | 33.1 tok/s, 119-122 blobs per token, hit 33-34% | 35.6, 96-102, hit 42-43% |
+| Answer after the 26K file | 35.3 tok/s, hit 40-42% | 26.0, hit 35% |
+| Damaged answers | 0 | 0 |
+
+- **Thinking is not why the rewrite is slow:** warmed-up new code with thinking off read about as little from the SSD as with thinking on.
+- **Copying is not needed for high reads either:** answers right after the 26K file are not copies and needed 121-129 blobs per token with thinking off. Every request above about 95 was a first request or came after a long prompt. Whether the long prompt itself is the cause is not tested. The follow-up (337 new tokens, 112-126 blobs per token) was also short, and short answers have low hit rates anyway.
+- **What ran before matters:** after code, the rewrite is faster and the English answer slower; after thinking text, the reverse. This fits a cache holding the recent kind of text, but it is only these two orderings.
+- **Not a free gain:** thinking off changes the answers, so it is not comparable as a speed setting. The 450-token limit may also mean the thinking-on "coding" figures are mostly reasoning text, not code; the answers were not saved, so this is not checked.
+
+### Coding prompts after about 1,600 unrelated tokens (2 runs, thinking off, against the thinking-off runs above, not alternated)
+`memtools/longprompt1`. Each coding prompt starts with a different 6,000-character part of `serve/server.py`, so nothing is reused.
+
+| | Short prompt | Long prompt |
+|---|---:|---:|
+| First coding request | 32.9-34.2 tok/s, 101-102 blobs per token | 33.9-34.0, 89-94 |
+| Other three coding requests | 56.8 tok/s (50.8-62.1), 40-54 blobs per token | 53.6 (49.0-58.8), 39-48 |
+| Rewrite afterwards | 35.6 tok/s, 96-102 blobs per token | 35.3, 99-101 |
+| Answer after the 26K file | 26.0 tok/s, 121-129 blobs per token | 31.3, 93-100 |
+| Damaged answers | 0 | 0 |
+
+- **A long prompt is not the cause:** at about 1,600 tokens, warmed-up new code reads no more from the SSD. A 26K prompt was not tested this way.
+- **The rewrite stays at 96-122 blobs per token in every test so far,** after warmed-up new code too, so the copied text itself is the best remaining explanation. Why copying needs more experts is not established.
+- Everything-else time on those three requests was 11.1-13.2 ms per token against 9.8-11.3, from 2 runs each.
+
+### Speed against context (the real Claude Code session above, per-request logs, one session, tasks change along the way)
+| Context | Tok/s | Per token | SSD wait | Everything else |
+|---|---:|---:|---:|---:|
+| 29-56K, 3 requests | 47.5 | 21.1 ms | 5.8 ms | 15.3 ms |
+| 158-217K, 5 requests | 42.6 | 23.5 ms | 7.2 ms | 16.3 ms |
+
+Means weighted by tokens, requests of 2,000 tokens or more. Rows per token stayed at about 1.4.
+
+| Context | Everything else per row | K/V blocks per row | Not in VRAM | K/V from RAM per row |
+|---|---:|---:|---:|---:|
+| 29K | 11.04 ms | 6,164 | 0.10% | 0.02 MiB |
+| 56K | 11.19 ms | 6,165 | 0.91% | 0.23 MiB |
+| 107K | 11.10 ms | 6,172 | 2.90% | 0.72 MiB |
+| 158K | 12.50 ms | 6,167 | 4.03% | 1.00 MiB |
+| 216K | 11.99 ms | 6,164 | 6.68% | 1.66 MiB |
+
+- **The attention work per row does not grow with context:** K/V blocks per row are flat. What grows is the share outside the 32,768 cells per layer held in VRAM.
+- **Part of the drop follows K/V reads from RAM (correlation only):** about 1 ms per row above 150K. 1.66 MiB per row at the measured 24.1 GB/s PCIe is about 0.07 ms, so bandwidth alone does not explain it; small-read delay would have to, which is not measured.
+- **More than half is SSD wait:** +1.4 ms of the +2.4 ms per token. Hit rates fell from 57-61% to 51-58%, but the agent's task changed too, so context is not established as the cause of that part.
+- **Correction:** an earlier reply said SSD wait barely changes with context. By the weighted means it is the larger part.
+- `--kv-resident 65536` was not tried. Estimated from the 13.7 KB per token in `docs/DETAILS.md`: about 450 MiB more VRAM, about 230 of 1,978 cache slots, for at most about 1 ms of 23.5 ms per token.
+
+### All K/V in VRAM (no `--kv-resident`, 2026-11-04, rejected, stopped after one run each)
+`memtools/kv_test.py`, `memtools/kv1`. Installed engine, 10 GiB tier, saving off, one run each, daily first.
+
+| | Daily (32,768 cells in VRAM) | All K/V in VRAM |
+|---|---:|---:|
+| Expert cache | 1,978 slots, 3.80 GiB | 367 slots, 0.71 GiB |
+| Coding answers | 44.6, 49.5, 55.6, 49.1 tok/s | 31.0, 37.5, 35.2, 35.2 |
+| Coding hit rate | 56-67% | 31-35% |
+| Coding experts from VRAM / RAM / SSD | 59-68 / 25-30 / 7-11% | 32-38 / 48-49 / 14-19% |
+| Everything else per token | 12.4-14.9 ms | 15.9-20.6 ms |
+| 204K-token prompt read | 143 s (1,423 tok/s) | not finished after about 15 minutes, stopped |
+| Answers at 204K | 36.3-47.3 tok/s | no result |
+| VRAM free at start | 544 MiB | 670 MiB |
+
+- The engine warned that all 238 lendable slots would read from the SSD during long prompts. The prompt read may still have been progressing when stopped; the log prints nothing until it ends, so a hang is not ruled out.
+- So the long-context question this was meant to answer has no number on this setting. It costs too much before that point.
+- Daily at 204K after warm-up gave 47.3 tok/s on two 800-token answers (hit 61.5-64.0%), which is as fast as the session's early requests, in a run with a synthetic prompt. One run, thinking on.
+
+## DFlash2 drafter on a compiled v0.2.10 (2026-11-04, 2 runs each, mixed order, not installed)
+`memtools/dflash_test.py`, `memtools/dflash1`. The installed engine 0.1.55 runs DFlash2 only from the command line, not with `--serve`, so v0.2.10 (engine 0.1.56) was compiled from the tag in a separate worktree, `strata-0210`, with the fork's engine change cherry-picked. Same build flags as the installed engine. The fork's `STRATA_SPEC_CUM_MIN` was dropped in the merge. Drafter: the Q4_0 pack with Q4_0 selector codebooks, `qwen3.8-flash-next-dflash2.q4_0-selq4.pack`.
+
+All arms: 10 GiB tier, saving off, 7 workers, vision on, temperature 0.6. MTP arms use `--spec 4 --spec-min-p 0.5`. The DFlash2 arm uses what the v0.2.10 launcher sets: `--spec 6 --draft-conf 0.8`, no MTP layer, windows up to 8 tokens. Mean (low-high), tok/s.
+
+| | Installed + MTP | v0.2.10 + MTP | v0.2.10 + DFlash2 |
+|---|---:|---:|---:|
+| Coding, thinking on, all 4 | 47.1 (46.6-47.6) | 47.4 (45.7-49.1) | 47.4 (45.0-49.9) |
+| Same, without the first request | 49.4 (48.8-50.0) | 49.6 (47.7-51.5) | 49.0 (46.5-51.6) |
+| Coding, thinking off | 51.9 (50.2-53.6) | 53.5 (52.1-54.9) | **62.3 (57.4-67.2)** |
+| Rewrite a file | 36.0 (35.4-36.7) | 38.0 (36.1-39.8) | 36.2 (34.2-38.2) |
+| Right after a 26K-token file | 29.3 (27.7-30.9) | 28.6 (27.0-30.3) | **37.1 (36.3-38.0)** |
+| Follow-up on that file | 31.9 (31.5-32.4) | 31.7 (31.1-32.2) | 34.1 (33.3-34.9) |
+| Prompt read | 1,417 | 1,415 | 1,392 |
+| Expert cache slots | 1,978 | 1,974 | 2,102 |
+| VRAM free with everything loaded | 527-577 MiB | 541-561 MiB | 643-644 MiB |
+| Accepted of drafted, after the file | 57-70% | 56-62% | 81-94% |
+| SSD wait per token, after the file | 15.5-17.7 ms | 15.1-17.2 ms | 9.5-10.0 ms |
+| SSD blobs per token, after the file | 104-117 | 106-111 | 66-71 |
+| Tokens per step, thinking on | 1.7-2.3 | 1.7-2.4 | 1.6-2.0 |
+| Tokens per step, thinking off | 3.1-3.3 | 3.1-3.4 | 3.5-3.7 |
+
+- v0.2.10 alone gives nothing measurable. Its MTP arm is inside the installed arm's range or close to it on everything, and the rewrite difference is within noise at 2 runs.
+- DFlash2 ranges do not overlap the MTP ranges on thinking off, after a file and follow-up. Best single answers 68.3 and 66.0 tok/s, thinking off.
+- Thinking on, the work the coding prompts mostly do, does not change. DFlash2 makes smaller windows there (1.6-2.0 tokens per step) with fewer wrong drafts (accepted 79-87% of drafted, MTP 56-72%), and the two cancel.
+- Most likely reason for the after-file gain: MTP's rejected drafts still pull their experts in, so fewer wrong drafts means fewer SSD reads. The table fits that, but it was not tested on its own.
+- Answers: 0 damaged in all 6 runs. Rewrites had no copy errors in any arm; the only changed source line is the last one, cut off by the 700-token limit. Answers were only checked by these rules and by reading the openings of a few; sampled answers differ per run, so there is no identical-output comparison.
+- The engine warns on this card: "on a 12 GB NVIDIA card the MTP drafter was faster in most measurements". sm_89 is not in its tested list. On this workload it is not slower anywhere beyond noise.
+- Not measured: a long real session. The release notes report about 0 gain in long agent sessions on another machine. Also not measured: paging and RAM use on DFlash2, and answer quality beyond the checks above. The daily config is unchanged.
+
+## Smallest config beside Roblox Studio (2026-11-04, 2 runs, not daily)
+`strata/strata-studio.json`, `run-strata-studio.bat`, `memtools/studio_bench.py`, `memtools/studio2`. Installed engine, Studio open with 3 windows. Changes from daily: `--max-context 65536`, `--resident-budget-gib 1`, no `--kv-resident`, `--pool-workers 4`, `--vram-reserve-mib 1024`. Thinking on, fresh engine per run, 1,264 cache slots.
+
+| | Run 1 | Run 2 |
+|---|---:|---:|
+| Short context, generation, 4 answers | 18.4, 21.3, 19.6, 19.7 tok/s | 18.5, 22.3, 20.2, 18.6 tok/s |
+| Short context, prefill (69-84 tokens) | 22-36 tok/s | 21-36 tok/s |
+| Long context, prefill, 50,046 tokens | 886 tok/s (56 s) | 884 tok/s (57 s) |
+| Long context, generation | 14.4 tok/s (177 tokens) | 15.1 tok/s (270 tokens) |
+| Follow-up at long context, generation | 17.3 tok/s | 17.7 tok/s |
+| Paged out | 0.1 GB/h | 0.0 GB/h |
+| Paged in | 21.3 GB/h | 11.9 GB/h |
+| Lowest available RAM | 2.12 GiB | 2.80 GiB |
+| Engine working set, peak | 5.08 GiB | 5.09 GiB |
+| Lowest free VRAM | 883 MiB | 838 MiB |
+| Studio working set, start to end | 12.11 to 11.72 GiB | 11.73 to 9.64 GiB |
+
+- **An earlier mixed run, with a play test starting during it:** 0.6 GB/h paged out, 121.5 GB/h paged in, lowest available RAM 0.24 GiB, 18.4-21.9 tok/s, one image at 10.3 tok/s with 0 MiB of VRAM free at its start (`memtools/studio1`). 0 damaged answers.
+- **Windows of about 3.5 minutes:** too short to rely on the paging figures.
+- **Studio's working set fell by about 2.5 GiB across the two runs.** Windows may have trimmed it or Studio may have released it; not traced. Whether Studio stuttered wasn't measured.
+- **Not compared with daily at 50K:** no daily run has this prompt, and daily doesn't fit beside Studio.
+
+## Each drafter's own time (2026-11-04, 2 runs each, order DFlash2, MTP, MTP, DFlash2)
+`memtools/drafter_speed.py`, `memtools/drafter1`. v0.2.10 engine, the minimum Studio memory settings, thinking on, temperature 0, suffix drafting off. MTP `--spec 4 --spec-min-p 0.5`, DFlash2 `--spec 6 --draft-conf 0.8`. Draft time is the engine's `STRATA_DECODE_TIMING` figure per window.
+
+| | DFlash2 | MTP |
+|---|---:|---:|
+| Short context, draft time | 2.54-2.57 ms | 2.15-2.56 ms |
+| Short context, whole window | 81.5-86.0 ms | 104.4-120.2 ms |
+| Short context, draft share of the window | 3.0-3.1% | 2.1% |
+| 26K context, draft time | 2.73-2.80 ms | 2.66-3.14 ms |
+| 26K context, whole window | 99.5-108.9 ms | 148.3-167.5 ms |
+| 26K context, draft share of the window | 2.6-2.7% | 1.8-1.9% |
+| Short context, tokens per window | 1.61-1.71 | 2.01-2.05 |
+| Short context, acceptance | 88.7-92.8% | 73.5-74.9% |
+| 26K context, acceptance | 83.6-87.8% | 68.5-73.7% |
+| Short context, 4 answers, tok/s | 18.8, 21.0 | 16.8, 19.9 |
+| 26K context, tok/s | 16.9, 18.7 | 13.9, 15.2 |
+
+- **Finding:** the two drafters take about the same time, and drafting is about 2-3% of a window. Removing it entirely would gain little.
+- **The speed rows aren't a fair drafter comparison:** Studio was open for some runs and closed by the end, not noted when, and cache slots moved from 1,059-1,066 on MTP to 1,375-1,638 on DFlash2. DFlash2's first run took 477 s against 152-183 s for the others; cause not checked.
+- **The acceptance gap follows the gate:** DFlash2 offers about 0.7-0.8 drafts per window against about 1.4 for MTP. Reports on other cards at similar draft volume (Strata #5129, #3965) show about equal acceptance or MTP slightly ahead. Not tested here at equal volume.
+
+## `STRATA_HC_Q8=1` and `STRATA_ROUTE_TAIL_SKIP=5` (2026-11-04, 2 runs each, mixed order, not adopted)
+`memtools/switch_test.py`, `memtools/switch1`. Installed engine, daily config (10 GiB tier, saving off), Studio closed, thinking on, temperature 0.6, fresh engine per run. Order: normal, HC, tail, tail, normal, HC.
+
+| | Normal | `STRATA_HC_Q8=1` | `STRATA_ROUTE_TAIL_SKIP=5` |
+|---|---:|---:|---:|
+| Short context, generation | 48.2, 44.6 tok/s | 49.3, 50.5 tok/s | **59.6, 59.7 tok/s** |
+| Prefill, 50,046 tokens | 1,337, 1,376 tok/s | **1,501, 1,505 tok/s** | 1,366, 1,407 tok/s |
+| Generation at 50K | 37.3, 30.7 tok/s | 42.4, 36.7 tok/s | **46.8, 48.7 tok/s** |
+| Follow-up, generation | 37.9, 40.8 tok/s | 39.2, 39.0 tok/s | **48.1, 50.4 tok/s** |
+| Tokens per step, short context | 1.92, 2.05 | 1.90, 2.22 | 2.01, 2.08 |
+| Cache slots | 1,978 | 2,181 | 1,978 |
+| Paged out | 17.67, 0.03 GB/h | 0.0, 0.0 GB/h | 0.0, 0.0 GB/h |
+| Damaged answers | 0 | 0 | 0 |
+
+- **Tail skip 5 is the biggest gain on this PC so far, about 28% at short context.** The ranges don't overlap normal's. It raises speed per step, not tokens per step. It zeroes more experts, so it changes answers.
+- **HC_Q8:** frees about 390 MiB of VRAM as about 200 more slots; prefill about 10% faster; generation about 8% faster at short context, within noise at 50K and follow-up.
+- **Quality not measured.** Neither switch can be judged until `tools/quant_quality.py` shows the perplexity cost. Not installed, not in setup.
+- **Normal's first paging figure** covers under 2 minutes straight after other tests, so it shouldn't be read as this arm's rate.
+- **`STRATA_ROUTE_TAIL_SKIP_FILE`:** not found in upstream. Added to this fork as an opt-in switch. It skips from the given rank only for experts that would be read from the file. Start-up check only, one 300-token answer each, not a benchmark: off 42.1 tok/s and 29,746 experts skipped, `=5` 44.2 tok/s and 39,552 skipped, so it fires. Speed and quality not measured.
 
 ## Measurement tools added
 - `STRATA_ROUTE_TRACE=<path>`: records expert routing to a file (`src/core/expert_source.cpp`). Off unless set.
