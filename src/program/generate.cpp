@@ -11273,6 +11273,9 @@ int main(int argc, char** argv) {
         }
         if (o.adapt_every > 0 && o.adapt_swaps > 0 && !all_experts_resident)
             drive.d.usage.assign((size_t) (g.n_layers * g.n_expert), 0.0f);
+        // STRATA_RAM_THROUGH: only on the one-GPU path it was tested on; the floor follows --adapt-decay (through_retarget)
+        if (!drive.d.usage.empty() && srcp == &src && !multi_gpu && o.peer_device < 0 && o.pipeline_windows <= 0 && o.batch == 0)
+            src.set_through_floor(2.0f * o.adapt_decay);
         PcieAuto pcie_auto;
         if (o.pcie_frac_auto && !all_experts_resident && o.batch == 0 && o.peer_device < 0 && (n_stages == 1 || pcie_auto_split_ok())) {
             const auto& pl = strata::kernels::cpu::expert_layout();
@@ -17032,6 +17035,7 @@ int main(int argc, char** argv) {
                 // the largest difference first.  One blob read each, on this thread; the RAM stays the same size, and
                 // the routing, the weights and the VRAM tier's own rule are untouched.
                 static const int ram_adapt_n = [] {
+                    if (const char* t = std::getenv("STRATA_RAM_THROUGH"); t != nullptr && t[0] == '1') return 0;   // the reads themselves move the tier
                     const char* e = std::getenv("STRATA_RAM_ADAPT");
                     return e != nullptr ? std::max(0, std::atoi(e)) : 0;
                 }();
