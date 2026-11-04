@@ -4,9 +4,11 @@ Qwen3.8-Flash-Next abliterated IQ3_S pack, 262K context, MTP on (`--spec 4 --spe
 SSD. No working-set or page locking of the RAM tier (`STRATA_RESIDENT_PIN=0`). Measured with `tools/strata_bench.py`
 (2 runs, median) and a decode A/B script (300 tokens x 3 prompts, temperature 0, alternating arms).
 
-The engine switches named below were written on a local copy of this fork and are **not in this PR**. They are all
-opt-in, and the default path is unchanged. This page records what was measured, including what didn't work, so the
-numbers are useful before the code lands.
+The new engine switches used here come with this page, all opt-in with the default path unchanged:
+`STRATA_POOL_FUSED`, `STRATA_IQ3_VBMI`, `STRATA_LM_CPU_ROWS`, `STRATA_HEAD_FAST_LOAD`, `STRATA_HEAD_ALIAS_SHORT`,
+`STRATA_REFILL_PINNED`, `STRATA_EXPERTS_MIRROR_SHARE` and the diagnostic `STRATA_POOL_PHASE_TIMING`. The file-read tail
+skip is the speed-fork's own `STRATA_ROUTE_TAIL_SKIP_FILE`. The dead ends below (pageable PCIe share, MWAITX parking and
+the rest) were measured on a local build and are not included.
 
 ## Result
 
