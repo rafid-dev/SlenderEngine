@@ -81,7 +81,7 @@ int main(int argc, char** argv) {
         cpu::native_quant_act(f, x.data(), act[t].data());
         cpu::act_quant_any(x.data(), cpu::H, qact[t]);
     }
-    int checks = 0, split_checks = 0, mixed_checks = 0;
+    int checks = 0, split_checks = 0, mixed_checks = 0, fused_checks = 0;
     for (int n : {1, 7, cpu::ExpertPool::kMaxSplitMulti + 1}) {
         std::vector<cpu::ExpertJobMulti> jobs(n);
         std::vector<float> out((size_t) n * cpu::MAXT * cpu::H);
@@ -116,6 +116,28 @@ int main(int argc, char** argv) {
                     ++checks;
                 }
             }
+        // STRATA_POOL_FUSED=1: gate/up and down rows in one batch (mode 7), the same bits as the two phases; spin 0 on
+        // the second pass so the late-wake path runs under it too
+        put_env("STRATA_POOL_FUSED", "1");
+        for (const char* spin : {"20000", "0"}) {
+            put_env("STRATA_POOL_SPIN_US", spin);
+            for (bool host : {false, true}) for (int workers : {1, 3, 7})
+                for (int tasks : {0, 1, 41, cpu::ExpertPool::kMaxTasks}) {
+                    cpu::ExpertPool pool(workers, false, host, cpu::PoolAffinity::All, tasks);
+                    for (int repeat = 0; repeat < 3; ++repeat) {
+                        for (const auto& job : jobs) for (int t = 0; t < job.nt; ++t) nan_h(job.out[t]);
+                        pool.run_split_multi_native(f, jobs.data(), n);
+                        if (std::memcmp(ref.data(), out.data(), out.size() * sizeof(float)) != 0) {
+                            std::fprintf(stderr, "fused mismatch n=%d workers=%d host=%d tasks=%d spin=%s repeat=%d\n",
+                                         n, workers, host, tasks, spin, repeat);
+                            return 1;
+                        }
+                        ++fused_checks;
+                    }
+                }
+        }
+        unset_env("STRATA_POOL_FUSED");
+        unset_env("STRATA_POOL_SPIN_US");
         // STRATA_NUMA_SPLIT=test: two slices without a real second node (thread j -> slice j % 2), every worker
         // sleeping between batches (spin 0) so the late-wake path of issue #29 runs constantly
         put_env("STRATA_NUMA_SPLIT", "test");
@@ -368,6 +390,7 @@ int main(int argc, char** argv) {
     }
 #endif
     std::printf("pool tasks: %d bitwise comparisons passed, %d of them in NUMA-split mode (%d with modes 0-4 "
-                "interleaved)\n", checks + split_checks + mixed_checks, split_checks + mixed_checks, mixed_checks);
+                "interleaved), %d fused (STRATA_POOL_FUSED)\n", checks + split_checks + mixed_checks + fused_checks,
+                split_checks + mixed_checks, mixed_checks, fused_checks);
     return 0;
 }

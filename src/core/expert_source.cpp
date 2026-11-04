@@ -2989,8 +2989,14 @@ bool FileExpertSource::read_direct(const Fill* fills, size_t n) const {
         const Req& r = sc.req[q];
         uint8_t* to = r.out != nullptr ? r.out : sc.buf + r.pos;
         constexpr uint64_t kSplitMin = 256ull << 10;
+        // STRATA_EXPERTS_MIRROR_SHARE (default 0.5): the mirror's part of each read.  Two unequal drives finish together
+        // when it matches the mirror's share of their combined speed (a 7.1 + 3.5 GB/s pair: 0.33); at 0.5 the slower one paces both.
+        static const double mirror_share = [] {
+            const char* e = std::getenv("STRATA_EXPERTS_MIRROR_SHARE");
+            return e != nullptr ? std::clamp(std::atof(e), 0.05, 0.95) : 0.5;
+        }();
         if (direct_mirror_ != nullptr && r.size >= kSplitMin) {
-            const uint64_t half = r.size / 2 / kSector * kSector;
+            const uint64_t half = (uint64_t) ((double) r.size * (1.0 - mirror_share)) / kSector * kSector;
             sc.io.push_back({r.h, r.a0, half, to, q});
             sc.io.push_back({(HANDLE) direct_mirror_, r.a0 + half, r.size - half, to + half, q});
         } else {

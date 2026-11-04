@@ -456,6 +456,82 @@ bool refill_blocking() {
     return v;
 }
 
+// STRATA_REFILL_PINNED=N (fork, opt-in, 1..16): the slots a batched prompt borrowed are refilled by N threads, each
+// reading runs of 2 blobs (copy_blobs: the RAM copy, or merged unbuffered reads) into its own two pinned buffers and
+// copying them up on its own stream, instead of this thread reading every blob and queueing a pageable copy.  The
+// lent experts are the GPU tier's, which the RAM copy complements, so nearly all are file reads (~1 GB, 380 ms on
+// one thread).  Pinned: 4 blobs per thread (~10.6 MB), kept for the process.  Returns 1 done, 0 not available (the
+// caller refills as before, nothing written), -1 failed (`err`).
+int refill_pinned_threads() {
+    static const int n = [] {
+        const char* v = std::getenv("STRATA_REFILL_PINNED");
+        return v ? std::clamp(std::atoi(v), 0, 16) : 0;
+    }();
+    return n;
+}
+int refill_pinned(strata::core::ExpertSource& src, strata::core::ExpertCache& cache, int dev,
+                  const std::vector<std::pair<int32_t, int32_t>>& lent, int64_t n_layers, int64_t n_expert, std::string& err) {
+    constexpr int kRun = 2;
+    struct Lane { uint8_t* buf[2] = {}; cudaEvent_t done[2] = {}; cudaStream_t st = nullptr; bool ready = false; };
+    static Lane lanes[16];   // ponytail: one device only (the caller checks), freed by the driver at exit
+    static bool failed = false;   // an allocation failed once: the old refill from then on (no retry, no leak)
+    if (failed || cache.sealed()) return 0;   // a sealed cache (STRATA_EXPERT_NIBBLE) is never written
+    const int nt = std::min<int>(refill_pinned_threads(), (int) lent.size());
+    const auto& lay = strata::kernels::cpu::expert_layout();
+    size_t maxb = 0;   // every layer's, so the lanes made at first use fit every later loan
+    for (int64_t l = 0; l < n_layers; ++l) maxb = std::max(maxb, (size_t) lay.blob_bytes(l));
+    const strata::core::OnDevice on(dev);
+    for (int t = 0; t < nt; ++t) {   // first use: the buffers, events and streams
+        Lane& L = lanes[t];
+        if (L.ready) continue;
+        for (int b = 0; b < 2; ++b)
+            if (cudaHostAlloc((void**) &L.buf[b], maxb * kRun, cudaHostAllocDefault) != cudaSuccess ||
+                cudaEventCreateWithFlags(&L.done[b], cudaEventDisableTiming) != cudaSuccess) {
+                (void) cudaGetLastError();
+                failed = true;
+                return 0;
+            }
+        if (cudaStreamCreateWithFlags(&L.st, cudaStreamNonBlocking) != cudaSuccess) {
+            (void) cudaGetLastError();
+            failed = true;
+            return 0;
+        }
+        L.ready = true;
+    }
+    // the prompt path's last kernels read the lent slots on its own streams: they are done before a byte is copied
+    if (cudaDeviceSynchronize() != cudaSuccess) { err = "refill: the device failed before the refill"; return -1; }
+    std::atomic<bool> ok{true};
+    std::vector<std::thread> th;
+    for (int t = 0; t < nt; ++t)
+        th.emplace_back([&, t] {
+            const strata::core::OnDevice on_t(dev);
+            Lane& L = lanes[t];
+            const size_t a = lent.size() * (size_t) t / (size_t) nt, z = lent.size() * (size_t) (t + 1) / (size_t) nt;
+            int b = 0;
+            for (size_t j = a; j < z && ok.load(std::memory_order_relaxed); j += kRun, b ^= 1) {
+                const size_t n = std::min<size_t>(kRun, z - j);
+                int32_t ls[kRun], es[kRun];
+                uint8_t* ds[kRun];
+                for (size_t k = 0; k < n; ++k) {
+                    ls[k] = (int32_t) (lent[j + k].first / n_expert);
+                    es[k] = (int32_t) (lent[j + k].first % n_expert);
+                    ds[k] = L.buf[b] + k * maxb;
+                }
+                if (cudaEventSynchronize(L.done[b]) != cudaSuccess || !src.copy_blobs(ls, es, ds, n)) { ok = false; break; }
+                for (size_t k = 0; k < n; ++k) {
+                    uint8_t* d = cache.device_slot(lent[j + k].second);
+                    if (d == nullptr || cudaMemcpyAsync(d, ds[k], (size_t) lay.blob_bytes(ls[k]), cudaMemcpyHostToDevice, L.st) != cudaSuccess)
+                        ok = false;
+                }
+                if (cudaEventRecord(L.done[b], L.st) != cudaSuccess) ok = false;
+            }
+            if (cudaStreamSynchronize(L.st) != cudaSuccess) ok = false;
+        });
+    for (std::thread& x : th) x.join();
+    if (!ok) { err = "refill: a pinned refill copy failed"; return -1; }
+    return 1;
+}
+
 using Clock = std::chrono::steady_clock;
 
 // --pipeline-windows: every STRATA_PIPELINE_* test and tuning variable (THETA, FORCE_MISS, SWITCH, LOG, TRACE, DOOM_SKIP,
@@ -14180,17 +14256,49 @@ int main(int argc, char** argv) {
                 std::printf("ERR %s\n", err.c_str());
                 return 1;
             }
-            if (o.prefill_head_alias && native_head.loaded()) {
+            // STRATA_HEAD_ALIAS_SHORT=N (opt-in, with --prefill-head-alias): the head stays loaded at the request's start,
+            // a part of at most N tokens reads through the verify windows (as --short-read N would), and the head becomes
+            // prompt workspace only at the first part read batched.  Unset: the head goes at every request's start.
+            static const int64_t alias_short = [] {
+                const char* v = std::getenv("STRATA_HEAD_ALIAS_SHORT");
+                return v != nullptr ? (int64_t) std::max(0LL, std::atoll(v)) : (int64_t) 0;
+            }();
+            const bool alias_defer = o.prefill_head_alias && alias_short > 0 && !kvg.on;
+            auto alias_out = [&]() -> bool {   // the head out, the prompt workspace in
+                if (!o.prefill_head_alias || !native_head.loaded()) return true;
                 const auto head_t0 = Clock::now();
                 native_head.unload();
                 sp.reset();
                 if (init_prompt_paths() != 0) {
                     std::printf("ERR rebuilding the head-alias prompt path failed: %s\n", err.c_str());
-                    return 1;
+                    return false;
                 }
                 std::fprintf(stderr, "strata serve: --prefill-head-alias: prompt workspace rebuilt in %.1f ms\n",
                              std::chrono::duration<double, std::milli>(Clock::now() - head_t0).count());
-            }
+                tr("head out");
+                return true;
+            };
+            auto alias_in = [&]() -> bool {   // the prompt workspace out, the head back
+                if (!o.prefill_head_alias || native_head.loaded()) return true;
+                sp.reset();
+                const auto head_t0 = Clock::now();
+                if (!native_head.load(o.native_head_shards, g.n_embd, n_vocab, err)) {
+                    std::printf("ERR restoring the native output head failed: %s\n", err.c_str());
+                    return false;
+                }
+                // the verify windows' captured graphs read the head at the address of their capture
+                if (prefill_head_alias_at == nullptr) prefill_head_alias_at = native_head.weights();
+                if (native_head.weights() != prefill_head_alias_at) {
+                    std::printf("ERR --prefill-head-alias: the output head was reloaded at another address, so the "
+                                "captured verify graphs would read freed memory\n");
+                    return false;
+                }
+                std::fprintf(stderr, "strata serve: --prefill-head-alias: output head restored in %.1f ms before decode\n",
+                             std::chrono::duration<double, std::milli>(Clock::now() - head_t0).count());
+                tr("head in");
+                return true;
+            };
+            if (!alias_defer && !alias_out()) return 1;
             auto kv_quiesce = adapt_quiesce;
             if (kvg.on) {   // the elastic K/V: this prompt's cells (it gives back what it does not need below)
                 // a failed growth may leave the tier half-changed: the engine stops (as for any CUDA failure)
@@ -14836,7 +14944,8 @@ int main(int argc, char** argv) {
             // read batched and its header still goes through the windows.  Picture rows need the batched path.
             // STRATA_CKPT_REREAD compares a restored checkpoint with a batched re-read, so it keeps every read batched.
             static const bool no_short = std::getenv("STRATA_CKPT_REREAD") != nullptr;
-            int64_t req_short_read = o.short_read;   // STRATA_PIPELINE_SWITCH may set it per request (short_read=)
+            // STRATA_PIPELINE_SWITCH may set it per request (short_read=)
+            int64_t req_short_read = alias_defer ? alias_short : o.short_read;
             if (short_read_off_once) {   // #3465: the request after non-finite logits in a prompt window
                 short_read_off_once = false;
                 req_short_read = 0;
@@ -14845,6 +14954,7 @@ int main(int argc, char** argv) {
             }
             auto windows_ok = [&](int64_t a, int64_t b) -> bool {
                 if (no_short || b - a > req_short_read) return false;
+                if (alias_defer && !native_head.loaded()) return false;   // the windows need the head
                 if (sp.embd_rows != nullptr)
                     for (int64_t i = a; i < b; ++i)
                         if (sp.embd_rows[i] != nullptr) return false;
@@ -15039,6 +15149,15 @@ int main(int argc, char** argv) {
             auto refill_issue = [&](PfPart& p, std::string& e) -> bool {
                 tr("refill start", (long long) p.lent.size());
                 const strata::core::OnDevice on(p.dev);
+                if (refill_pinned_threads() > 0 && !refill_parts && !refill_blocking() && pf_parts.size() == 1 &&
+                    srcp == &src) {   // STRATA_REFILL_PINNED (fork): see refill_pinned
+                    const int rp = refill_pinned(*srcp, *p.cache, p.dev, p.lent, g.n_layers, g.n_expert, e);
+                    if (rp < 0) return false;
+                    if (rp > 0) {
+                        for (const auto& [i, slot] : p.lent) host_res[(size_t) i] = slot;
+                        return true;
+                    }
+                }
                 for (const auto& [i, slot] : p.lent) {   // D-4: queued, one wait (STRATA_REFILL_BLOCKING=1: each)
                     strata::core::BlobPart parts[3];
                     const int np = refill_parts && !refill_blocking() ? srcp->blob_parts(i / g.n_expert, i % g.n_expert, parts) : 0;
@@ -15988,6 +16107,15 @@ int main(int argc, char** argv) {
             for (const int64_t to : cuts) {
                 if (to <= at) continue;
                 err.clear();
+                // STRATA_HEAD_ALIAS_SHORT: a short last part after a batched one gets the head back first and goes
+                // through the windows (the batched path streams every expert its few tokens route to)
+                if (alias_defer && !native_head.loaded() && to == n - 1 && to - at <= req_short_read) {
+                    if (!refill(err)) {
+                        std::printf("ERR refilling a lent slot failed: %s\n", err.c_str());
+                        return 1;
+                    }
+                    if (!alias_in()) return 1;
+                }
                 const bool win = windows_ok(at, to);
                 if (win && !refill(err)) {
                     std::printf("ERR refilling a lent slot failed: %s\n", err.c_str());
@@ -15997,6 +16125,7 @@ int main(int argc, char** argv) {
                 // another, and the loan decides which experts are read in place: bits)
                 const int64_t plan_lend = resume_plan.chunk > 0 && at == resume_plan_at && to == resume_plan_end
                                               ? resume_plan.lend : 0;
+                if (!win && alias_defer && !alias_out()) return 1;
                 if (!win && !lend(to - at, err, plan_lend)) {
                     std::printf("ERR lending the prompt path its slots failed: %s\n", err.c_str());
                     return 1;
@@ -16063,23 +16192,7 @@ int main(int argc, char** argv) {
                 std::printf("ERR refilling a lent slot failed: %s\n", err.c_str());
                 return 1;
             }
-            if (o.prefill_head_alias) {
-                sp.reset();
-                const auto head_t0 = Clock::now();
-                if (!native_head.load(o.native_head_shards, g.n_embd, n_vocab, err)) {
-                    std::printf("ERR restoring the native output head failed: %s\n", err.c_str());
-                    return 1;
-                }
-                // the verify windows' captured graphs read the head at the address of their capture
-                if (prefill_head_alias_at == nullptr) prefill_head_alias_at = native_head.weights();
-                if (native_head.weights() != prefill_head_alias_at) {
-                    std::printf("ERR --prefill-head-alias: the output head was reloaded at another address, so the "
-                                "captured verify graphs would read freed memory\n");
-                    return 1;
-                }
-                std::fprintf(stderr, "strata serve: --prefill-head-alias: output head restored in %.1f ms before decode\n",
-                             std::chrono::duration<double, std::milli>(Clock::now() - head_t0).count());
-            }
+            if (!alias_in()) return 1;
             tr("prompt done (slots refilled)");
             if (il_parts > 0)
                 std::fprintf(stderr, "strata batch: the prompt was read in %lld parts, the slots decoding %.0f ms between "
@@ -16140,6 +16253,10 @@ int main(int argc, char** argv) {
                                drive.d.pcie_experts};
             };
             const DecSnap ds0 = dec_snap();
+            // STRATA_POOL_PHASE_TIMING: the rows phases of this request's decode only
+            const double pq0 = pool.ms_multi_q;
+            pool.pt_park_ms = pool.pt_wall_ms = pool.pt_tail_ms = pool.pt_busy_ms = 0;
+            pool.pt_phases = 0;
             double dt_run = 0, dt_commit = 0, dt_draft = 0;
             double dt_adapt_wait = 0, dt_adapt_join = 0;   // the tier's wait before a window / join after the draft (ms, summed)
             const int64_t dt_sw0 = ajob ? a_swapped : adapt_nswaps;
@@ -17304,6 +17421,12 @@ int main(int argc, char** argv) {
                                  (d1.entries - ds0.entries) / (w * L), (d1.hits - ds0.hits) / (w * L), (d1.pcie - ds0.pcie) / (w * L),
                                  dt_adapt_wait / w, dt_adapt_join / w, (double) ((ajob ? a_swapped : adapt_nswaps) - dt_sw0) / w);
                 }
+                if (pool.pt_phases > 0)
+                    std::fprintf(stderr, "strata pool phases: %.1f rows phases/window, wall %.2f (host tail %.2f) + parked waits "
+                                         "%.2f + quantize %.2f ms/window; tasks busy %.1f%% of %d threads x wall\n",
+                                 (double) pool.pt_phases / w, pool.pt_wall_ms / w, pool.pt_tail_ms / w, pool.pt_park_ms / w,
+                                 (pool.ms_multi_q - pq0) / w,
+                                 100.0 * pool.pt_busy_ms / std::max(1e-9, pool.pt_wall_ms * pool.pt_threads()), pool.pt_threads());
                 if (at_on) {
                     std::fprintf(stderr, "strata adapt timing: RAM moves %.2f, snapshot %.2f, copies back %.2f (table upload %.2f), flip %.2f, release %.2f, pending %.2f, whole tick %.2f ms/window\n",
                                  at_ram / w, at_snap / w, at_back / w, at_res / w, at_flip / w, at_rel / w, at_pend / w, at_tick / w);

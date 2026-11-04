@@ -61,6 +61,100 @@ inline __m512i scales4(int s0, int s1, int s2, int s3) {
     return _mm512_permutexvar_epi16(idx, _mm512_set1_epi64((long long) packed));
 }
 
+inline __mmask64 sign_mask_from_idx(__m256i si);
+inline __m256i sign_idx_xxs(uint32_t lo4, uint32_t hi4);
+
+// fork: STRATA_IQ3_VBMI=1 (opt-in; needs AVX512_VBMI and VPOPCNTDQ): the IQ3_S / IQ3_XXS grids of a whole block by byte
+// permutes of nibble tables held in registers, instead of 16 scalar lookups and a set_epi32 per 64 values (IQ3_XXS's signs
+// and scales per block too: one multishift + one ksigns_iq2xs byte permute).  The same grid bytes and sign bits, so the results are bit for bit the scalar decode's.
+// Ryzen 7 8845HS microbench, one core: IQ3_S 3.3 -> 6.5-8.2 GB/s, IQ3_XXS 4.6 -> 6.3 GB/s; 8 threads from DRAM
+// 14.7 -> 25.7 and 30.2 -> 41.9 GB/s (DRAM gives ~57): the scalar lookups, not memory, bound these rows.
+inline bool cpu_vbmi_popcnt() {   // AVX512_VBMI, VPOPCNTDQ and AVX512VL (the 256-bit popcount)
+#if defined(_MSC_VER)
+    int r[4];
+    __cpuidex(r, 7, 0);
+    const unsigned b = (unsigned) r[1], c = (unsigned) r[2];
+#else
+    unsigned a, b, c, d;
+    __cpuid_count(7, 0, a, b, c, d);
+#endif
+    return ((c >> 1) & 1u) != 0 && ((c >> 14) & 1u) != 0 && ((b >> 31) & 1u) != 0;
+}
+const bool vbmi3 = [] {
+    const char* v = std::getenv("STRATA_IQ3_VBMI");
+    return v != nullptr && std::atoi(v) != 0 && cpu_vbmi_popcnt();
+}();
+// (IQ2_S the same way - 10-bit indices through two byte planes of 2-bit codes, 16 vpermt2b + 14 blends a block - is exact
+// but 2x SLOWER than its 8 scalar u64 lookups a chunk: 2.8 vs 5.8 GB/s a core.  Not kept.)
+struct Iq3Tables {
+    // per grid entry two bytes of 4-bit codes (entry bytes 0,1 -> s_a, 2,3 -> s_b): IQ3_S grid bytes are 1..15 (the
+    // code is the byte), IQ3_XXS's are {4,12,20,28,36,44,52,62} (code 0-7, mapped back by `xlut`)
+    alignas(64) uint8_t s_a[512], s_b[512], x_a[256], x_b[256], expand[4][64], xlut[64];
+    Iq3Tables() {
+        for (int i = 0; i < 512; ++i) {
+            const uint32_t g = iq3s_grid[i];
+            s_a[i] = (uint8_t) ((g & 15) | (((g >> 8) & 15) << 4));
+            s_b[i] = (uint8_t) (((g >> 16) & 15) | (((g >> 24) & 15) << 4));
+        }
+        static const uint8_t xv[8] = {4, 12, 20, 28, 36, 44, 52, 62};
+        auto code = [](uint8_t v) { for (int c = 0; c < 8; ++c) if (xv[c] == v) return c; std::abort(); };
+        for (int i = 0; i < 256; ++i) {
+            const uint32_t g = iq3xxs_grid[i];
+            x_a[i] = (uint8_t) (code((uint8_t) g) | (code((uint8_t) (g >> 8)) << 4));
+            x_b[i] = (uint8_t) (code((uint8_t) (g >> 16)) | (code((uint8_t) (g >> 24)) << 4));
+        }
+        // chunk j, output byte 4m+t (entry 16j+m, its byte t): the packed byte from a (t<2) or b (t>=2), nibble t&1
+        for (int j = 0; j < 4; ++j)
+            for (int m = 0; m < 16; ++m)
+                for (int t = 0; t < 4; ++t) expand[j][4 * m + t] = (uint8_t) ((t < 2 ? 0 : 64) + 16 * j + m);
+        for (int l = 0; l < 4; ++l)
+            for (int c = 0; c < 16; ++c) xlut[16 * l + c] = c < 8 ? xv[c] : 0;
+    }
+};
+const Iq3Tables iq3t;
+// the packed codes of a block's 64 entries -> the four 64-value chunks (codes, one per byte)
+inline void iq3_expand(__m512i a, __m512i b, __m512i g[4]) {
+    const __m512i lo4 = _mm512_set1_epi8(15);
+    const __mmask64 odd = _cvtu64_mask64(0xAAAAAAAAAAAAAAAAull);
+    for (int j = 0; j < 4; ++j) {
+        const __m512i ab = _mm512_permutex2var_epi8(a, _mm512_load_si512((const void*) iq3t.expand[j]), b);
+        g[j] = _mm512_mask_blend_epi8(odd, _mm512_and_si512(ab, lo4), _mm512_and_si512(_mm512_srli_epi16(ab, 4), lo4));
+    }
+}
+inline void grid21_vbmi(const uint8_t* blk, __m512i g[4]) {   // IQ3_S: 9-bit indices (qh bit 8), four 128-entry quarters
+    const __m512i* A = (const __m512i*) iq3t.s_a;
+    const __m512i* B = (const __m512i*) iq3t.s_b;
+    const __m512i q = _mm512_loadu_si512((const void*) (blk + 2));
+    const __mmask64 hb = _cvtu64_mask64(u64(blk + 66)), m7 = _mm512_movepi8_mask(q);
+    const __m512i a = _mm512_mask_blend_epi8(hb,
+        _mm512_mask_blend_epi8(m7, _mm512_permutex2var_epi8(A[0], q, A[1]), _mm512_permutex2var_epi8(A[2], q, A[3])),
+        _mm512_mask_blend_epi8(m7, _mm512_permutex2var_epi8(A[4], q, A[5]), _mm512_permutex2var_epi8(A[6], q, A[7])));
+    const __m512i b = _mm512_mask_blend_epi8(hb,
+        _mm512_mask_blend_epi8(m7, _mm512_permutex2var_epi8(B[0], q, B[1]), _mm512_permutex2var_epi8(B[2], q, B[3])),
+        _mm512_mask_blend_epi8(m7, _mm512_permutex2var_epi8(B[4], q, B[5]), _mm512_permutex2var_epi8(B[6], q, B[7])));
+    iq3_expand(a, b, g);
+}
+// IQ3_XXS, g[0..3] the grid chunks as before; g[4..7] chunk j's scales4 and g[8] the block's 32 sign bytes (low 256 bits): the
+// 32 7-bit sign fields by one multishift, ksigns_iq2xs by one 128-entry byte permute, the scale nibbles by one permute per chunk
+inline void grid18_vbmi(const uint8_t* blk, __m512i g[9]) {   // IQ3_XXS: 8-bit indices, two 128-entry halves, codes -> bytes
+    const __m512i* A = (const __m512i*) iq3t.x_a;
+    const __m512i* B = (const __m512i*) iq3t.x_b;
+    const __m512i q = _mm512_loadu_si512((const void*) (blk + 2));
+    const __mmask64 m7 = _mm512_movepi8_mask(q);
+    const __m512i a = _mm512_mask_blend_epi8(m7, _mm512_permutex2var_epi8(A[0], q, A[1]), _mm512_permutex2var_epi8(A[2], q, A[3]));
+    const __m512i b = _mm512_mask_blend_epi8(m7, _mm512_permutex2var_epi8(B[0], q, B[1]), _mm512_permutex2var_epi8(B[2], q, B[3]));
+    iq3_expand(a, b, g);
+    const __m512i lut = _mm512_load_si512((const void*) iq3t.xlut);
+    for (int j = 0; j < 4; ++j) g[j] = _mm512_shuffle_epi8(lut, g[j]);
+    const __m256i w = _mm256_loadu_si256((const __m256i*) (blk + 66));   // qword j = (a_j, c_j)
+    const __m256i f = _mm256_and_si256(_mm256_multishift_epi64_epi8(_mm256_set1_epi64x(0x352E2720150E0700ll), w), _mm256_set1_epi8(127));
+    g[8] = _mm512_permutex2var_epi8(_mm512_loadu_si512((const void*) ksigns_iq2xs), _mm512_zextsi256_si512(f),
+                                    _mm512_loadu_si512((const void*) (ksigns_iq2xs + 64)));
+    const __m512i sv = _mm512_zextsi256_si512(_mm256_add_epi32(_mm256_slli_epi32(_mm256_srli_epi32(w, 28), 1), _mm256_set1_epi32(1)));
+    for (int j = 0; j < 4; ++j)   // words 0-15 a_j's scale (dword 2j's low word), 16-31 c_j's (dword 2j+1)
+        g[4 + j] = _mm512_permutexvar_epi16(_mm512_inserti64x4(_mm512_set1_epi16((short) (4 * j)), _mm256_set1_epi16((short) (4 * j + 2)), 1), sv);
+}
+
 // ---- per format: 64 values (chunk j of a 256-value block) -> grid magnitudes, sign mask, scales
 template <int TY> struct Fmt;
 
@@ -129,15 +223,22 @@ template <> struct Fmt<22> {   // IQ2_S: d, qs[64] (32 grid bytes, 32 sign bytes
 template <> struct Fmt<18> {   // IQ3_XXS: d, qs[64] grid bytes, 8 x u32 (4 x 7-bit sign index + 4-bit scale)
     static constexpr int bytes = 98;
     static constexpr float K = 0.25f;
-    static inline void decode(const uint8_t* b, int j, __m512i& g, __mmask64& m, __m512i& sc) {
+    // pre: grid18_vbmi's grid chunks, scales and sign bytes for the whole block (STRATA_IQ3_VBMI)
+    static inline void decode(const uint8_t* b, int j, __m512i& g, __mmask64& m, __m512i& sc, const __m512i* pre = nullptr) {
         const uint8_t* q = b + 2 + 16 * j;
+        const uint32_t a = u32(b + 2 + 64 + 8 * j), c = u32(b + 2 + 64 + 8 * j + 4);
+        if (pre) {   // grid18_vbmi's nine vectors
+            g = pre[j];
+            sc = pre[4 + j];
+            m = _cvtu64_mask64((uint64_t) _mm_cvtsi128_si64(_mm512_castsi512_si128(_mm512_permutexvar_epi64(_mm512_set1_epi64(j), pre[8]))));
+            return;
+        }
         // E-2: one gather of the 16 grid words (the scalar lookups assembled with set_epi32 cost ~30 uops)
         g = gather ? _mm512_i32gather_epi32(_mm512_cvtepu8_epi32(_mm_loadu_si128((const __m128i*) q)), iq3xxs_grid, 4)
                    : _mm512_set_epi32((int) iq3xxs_grid[q[15]], (int) iq3xxs_grid[q[14]], (int) iq3xxs_grid[q[13]], (int) iq3xxs_grid[q[12]],
                              (int) iq3xxs_grid[q[11]], (int) iq3xxs_grid[q[10]], (int) iq3xxs_grid[q[9]], (int) iq3xxs_grid[q[8]],
                              (int) iq3xxs_grid[q[7]], (int) iq3xxs_grid[q[6]], (int) iq3xxs_grid[q[5]], (int) iq3xxs_grid[q[4]],
                              (int) iq3xxs_grid[q[3]], (int) iq3xxs_grid[q[2]], (int) iq3xxs_grid[q[1]], (int) iq3xxs_grid[q[0]]);
-        const uint32_t a = u32(b + 2 + 64 + 8 * j), c = u32(b + 2 + 64 + 8 * j + 4);
         const uint64_t s = (uint64_t) ksigns_iq2xs[a & 127] | ((uint64_t) ksigns_iq2xs[(a >> 7) & 127] << 8) |
                            ((uint64_t) ksigns_iq2xs[(a >> 14) & 127] << 16) | ((uint64_t) ksigns_iq2xs[(a >> 21) & 127] << 24) |
                            ((uint64_t) ksigns_iq2xs[c & 127] << 32) | ((uint64_t) ksigns_iq2xs[(c >> 7) & 127] << 40) |
@@ -151,10 +252,12 @@ template <> struct Fmt<18> {   // IQ3_XXS: d, qs[64] grid bytes, 8 x u32 (4 x 7-
 template <> struct Fmt<21> {   // IQ3_S: d, qs[64], qh[8], signs[32], scales[4]
     static constexpr int bytes = 110;
     static constexpr float K = 1.0f;
-    static inline void decode(const uint8_t* b, int j, __m512i& g, __mmask64& m, __m512i& sc) {
+    static inline void decode(const uint8_t* b, int j, __m512i& g, __mmask64& m, __m512i& sc, const __m512i* pre = nullptr) {
         const uint8_t* q = b + 2 + 16 * j;
         const uint32_t h0 = b[66 + 2 * j], h1 = b[66 + 2 * j + 1];
-        if (gather) {   // E-2: the 9-bit indices (the high bit from qh under a mask), one gather
+        if (pre) {   // grid21_vbmi (STRATA_IQ3_VBMI)
+            g = pre[j];
+        } else if (gather) {   // E-2: the 9-bit indices (the high bit from qh under a mask), one gather
             __m512i idx = _mm512_cvtepu8_epi32(_mm_loadu_si128((const __m128i*) q));
             idx = _mm512_mask_add_epi32(idx, (__mmask16) (h0 | (h1 << 8)), idx, _mm512_set1_epi32(256));
             g = _mm512_i32gather_epi32(idx, iq3s_grid, 4);
@@ -198,10 +301,20 @@ inline void row_dot(const uint8_t* row, int nblocks, const block_q8_K* const* y,
         }
         __m512i acci[NT];
         for (int t = 0; t < NT; ++t) acci[t] = _mm512_setzero_si512();
+        __m512i g4[TY == 18 ? 9 : 4];
+        const __m512i* pre = nullptr;
+        if constexpr (TY == 18 || TY == 21) {
+            if (vbmi3) {
+                if constexpr (TY == 21) grid21_vbmi(blk, g4);
+                else grid18_vbmi(blk, g4);
+                pre = g4;
+            }
+        }
         for (int j = 0; j < 4; ++j) {
             __m512i g, sc;
             __mmask64 m;
-            Fmt<TY>::decode(blk, j, g, m, sc);
+            if constexpr (TY == 18 || TY == 21) Fmt<TY>::decode(blk, j, g, m, sc, pre);
+            else Fmt<TY>::decode(blk, j, g, m, sc);
             for (int t = 0; t < NT; ++t) {
                 const __m512i yv = _mm512_loadu_si512((const void*) (y[t][i].qs + 64 * j));
                 const __m512i ys = _mm512_mask_sub_epi8(yv, m, zero, yv);
