@@ -218,6 +218,8 @@ public:
     virtual bool pinned(int64_t layer, int64_t expert) const { (void) layer; (void) expert; return false; }
     /// STRATA_ROUTE_TAIL_SKIP_FILE: false only where reading the expert means going to the file.
     virtual bool in_ram_tier(int64_t layer, int64_t expert) const { (void) layer; (void) expert; return true; }
+    /// STRATA_RAM_THROUGH: this layer's routing and usage counts, just before its reads are claimed.
+    virtual void through_context(const int32_t* ids, int64_t n, const float* usage, int64_t n_tok) { (void) ids; (void) n; (void) usage; (void) n_tok; }
 
     /// Called once before the first expert of a layer.  A source that reads from disk wants to start the read
     /// here so it overlaps the quantisation, and a prefetching source in Phase 3 wants the ids.
@@ -791,6 +793,9 @@ public:
     /// Whether the compact copy holds `(layer, expert)`.
     bool has_resident(int64_t layer, int64_t expert) const;
     bool in_ram_tier(int64_t layer, int64_t expert) const override { return has_resident(layer, expert); }
+    void through_context(const int32_t* ids, int64_t n, const float* usage, int64_t n_tok) override;
+    /// STRATA_RAM_THROUGH: a victim's usage count stays under this (0: nothing is admitted).  See through_retarget.
+    void set_through_floor(float f) { through_floor_ = f; }
     /// Host room for `n` evicted blobs (page-locked when possible).  Idempotent for the same or a smaller `n`.
     /// `bounce`: how many of the last buffers are only staged through and never hold an exchange (STRATA_EXCHANGE_ROTATE
     /// keeps those in the largest block size alone).
@@ -1152,7 +1157,22 @@ private:
     // blob's sectors straight into one, the blob `stage_skip_` bytes in, with no copy out of a scratch buffer.
     std::vector<uint32_t> stage_skip_;
     std::vector<char> stage_in_place_;
-    uint8_t* stage_ptr(size_t v) const { return stage_buf_[v].get() + stage_skip_[v]; }
+    // STRATA_RAM_THROUGH: a read that lands straight in a RAM tier place: the buffer's own memory is unused and the blob is at stage_alias_[v].
+    std::vector<uint8_t*> stage_alias_;
+    std::vector<size_t> stage_land_i_;                ///< the expert whose RAM place is set when this read lands (SIZE_MAX: none)
+    std::vector<uint64_t> stage_land_at_;
+    struct ThroughLive { size_t v; int64_t key; };
+    std::vector<ThroughLive> through_live_;           ///< the aliases of the layer just run, dropped before the next one's claims
+    std::vector<uint8_t> through_routed_;             ///< this layer's routed experts: not victims
+    const float* through_usage_ = nullptr;
+    float through_floor_ = 0.0f;
+    bool through_on_ = false, through_padded_ = false;
+    uint64_t through_admits_ = 0, through_said_ = 0, through_checked_at_ = 0;
+    void through_retarget(int64_t layer);
+    void through_purge();
+    void through_land(size_t v);
+    void through_verify();
+    uint8_t* stage_ptr(size_t v) const { return stage_alias_[v] != nullptr ? stage_alias_[v] : stage_buf_[v].get() + stage_skip_[v]; }
     Fill stage_fill(size_t v, int64_t layer, int64_t e) const { return {v, layer, e, stage_ptr(v), stage_in_place_[v] != 0}; }
     // set_direct_ahead: the read-ahead's queue and threads
     struct AheadItem { int64_t layer, e; uint64_t epoch; };

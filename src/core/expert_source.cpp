@@ -1639,6 +1639,10 @@ void FileExpertSource::close() {
         stage_free_events();
         stage_buf_.clear();
         stage_skip_.clear();
+        stage_alias_.clear();
+        stage_land_i_.clear();
+        stage_land_at_.clear();
+        through_live_.clear();
         stage_in_place_.clear();
         stage_key_.clear();
         stage_epoch_.clear();
@@ -1856,6 +1860,12 @@ void FileExpertSource::StageBufFree::operator()(uint8_t* p) const noexcept {
 //
 // `claim_stage` finds or reserves the buffer of `key` (stage_mu_ held): true when the blob is already there (or
 // being filled by another thread - the caller then waits), false when the caller must fill buffer `v`.
+// STRATA_RAM_THROUGH=1 (opt-in): a missed expert's read lands straight in the RAM place of the layer's least used expert that isn't
+// routed this layer, so admitting it costs no copy.  Replaces the STRATA_RAM_ADAPT moves.  The tier's places are padded and 4 KiB
+// aligned, as an unbuffered read needs, and a read never touches a neighbour.  STRATA_RAM_THROUGH_VERIFY=N: every N admits, the
+// whole tier against the file.
+namespace { bool ram_through_env() { static const bool on = [] { const char* v = std::getenv("STRATA_RAM_THROUGH"); return v != nullptr && v[0] == '1'; }(); return on; } }
+
 bool FileExpertSource::claim_stage(int64_t key, size_t& v, bool& fill, bool ahead) {
     constexpr uint64_t kStageSeq = 256;
     const uint64_t seq = ++stage_seq_;
@@ -1911,6 +1921,9 @@ bool FileExpertSource::claim_stage(int64_t key, size_t& v, bool& fill, bool ahea
         if (raw == nullptr) return false;
         stage_buf_.emplace_back(raw, StageBufFree{pinned, aligned});
         stage_skip_.push_back(0);
+        stage_alias_.push_back(nullptr);
+        stage_land_i_.push_back(SIZE_MAX);
+        stage_land_at_.push_back(0);
         stage_in_place_.push_back(0);
         stage_idx_[raw] = stage_buf_.size() - 1;
         stage_ev_.push_back(nullptr);
@@ -1956,6 +1969,8 @@ bool FileExpertSource::claim_stage(int64_t key, size_t& v, bool& fill, bool ahea
     stage_busy_[v] = 1;
     stage_of_[key] = v;
     stage_skip_[v] = 0;
+    stage_alias_[v] = nullptr;
+    stage_land_i_[v] = SIZE_MAX;
     stage_in_place_[v] = 0;
     if (stage_buf_[v].get_deleter().aligned && role_ptr_.empty() && !direct_.empty()) {
         const int64_t l = key / n_expert_;
@@ -2277,6 +2292,7 @@ int64_t FileExpertSource::prefetch_begin(int64_t layer, const int64_t* experts, 
         return 0;
     }
     prefetch_end();
+    through_purge();
     async_todo_.clear();
     async_fill_us_ = 0;
     static const int mode_env = [] {   // as the dispatch reads it (0.2.0: unset = 4 for the GGUF read in place on Linux)
@@ -2285,6 +2301,7 @@ int64_t FileExpertSource::prefetch_begin(int64_t layer, const int64_t* experts, 
     }();
     const int mode = mode_env >= 0 ? mode_env : (linux_file_defaults() ? 4 : 0);
     claim_todo(layer, experts, n, async_todo_, pending, mode >= 3);
+    if (through_on_) through_retarget(layer);
     if (mode == 4) {   // zero-copy only: the blobs that must be read are read here, as `prefetch` reads them
         const auto t0 = std::chrono::steady_clock::now();
         fill_many(async_todo_);
@@ -2305,19 +2322,29 @@ int64_t FileExpertSource::prefetch_begin(int64_t layer, const int64_t* experts, 
     async_end_ns_.store(0, std::memory_order_relaxed);
     const bool direct = !direct_.empty();
     const bool dec = tl_decode;
+    // STRATA_DIRECT_BATCH=N (opt-in, 1-64, default 16): how many blobs a reader reads and publishes together.
+    static const size_t direct_batch = [] {
+        const char* v = std::getenv("STRATA_DIRECT_BATCH");
+        const int b = v != nullptr ? std::atoi(v) : 16;
+        return (size_t) (b >= 1 && b <= 64 ? b : 16);
+    }();
     auto work = [this, direct, dec] {
         tl_decode = dec;
         const std::vector<Fill>& todo = async_todo_;
         if (direct) {
-            for (size_t at; (at = async_next_.fetch_add(16)) < todo.size();) {
-                const size_t k = std::min<size_t>(16, todo.size() - at);
+            for (size_t at; (at = async_next_.fetch_add(direct_batch)) < todo.size();) {
+                const size_t k = std::min<size_t>(direct_batch, todo.size() - at);
                 const auto t0 = std::chrono::steady_clock::now();
                 const bool ok = read_direct(todo.data() + at, k);
                 const double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count();
                 for (size_t i = at; i < at + k; ++i) {
                     const Fill& f = todo[i];
-                    if (ok) publish_stage(f.v, f.layer, true, us / (double) k);
-                    else (void) fill_stage(f.v, f.layer, f.e, f.dst);
+                    if (ok) {
+                        through_land(f.v);
+                        publish_stage(f.v, f.layer, true, us / (double) k);
+                    } else if (fill_stage(f.v, f.layer, f.e, f.dst)) {
+                        through_land(f.v);
+                    }
                 }
             }
         } else {
@@ -2329,11 +2356,124 @@ int64_t FileExpertSource::prefetch_begin(int64_t layer, const int64_t* experts, 
         int64_t cur = async_end_ns_.load(std::memory_order_relaxed);
         while (ns > cur && !async_end_ns_.compare_exchange_weak(cur, ns, std::memory_order_relaxed)) {}
     };
-    const size_t nt = direct ? std::min<size_t>(4, (async_todo_.size() + 15) / 16)
+    const size_t nt = direct ? std::min<size_t>(4, (async_todo_.size() + direct_batch - 1) / direct_batch)
                              : std::min<size_t>(async_todo_.size(), (size_t) std::max(1, fetch_threads_));
     if (cold_kept_readers() && nt <= 4) kept_readers_.run((int) nt, work);
     else for (size_t t = 0; t < nt; ++t) async_th_.emplace_back(work);
     return np;
+}
+
+void FileExpertSource::through_context(const int32_t* ids, int64_t n, const float* usage, int64_t n_tok) {
+    through_on_ = false;
+    if (!through_padded_ || usage == nullptr || n_tok > 16) return;   // decode windows only: a prompt's chunks would churn the tier
+    through_routed_.assign((size_t) n_expert_, 0);
+    for (int64_t i = 0; i < n; ++i)
+        if (ids[i] >= 0 && ids[i] < n_expert_) through_routed_[(size_t) ids[i]] = 1;
+    through_usage_ = usage;
+    through_on_ = true;
+}
+
+void FileExpertSource::through_retarget(int64_t layer) {
+    through_on_ = false;
+    if (async_todo_.empty() || !complement_ready_ || complement_host_ == nullptr || direct_.empty() || !role_ptr_.empty() ||
+        exchange_storage_.active() || fs_swap_.load(std::memory_order_acquire) != nullptr) return;
+    // a round's incoming expert had a count of at least 2 when it was chosen, and the counts decay once a round (generate.cpp, a_pick):
+    // under 2 x --adapt-decay an expert can't be one a round in flight is reading or filling.  generate.cpp sets the floor.
+    const float victim_below = through_floor_;
+    if (victim_below <= 0.0f) return;
+    const size_t lo = (size_t) layer * (size_t) n_expert_;
+    const uint64_t blob = layer_blob_bytes_[(size_t) layer];
+    static thread_local std::vector<std::pair<float, int32_t>> cand;
+    cand.clear();
+    for (int32_t e = 0; e < (int32_t) n_expert_; ++e) {
+        const size_t i = lo + (size_t) e;
+        if (complement_offsets_[i] == kNoComplement || through_routed_[(size_t) e]) continue;
+        if (!override_.empty() && override_[i] != nullptr) continue;
+        if (through_usage_[e] < victim_below) cand.emplace_back(through_usage_[e], e);
+    }
+    const size_t want = std::min(cand.size(), async_todo_.size());
+    if (want == 0) return;
+    std::partial_sort(cand.begin(), cand.begin() + (std::ptrdiff_t) want, cand.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
+    uint8_t* host = (uint8_t*) complement_host_;
+    size_t c = 0;
+    std::lock_guard<std::mutex> lk(stage_mu_);
+    for (Fill& f : async_todo_) {
+        if (c >= want) break;
+        const size_t i_in = lo + (size_t) f.e;
+        if (complement_offsets_[i_in] != kNoComplement || (!override_.empty() && override_[i_in] != nullptr)) continue;
+        const size_t i_out = lo + (size_t) cand[c++].second;
+        const uint64_t base = complement_offsets_[i_out] / 4096 * 4096;
+        const uint64_t r = (layer_offsets_[(size_t) layer] + (uint64_t) f.e * blob) % 4096;
+        if (base + r + blob > complement_bytes_) continue;
+        if (const auto it = stage_of_.find((int64_t) i_out); it != stage_of_.end() && stage_alias_[it->second] != nullptr) {
+            stage_alias_[it->second] = nullptr;   // an older alias of this place
+            stage_key_[it->second] = -1;
+            stage_of_.erase(it);
+        }
+        complement_offsets_[i_out] = kNoComplement;
+        f.dst = host + (size_t) (base + r);
+        f.in_place = true;
+        stage_alias_[f.v] = f.dst;
+        stage_land_i_[f.v] = i_in;
+        stage_land_at_[f.v] = base + r;
+        through_live_.push_back({f.v, (int64_t) i_in});
+        ++through_admits_;
+    }
+    if (through_admits_ - through_said_ >= 32768) {
+        through_said_ = through_admits_;
+        std::fprintf(stderr, "strata ram through: %llu reads landed straight in the RAM tier\n", (unsigned long long) through_admits_);
+    }
+}
+
+void FileExpertSource::through_land(size_t v) {
+    const size_t i = stage_land_i_[v];
+    if (i == SIZE_MAX) return;
+    complement_offsets_[i] = stage_land_at_[v];
+    stage_land_i_[v] = SIZE_MAX;
+}
+
+void FileExpertSource::through_purge() {
+    if (through_live_.empty()) return;
+    {
+        // the blob now lives in the tier: a stage entry must not outlast this layer, as a later exchange or read could reuse the place
+        std::lock_guard<std::mutex> lk(stage_mu_);
+        for (const ThroughLive& x : through_live_) {
+            if (stage_key_[x.v] != x.key || stage_alias_[x.v] == nullptr) continue;
+            stage_of_.erase(x.key);
+            stage_key_[x.v] = -1;
+            stage_alias_[x.v] = nullptr;
+        }
+        through_live_.clear();
+    }
+    static const uint64_t every = [] { const char* v = std::getenv("STRATA_RAM_THROUGH_VERIFY"); return v != nullptr ? (uint64_t) std::atoll(v) : (uint64_t) 0; }();
+    if (every > 0 && through_admits_ - through_checked_at_ >= every && staged_.empty()) {
+        through_checked_at_ = through_admits_;
+        through_verify();
+    }
+}
+
+void FileExpertSource::through_verify() {
+    const auto t0 = std::chrono::steady_clock::now();
+    std::vector<uint8_t> file;
+    uint64_t checked = 0, differ = 0;
+    const uint8_t* host = (const uint8_t*) complement_host_;
+    for (int64_t l = 0; l < n_layers_; ++l) {
+        const uint64_t blob = layer_blob_bytes_[(size_t) l];
+        file.resize((size_t) blob);
+        for (int64_t e = 0; e < n_expert_; ++e) {
+            const uint64_t at = complement_offsets_[(size_t) l * (size_t) n_expert_ + (size_t) e];
+            if (at == kNoComplement) continue;
+            const Fill f{0, l, e, file.data(), false};
+            if (!read_direct(&f, 1)) { std::fprintf(stderr, "strata ram through verify: read of layer %lld expert %lld failed\n", (long long) l, (long long) e); continue; }
+            ++checked;
+            if (std::memcmp(host + (size_t) at, file.data(), (size_t) blob) != 0) {
+                if (differ < 8) std::fprintf(stderr, "strata ram through verify: layer %lld expert %lld differs from the file\n", (long long) l, (long long) e);
+                ++differ;
+            }
+        }
+    }
+    std::fprintf(stderr, "strata ram through verify: %llu admits so far, %llu blobs checked, %llu differ, %.1f s\n", (unsigned long long) through_admits_,
+                 (unsigned long long) checked, (unsigned long long) differ, std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
 }
 
 FileExpertSource::KeptReaders::~KeptReaders() {
@@ -2846,6 +2986,10 @@ bool FileExpertSource::end_startup_unbuffered(std::string& why) {
         std::lock_guard<std::mutex> lk(stage_mu_);
         stage_buf_.clear();
         stage_skip_.clear();
+        stage_alias_.clear();
+        stage_land_i_.clear();
+        stage_land_at_.clear();
+        through_live_.clear();
         stage_in_place_.clear();
         stage_key_.clear();
         stage_epoch_.clear();
@@ -3009,6 +3153,9 @@ bool FileExpertSource::read_direct(const Fill* fills, size_t n) const {
         sc.ev.push_back(e);
     }
     sc.ov.assign(sc.io.size(), OVERLAPPED{});
+    // STRATA_READ_TRACE=1 (measurement only): watches each request finish, so it spins on this reader while it does
+    static const bool read_trace = [] { const char* v = std::getenv("STRATA_READ_TRACE"); return v != nullptr && v[0] == '1'; }();
+    const auto trace_t0 = read_trace ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     // every request in flight before the first wait: the drive sees the whole batch as one queue
     size_t issued = 0;
     bool ok = true;
@@ -3023,6 +3170,44 @@ bool FileExpertSource::read_direct(const Fill* fills, size_t n) const {
             break;
         }
         ++issued;
+    }
+    if (read_trace && ok && issued > 0) {
+        // when each request ends, each blob could have been used, and the batch published it
+        static std::atomic<uint64_t> tr_batches{0}, tr_blobs{0}, tr_issue_ns{0}, tr_first_ns{0}, tr_last_ns{0}, tr_gap_ns{0}, tr_gap_n{0};
+        static std::atomic<uint64_t> tr_size[6]{};
+        const double issue_ns = std::chrono::duration<double, std::nano>(std::chrono::steady_clock::now() - trace_t0).count();
+        std::vector<double> req_done(sc.req.size(), 0.0);
+        std::vector<uint8_t> io_done(issued, 0);
+        double first = -1.0, last = 0.0;
+        for (size_t left = issued; left > 0;) {
+            for (size_t q = 0; q < issued; ++q) {
+                if (io_done[q] || !HasOverlappedIoCompleted(&sc.ov[q])) continue;
+                const double t = std::chrono::duration<double, std::nano>(std::chrono::steady_clock::now() - trace_t0).count();
+                io_done[q] = 1;
+                --left;
+                if (first < 0.0) first = t;
+                last = std::max(last, t);
+                req_done[sc.io[q].req] = std::max(req_done[sc.io[q].req], t);
+            }
+            YieldProcessor();
+        }
+        uint64_t gap = 0;
+        for (const Window& x : sc.win) gap += (uint64_t) (last - req_done[x.req]);
+        tr_gap_ns.fetch_add(gap, std::memory_order_relaxed);
+        tr_gap_n.fetch_add(sc.win.size(), std::memory_order_relaxed);
+        tr_issue_ns.fetch_add((uint64_t) issue_ns, std::memory_order_relaxed);
+        tr_first_ns.fetch_add((uint64_t) first, std::memory_order_relaxed);
+        tr_last_ns.fetch_add((uint64_t) last, std::memory_order_relaxed);
+        tr_blobs.fetch_add(n, std::memory_order_relaxed);
+        tr_size[n <= 1 ? 0 : n == 2 ? 1 : n == 3 ? 2 : n == 4 ? 3 : n <= 8 ? 4 : 5].fetch_add(1, std::memory_order_relaxed);
+        const uint64_t b = tr_batches.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (b % 2048 == 0)
+            std::fprintf(stderr, "strata read trace: %llu batches, %llu blobs; blobs per batch 1:%llu 2:%llu 3:%llu 4:%llu 5-8:%llu 9+:%llu; per batch issue %.0f us, first done %.0f us, last done %.0f us; "
+                                 "a finished blob waits %.0f us for its batch\n",
+                         (unsigned long long) b, (unsigned long long) tr_blobs.load(), (unsigned long long) tr_size[0].load(), (unsigned long long) tr_size[1].load(),
+                         (unsigned long long) tr_size[2].load(), (unsigned long long) tr_size[3].load(), (unsigned long long) tr_size[4].load(), (unsigned long long) tr_size[5].load(),
+                         (double) tr_issue_ns.load() / 1e3 / (double) b, (double) tr_first_ns.load() / 1e3 / (double) b, (double) tr_last_ns.load() / 1e3 / (double) b,
+                         (double) tr_gap_ns.load() / 1e3 / (double) std::max<uint64_t>(tr_gap_n.load(), 1));
     }
     std::vector<DWORD>& got = sc.got;
     got.assign(sc.req.size(), 0);
@@ -3879,15 +4064,21 @@ bool FileExpertSource::pin_cache_complement(
         std::vector<uint64_t> ranked(offsets.size(), kNoComplement);
         uint64_t at = 0;
         int64_t held = 0;
+        // STRATA_RAM_THROUGH: each place 4 KiB aligned with the sectors around its blob, so a read can land in it; the blob sits at its file offset's remainder
+        const bool through_pad = ram_through_env() && role_ptr_.empty();
+        const auto place_bytes = [&](uint64_t b) { return through_pad ? (b + 8192 + 4095) / 4096 * 4096 : b; };
+        const auto place_at = [&](int64_t layer, int64_t expert, uint64_t b, uint64_t a) {
+            return through_pad ? a + (layer_offsets_[(size_t) layer] + (uint64_t) expert * b) % 4096 : a;
+        };
         if (rank != nullptr)
             for (const auto& pr : *rank) {
                 if (pr.first < 0 || pr.second < 0 || pr.first >= n_layers_ || pr.second >= n_expert_) continue;
                 const size_t i = (size_t) pr.first * (size_t) n_expert_ + (size_t) pr.second;
                 if (offsets[i] == kNoComplement || ranked[i] != kNoComplement) continue;   // on a GPU, or twice
                 const uint64_t b = layer_blob_bytes_[(size_t) pr.first];
-                if (b > budget_bytes - at) continue;
-                ranked[i] = at;
-                at += b;
+                if (place_bytes(b) > budget_bytes - at) continue;
+                ranked[i] = place_at(pr.first, pr.second, b, at);
+                at += place_bytes(b);
                 ++held;
             }
         if (what_fits && held == 0) {   // #467: nothing to keep - the caller's plain mmap fallback, not an empty copy
@@ -3916,10 +4107,10 @@ bool FileExpertSource::pin_cache_complement(
                 const auto& pr = primary_gpu_pairs[i];
                 const size_t idx = (size_t) pr.first * (size_t) n_expert_ + (size_t) pr.second;
                 const uint64_t b = layer_blob_bytes_[(size_t) pr.first];
-                if (b > budget_bytes - at) break;   // a contiguous tail of the region: a short prompt lends only the last few
+                if (place_bytes(b) > budget_bytes - at) break;   // a contiguous tail of the region: a short prompt lends only the last few
                 if (ranked[idx] != kNoComplement) continue;
-                ranked[idx] = at;
-                at += b;
+                ranked[idx] = place_at(pr.first, pr.second, b, at);
+                at += place_bytes(b);
                 ++budget_lent;
             }
             std::fprintf(stderr, "FileExpertSource: the prompt path's lend region: %lld of its %lld slots keep their experts "
@@ -3930,6 +4121,8 @@ bool FileExpertSource::pin_cache_complement(
         offsets.swap(ranked);
         bytes = at;
         lend_from_slot = -1;
+        through_padded_ = through_pad;
+        if (through_pad) std::fprintf(stderr, "strata ram through: the tier's %lld places are padded and aligned, reads land in them\n", (long long) held);
     }
 
     const bool lend = lend_from_slot >= 0 && lend_from_slot < n_slots && additional_gpu_pairs.empty();
@@ -5542,6 +5735,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         } else {
             mstate.assign(miss.size(), 0);
             const auto r0 = std::chrono::steady_clock::now();
+            if (ram_through_env()) d.src->through_context(ids, n_tok * k, d.usage.empty() ? nullptr : d.usage.data() + (size_t) d.layers * (size_t) d.n_expert, n_tok);
             npend = d.src->prefetch_begin(d.layers, miss.data(), (int64_t) miss.size(), mstate.data());
             if (npend > 0 && d.cold_mode == 2) {   // measure: every read first, as mode 0 does
                 d.src->prefetch_end();
@@ -5714,6 +5908,39 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     }
     const auto c4 = std::chrono::steady_clock::now();
     pt("ran");
+    // STRATA_LAYER_TRACE=<path> (measurement only): one line per layer of a window, for offline scheduling models:
+    // layer tokens experts start_us host_us cold_read_us cold_wait_us cold_landed_us, then per distinct expert id:kind:tier:entries:best_rank
+    // kind 0 VRAM, 1 PCIe, 2 another GPU, -1 CPU, -2 skipped; tier V VRAM, R RAM, F file
+    static std::FILE* layer_trace = [] {
+        const char* v = std::getenv("STRATA_LAYER_TRACE");
+        std::FILE* f = v != nullptr && *v != 0 ? std::fopen(v, "w") : nullptr;
+        if (f != nullptr) std::setvbuf(f, nullptr, _IOFBF, 1 << 20);
+        return f;
+    }();
+    if (layer_trace != nullptr && n_tok * k <= kMaxWindowEntries) {
+        static thread_local double tr_r = 0, tr_w = 0, tr_cc = 0;
+        const double dr = d.ms_cold_r - tr_r, dw = d.ms_cold_wait - tr_w, dcc = d.ms_cold_cc - tr_cc;
+        tr_r = d.ms_cold_r;
+        tr_w = d.ms_cold_wait;
+        tr_cc = d.ms_cold_cc;
+        std::fprintf(layer_trace, "%lld %lld %lld %lld %.1f %.1f %.1f %.1f", (long long) d.layers, (long long) n_tok, (long long) k,
+                     (long long) std::chrono::duration_cast<std::chrono::microseconds>(c0.time_since_epoch()).count(),
+                     std::chrono::duration<double, std::micro>(c4 - c0).count(), dr * 1e3, dw * 1e3, dcc * 1e3);
+        const int64_t total = n_tok * k;
+        for (int64_t i = 0; i < total; ++i) {
+            const int32_t e = ids[i];
+            bool seen = false;
+            for (int64_t j = 0; j < i && !seen; ++j) seen = ids[j] == e;
+            if (seen || e < 0 || e >= d.n_expert) continue;
+            int entries = 0, best = 99;
+            for (int64_t j = i; j < total; ++j)
+                if (ids[j] == e) { ++entries; best = std::min(best, (int) (j % k)); }
+            const bool vram = d.host_res != nullptr && d.host_res[(size_t) d.layers * (size_t) d.n_expert + (size_t) e] >= 0;
+            std::fprintf(layer_trace, " %d:%d:%c:%d:%d", (int) e, (int) kind[i], vram ? 'V' : d.src->in_ram_tier(d.layers, e) ? 'R' : 'F', entries, best);
+        }
+        std::fputc('\n', layer_trace);
+        if (d.layers == 0) std::fflush(layer_trace);
+    }
     auto ms = [](auto a, auto b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
     d.ms_plan += ms(c0, c1);
     d.ms_actq += ms(c1, c2);
