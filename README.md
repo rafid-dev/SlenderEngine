@@ -25,7 +25,7 @@ Measured on an i7-14700KF, 32 GB DDR5-6000, RTX 4070 Ti 12 GB and two 990 PRO 1 
 | Setting | Strata in the table | This fork in the table | What setup installs |
 |---|---|---|---|
 | Experts in RAM | 14 GiB | 14 GiB | **10 GiB**, or what you choose |
-| Saved conversations in RAM | 2,048 MiB | 2,048 MiB | **Off** |
+| Saved conversation checkpoints in RAM | Up to 2,048 MiB | Up to 2,048 MiB | **Off** |
 | Drafting | `--spec 3` | `--spec 4` | `--spec 4` |
 | CPU workers | 13 | 7, on P-cores | One per P-core, leaving the first for the host (7 here) |
 | SSDs | One | Two | Two if you pick a second drive |
@@ -94,7 +94,7 @@ set STRATA_EXPERTS_MIRROR=E:\StrataMirror\experts.bin
 
 ## Memory settings
 
-Setup asks how much RAM should hold the model's experts. Press Enter for 10 GiB on a 32 GB PC. The engine uses about 8 GiB on top of that. More RAM is faster, but leaves less for other apps and pages more. Setup also turns off saving conversations in RAM, so switching back to an earlier conversation has to read it again.
+Setup asks how much RAM should hold the model's experts. Press Enter for 10 GiB on a 32 GB PC. The engine uses about 8 GiB on top of that. More RAM is faster, but leaves less for other apps and pages more. Setup also turns off saved conversation checkpoints (`--conversation-cache-mib 0`) to save more RAM: up to 2 GiB, the limit they had before. Switching back to an earlier conversation then has to read it again. The checkpoints inside the conversation you're using stay on.
 
 | Measured on the PC above | 14 GiB (1 run) | 10 GiB (4 runs) |
 |---|---|---|
@@ -135,6 +135,7 @@ Setup writes only `strata-fast.json` and `run-fast.bat`, plus the copy if you as
 - **Better thread placement:** workers run on P-cores only, and SSD readers stay alive on E-cores, so ready work computes while reads finish.
 - **Parallel RAM moves:** the RAM cache updates during drafting, while nothing else needs it.
 - **Deeper drafts:** `--spec 4`.
+- **Less RAM by default:** setup asks how much RAM to use, starts at 10 GiB of experts, and turns off saved conversation checkpoints.
 
 [FORK.md](FORK.md) lists each change with its switch and files. [The worklog](docs/fork/WORKLOG.md) has every test, including the ones that failed.
 
