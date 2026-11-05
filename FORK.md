@@ -54,7 +54,53 @@ Engine args: `--pool-workers 7 --spec 4 --spec-min-p 0.5 --adapt-swaps 24 --resi
 
 The dual SSD copy must be the same file as the pack's `experts.bin`. The engine only compares file sizes, so copy it again if the pack changes.
 
-`FAST-SETUP.bat` no longer writes 14 GiB. It asks how much RAM to use, defaulting to 10 GiB on a 32 GB PC, and writes `--conversation-cache-mib 0`. [README](README.md#memory-settings) has the numbers for that setting and for running beside a large app.
+`FAST-SETUP.bat` no longer writes 14 GiB. It asks how much RAM to use, defaulting to 10 GiB on a 32 GB PC, and writes `--conversation-cache-mib 0`. [README](README.md#how-much-memory-it-uses) has the numbers for that setting and for running beside a large app.
+
+## What the top table's settings were
+
+| Setting | Upstream | This fork | What setup installs |
+|---|---|---|---|
+| Experts cached in RAM | 14 or 10 GiB | 14 or 10 GiB | **10 GiB**, or what you choose |
+| Saved conversation checkpoints in RAM | Up to 2,048 MiB at 14 GiB, off at 10 | Up to 2,048 MiB at 14 GiB, off at 10 | **Off** |
+| Drafting | `--spec 3` | `--spec 4` | `--spec 4` |
+| CPU workers | 13 | 7, on P-cores | One per P-core, leaving the first for the host (7 here) |
+| SSDs | One | Two | Two if you pick a second drive |
+| Read-through | Doesn't have it | Off | **On at 10 GiB or below** |
+
+## Read-through
+
+| Windows 26H2, 10 GiB, 3 runs each, mixed order | Off | On | Change |
+|---|---:|---:|---:|
+| Coding answers | 44.2 tok/s | 49.2 tok/s | +11% |
+| Generating after a 50K prompt | 34.0 tok/s | 39.9 tok/s | +17% |
+| Follow-up question | 36.7 tok/s | 41.5 tok/s | +13% |
+| Whole run | 40.9 tok/s | 46.4 tok/s | **+13%** |
+| Experts read from the SSD | 108,837 | 83,899 | -23% |
+| Written to the page file | 0-0.8 GB/h | 0 GB/h | |
+
+- **Other batches on this PC at 10 GiB:** +5.2%, +6.0% and +10.9% over the whole run. The gain varies, and "off" here is slower than in the table at the top, for reasons not established. The Windows update and other open apps both changed between them.
+- **On the RTX 4060 8 GB laptop:** +30% and +15% on short prompts at 10 GiB, without and with read-ahead. At 16 GiB with the browser closed, +8-13% on short and long-context answers, and about flat on follow-ups. Measured and reported by that laptop's owner.
+- **Correctness:** the whole cache was compared with the file up to about 80,000 reads on this PC and about 120,000 on the laptop, and nothing differed. With answers made repeatable on this PC at 10 GiB, the answers were the same with it on and off.
+- **Not above 10 GiB here:** at 14 GiB it **lost about 19%** (40.3 against 49.5 tok/s). There the driver can't lock the whole cache, and reads landing in ordinary memory took about twice as long. A first test with ordinary memory at 10 GiB, one run each, was just as slow with plenty of RAM free.
+- **Not measured:** other amounts of RAM on this PC.
+
+## Two SSDs alone
+
+From an earlier stage of this fork, two 990 PRO, 4 runs each. With everything on, it hasn't been measured separately.
+
+| | One SSD | Two SSDs | Gain |
+|---|---:|---:|---:|
+| Text generation | 42.2 tok/s | 47.4 tok/s | +12% |
+| Reading a prompt | 997 tok/s | 1,389 tok/s | +39% |
+| Generating after a 26K file | 31.4 tok/s | 37.3 tok/s | +19% |
+| Follow-up question | 34.5 tok/s | 41.5 tok/s | +20% |
+| Answering about an image | 24.8 tok/s | 31.6 tok/s | +28% |
+
+Setup refuses a second partition of the same disk, hard disks and USB drives. To turn it off, run `FAST-SETUP.bat --no-mirror` and delete the `StrataMirror` folder.
+
+## Beside a large app
+
+With Roblox Studio open using about 12 GiB, these settings kept writes to the page file at 0.0-0.1 GB/h (2 runs of about 3.5 minutes): `--max-context 65536 --resident-budget-gib 1 --pool-workers 4 --vram-reserve-mib 1024`, with no `--kv-resident`. Speed fell to about 20 tok/s at short context and 15 tok/s at 50K, and context is limited to 64K. Whether Studio stuttered wasn't measured.
 
 ## Answers
 
