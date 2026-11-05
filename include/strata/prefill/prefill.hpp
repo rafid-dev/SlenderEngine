@@ -85,6 +85,9 @@ public:
     /// request lends only the slots its prompt needs.  The stream must be idle (between prompts).
     bool relayout(int64_t chunk, void* borrow, uint64_t borrow_bytes, std::string& err);
     int64_t chunk() const;
+    /// STRATA_LOAN_TRACE: what the last layout really took, and whether it spilled past the loan into its own allocations
+    uint64_t workspace_used() const;
+    bool workspace_spilled() const;
 
     /// The share of the streamed experts' bytes DMA-able straight from pinned RAM (1 = all).  Sizes the streamed
     /// ring (a big one only pays when the copy engine, not the host copies, is the limit); set before bytes_needed.

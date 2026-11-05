@@ -1125,6 +1125,8 @@ struct Prefill::Impl {
     const int32_t* host_res = nullptr;
     int64_t T = 0, T_max = 0;
     bool borrowed = false, borrow_spill = false;
+    uint64_t ws_used = 0;
+    bool ws_spilled = false;
     cudaStream_t cs = nullptr, copy = nullptr;
     Gemm gemm;
     std::vector<void*> owned;
@@ -2134,6 +2136,8 @@ bool Prefill::carve(size_t T, void* alloc) {
                                         std::to_string((long long) (T * K)) + ");").c_str() : "",
                      hcr ? " STRATA_PF_HC_REGION on (the hyper-connection read's scratch is in the shared region);" : "");
     }
+    m.ws_used = o.used;      // effb88b9: the narrow loan's workspace size (STRATA_LOAN_TRACE)
+    m.ws_spilled = o.spilled;
     return ok;
 }
 
@@ -2176,6 +2180,8 @@ bool Prefill::relayout(int64_t chunk, void* borrow, uint64_t borrow_bytes, std::
 }
 
 int64_t Prefill::chunk() const { return impl_->T; }
+uint64_t Prefill::workspace_used() const { return impl_->ws_used; }
+bool Prefill::workspace_spilled() const { return impl_->ws_spilled; }
 
 void Prefill::set_ring_room_active(bool on) {
     ring_room_active_ = on;
