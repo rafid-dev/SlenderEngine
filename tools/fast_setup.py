@@ -299,6 +299,9 @@ def main():
         set_arg(args, k, v)
     env = {"STRATA_UNBUFFERED_LOAD": "1", "STRATA_RESIDENT_HEADROOM_GIB": "1.5", "STRATA_RAM_ADAPT": "1", "STRATA_COLD_OVERLAP": "1", "STRATA_COLD_KEPT_READERS": "1",
            "STRATA_PARTIAL_PIN": "1", "STRATA_RAM_ADAPT_PAR": "1", "STRATA_RAM_ADAPT_BG": "1"}
+    # Read-through: +5-13% at 10 GiB on the PC this was tuned on. At 14 GiB there it lost 19%, so it stays off above 10 until that's explained.
+    if budget <= 10:
+        env["STRATA_RAM_THROUGH"] = "1"
     if cpu["hybrid"]:
         set_arg(args, "--pool-workers", str(len(cpu["workers"])))
         env["STRATA_POOL_CORES"] = ",".join(map(str, cpu["workers"]))
