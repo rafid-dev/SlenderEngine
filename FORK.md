@@ -26,7 +26,7 @@ Measured 2026-11-05 on Windows 11 26H2. Model card sampling, thinking on, a fres
 - **Same settings:** +75% at `--spec 3` with 13 workers, +68% at `--spec 4` with 7. These flatter the fork. Upstream's read overlap creates threads for every layer, and upstream ran faster with overlap and page locking off. Which of the two costs it wasn't tested. The fork arms also have its own switches on.
 - **The second SSD alone:** text +17%, prompt reading +51%. On one SSD the fork's code doesn't speed up prompt reading.
 - **The gain is time per step, not tokens per step.** Tokens per step were 1.7-2.0 on every row.
-- **Expert skip:** both engines ran upstream's default `STRATA_ROUTE_TAIL_SKIP=7`. With it off, the fork's daily setup went from 45.9 to 35.9 tok/s (-22%), 3 runs each, mixed order.
+- **Expert skip:** both engines ran upstream's default `STRATA_ROUTE_TAIL_SKIP=7`. With it off, the fork's daily setup went from 45.9 to 35.9 tok/s (-22%), 3 runs each, mixed order. `tools/quant_quality.py` against skip 0, 4,995 positions, repeatable: KL 0.081, top-1 agreement 90.7%, perplexity 4.035 to 4.148, and on the agent text KL 0.196, 89.5%, 4.699 to 5.109. Upstream reports KL 0.003-0.006 on other packs and cards; the reason for the gap isn't established. A tool-call test like upstream #5225's was clean at both settings, 60 requests each. No task suite was run.
 
 The three memory switches are `STRATA_UNBUFFERED_LOAD`, `STRATA_RESIDENT_HEADROOM_GIB=1.5` and `STRATA_RAM_ADAPT`. Strata 0.2.10 hasn't been compared this way.
 

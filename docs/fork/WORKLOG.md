@@ -1255,6 +1255,24 @@ The asked rule: no expert skipping or rerouting. Sources were read at abstract o
 
 Ranges don't overlap on text. It fired: skip 0's log has no banner or skip counter, skip 7's first run skipped 244,615 experts. 0 damaged, 0 failed. Answer quality wasn't compared. The same skip 7 settings ran 48.9 in `fair2` an hour earlier, so about 6% between batches; compare inside a batch. Upstream's source comment gives skip 7's cost as KL about 0.003-0.006; not measured on this setup. **Agreed with the user:** after the stock runs, `memtools/tool_probe.py` (two tools, one enum, temperature 0, 30 identical requests per engine start, order `7007`, `memtools/probe1`), then `tools/quant_quality.py` at 1,978 slots with skip 0 and 7, order `0707`, `memtools/kl_skip`.
 
+**Tool-call probe (`memtools/probe1`, 16:22-16:28, `memtools/tool_probe.py`, order `7007`, temperature 0):** 0 of 60 not clean at skip 7, 0 of 60 at skip 0. All 120 replies gave the same arguments. Cache-hot as in #5225 (468 reused + 5 read). Skip confirmed on and off in the logs. Mean speed 61 against 39 tok/s on these short replies. One schema and one prompt, CUDA, so rarer corruption or real multi-tool sessions aren't ruled out.
+
+**KL, teacher-forced (`memtools/kl_skip`, 16:28-16:48, `tools/quant_quality.py`, 4,995 positions, `STRATA_IQ_MT_MIN=1`, FP16 K/V, no adaptation, no suffix drafts, order `0707`). Reference is skip 0, not Q8_0:**
+
+| Segment | Top-1 agreement | KL | Perplexity, skip 0 to 7 |
+|---|---:|---:|---:|
+| Code | 96.60% | 0.02732 | 2.031 to 2.033 |
+| Other languages | 94.39% | 0.02741 | 2.686 to 2.687 |
+| English | 88.99% | 0.04758 | 4.151 to 4.216 |
+| Docs | 83.98% | 0.10489 | 10.057 to 10.435 |
+| Agent | 89.49% | 0.19632 | 4.699 to 5.109 |
+| All | 90.69% | 0.08070 | 4.035 to 4.148 |
+
+- **Repeatable:** skip 0 against skip 0 and skip 7 against skip 7 are both KL 0.00000, 100% top-1. The last run overlapped the other chat's 15-second clone on D: and still matched exactly.
+- **Far above upstream's 0.0030-0.0058 and 97.5-98.2%** (`docs/DETAILS.md`: 28 chat prompts, RTX 3060 IQ3_XXS and RTX A4000 Q2_0, against the old behavior). Why isn't established. Differences here: other pack and card, fixed text set, no adaptation, 2,555 slots (`--gpu-experts 1978` was asked for, the log says 2,555, not explained) against the daily 1,978. Skipped 385,467 experts in 4,995 positions.
+- **What it doesn't show:** whether answers get worse on real tasks. No task suite was run. It's above the 0.012-0.02 that kept layer-major off, a different KL test.
+- **Next, proposed:** `STRATA_ROUTE_TAIL_SKIP` at 8 and 9, and `STRATA_ROUTE_TAIL_SKIP_FILE=7`, for speed and KL.
+
 **Second pass the same day, through Chrome (full paper text and upstream issues). Corrects the table above:**
 
 - **The daily setup already skips experts.** `STRATA_ROUTE_TAIL_SKIP=7` is on by default on both engines (`sess_on/engine.log` line 63). That session skipped 4,948,041 missed experts, against 10,730,049 RAM blobs and 34,244 file blobs, so roughly a third of misses if the counters compare. Every speed in this log and the "no skipping" estimate above include it, except the identical-output checks. Cost of turning it off here isn't measured; upstream advertises +10-20% decode. Upstream #5225 (R9700, engine 0.1.56): tool-call arguments corrupted with copied schema text in about 6% of scripted requests, gone with skip 0 in 32 requests; the link to skipping is the reporter's suspicion. Not seen or checked on this PC.

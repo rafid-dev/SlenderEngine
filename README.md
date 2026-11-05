@@ -24,7 +24,7 @@ Strata's column is the fastest of the 6 setups we tried on it. Its runs came abo
 
 With the same `--spec`, workers and one SSD, Strata ran 24.9 tok/s against this fork's 41.8 (+68%). That gap flatters the fork, because read overlap and page locking were on for both, and Strata was faster without them.
 
-Both engines use Strata's default expert skip, which leaves out some low-ranked experts that aren't in VRAM and changes answers slightly. Turning it off took this fork from 45.9 to 35.9 tok/s.
+Both engines use Strata's default expert skip, which leaves out some low-ranked experts that aren't in VRAM. Turning it off took this fork from 45.9 to 35.9 tok/s. The skip also changes answers. On a fixed set of text, the model's top choice stayed the same at 90.7% of positions, from 84% on docs to 97% on code. That shows how far answers move, not whether they get worse.
 
 The fork's columns include read-through, which puts SSD reads straight into the RAM cache. Setup turns it on at a 10 GiB cache or below. It lost about 19% at 14 GiB on this PC, so it stays off above that.
 
