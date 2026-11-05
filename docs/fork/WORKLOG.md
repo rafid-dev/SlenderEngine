@@ -24,6 +24,130 @@ Text ranges do not overlap. Same model, quant, context, 14 GiB RAM tier and VRAM
 
 This table is the 14 GiB setting. Daily since 2026-11-04: `--resident-budget-gib 10 --conversation-cache-mib 0`, coding answers 48.2 tok/s, see the sections below.
 
+## Read-through before a default: the three checks (agreed 2026-11-05, before the fair comparison below)
+
+All on `strata\build`, Windows 26H2, model card sampling, thinking on, fresh engine per run, read-through off against on.
+
+1. **26H2 re-check, 10 GiB:** `switch_test.py th26 bRRbbR card`. Compare with +5.2% and +6.0% on the old Windows.
+2. **14 GiB:** `switch_test.py th14 kKKkkK card`, checkpoints off, paging per request, then one verify run, arm `M`.
+3. **Long real session, 10 GiB:** `real_session.py`, 25 minutes, one run each way, on then off. Target 0.3 GB/h paged.
+
+Then the fair comparison below.
+
+**Check 1, 26H2 at 10 GiB (`th26`), 3 runs each, order off, on, on, off, off, on, 450 tokens:**
+
+| | Off | On | Change |
+|---|---:|---:|---:|
+| Whole run | 42.4 (42.0-42.7) | 47.0 (46.4-47.3) | **+10.9%** |
+| Coding answers | 44.6 (43.5-45.1) | 49.8 (49.4-50.1) | **+11.6%** |
+| After 50K | 37.1 (35.8-38.9) | 40.9 (38.5-45.5) | +10.1%, overlap |
+| Follow-up | 39.6 (37.5-41.2) | 42.5 (40.6-44.5) | +7.1%, overlap |
+| 50K prompt | 1,405 | 1,400 | flat |
+| Tokens per window | 1.88 | 1.93 | overlap |
+| Blobs read | 108,604 | 89,362 | -17.7% |
+| Waited on reads | 22.0 s | 16.9 s | -23.5% |
+| Lowest free RAM | 0.3-1.95 GiB | 1.57-2.39 GiB | |
+| Paged out in the run | 0-0.01 GB | 0.3-0.87 GB | **see below** |
+
+- **Active:** 65,536+ landings in all 3 on runs, tier page-locked on 26H2.
+- **Larger than on the old Windows (+5.2%, +6.0%),** mostly because off fell: about 45 to 42.4, on 48.2 to 47.0. Can't be pinned on 26H2: this batch started with 19.7 GiB available, against 22.3-22.8 in the morning. By 13:05 it was back to 22.5 with Firefox still open, so Firefox isn't the cause. The batch ran 20-30 minutes after the reboot, and what held the extra 3 GiB wasn't established. Rerun at settled RAM: `th26b`.
+- **Paging is new:** on the old Windows read-through paged 0-0.13 GB/h with 3.6-3.9 GiB free. Here each on run paged 0.3-0.84 GB, nearly all in its first coding answer, and off paged none. In 100 s runs that reads as 11-30 GB/h, but it's one burst. Why read-through bursts when RAM is lower isn't known. `th26b` and the long session decide this one.
+- **Task Manager's rows don't add up to its total, and that's expected.** 14 GiB run, 13:08: 30.2 GiB in use, rows about 22.1 GiB (private working sets). Loading the engine took available RAM from 23.28 to 1.62 GiB, so 21.7 GiB, while its row showed 17.6: about 4.1 GiB of it is outside its working set, which fits the logged 3.09 GiB of pinned K/V and the earlier ledger's 3.0-3.7. Kernel pools add 1.2 GiB, and the remaining 2.8 GiB or so fits shared pages (shared working sets count 5.7 GiB, double counted), not separately measured. Before and after the engine, available RAM was the same, so it isn't a leak.
+
+**Check 2, 14 GiB (`th14`), 3 runs each, order off, on, on, off, off, on. Read-through loses clearly:**
+
+| | Off | On | Change |
+|---|---:|---:|---:|
+| Whole run | 49.5 (49.0-50.0) | 40.3 (39.2-41.5) | **-18.6%** |
+| Coding answers | 52.7 (51.3-53.5) | 42.6 (41.8-44.3) | **-19.1%** |
+| After 50K | 42.6 (40.6-45.0) | 37.9 (36.4-39.2) | **-11.0%** |
+| Follow-up | 45.2 (44.7-45.5) | 35.1 (33.8-36.5) | **-22.3%** |
+| 50K prompt | 1,465 | 1,455 | flat |
+| Tokens per window | 1.95 | 1.79 | -7.9%, overlap |
+| Blobs read | 64,673 | 54,225 | -16.2% |
+| Waited on reads | 12.5 s | 24.4 s | **+95%** |
+| Lowest free RAM | 0.32-0.91 GiB | 0.32-0.79 GiB | |
+| Paged out in the run | 0.03-1.03 GB | 0.63-0.96 GB | same, nearly all at load |
+
+- **Active:** 32,768+ landings in every on run. Paging doesn't separate the arms.
+- **Fewer reads, but each takes about 1.8x as long, and very steadily.** Time reading per blob, from the logs' R, per run:
+
+| | Off | On |
+|---|---:|---:|
+| 10 GiB | 276, 282, 280 µs | 284, 290, 290 µs |
+| 14 GiB | 336, 322, 310 µs | 577, 598, 610 µs |
+
+- **Correction:** the 4 GiB outside the registered part isn't pageable, as written earlier. The log says "locked 4096 MiB via working-set minimum + VirtualLock", so Windows can't trim the tier. At 10 GiB the engine gets the tier from the driver (`cudaHostAlloc`, "page-locked and mapped"). At 14 GiB the driver refuses, so it's ordinary memory with 10 GiB registered afterwards: the engine tries 14 and 12, and 10 succeeds.
+- **Two explanations, under test with a 2 x 2:** memory pressure (the user's view), or a read landing in ordinary memory instead of driver-allocated memory, a cost on every read.
+
+| | Tier from the driver | Tier in ordinary memory |
+|---|---|---|
+| RAM to spare | `th26b` | `th10u`, `STRATA_RESIDENT_PIN=0` |
+| Low free RAM, `ballast.py` holding 4 GiB | `th10p` | `th10up`, `STRATA_RESIDENT_PIN=0` |
+
+All at 10 GiB, so tier size doesn't change between cells (the user's point). The `th14c` rerun was stopped after one run. `memtools/blob_cost.py` reads the per-blob time.
+
+**Stopped early so the merge could go ahead, with one cell started (`th10u`, one run each):** ordinary memory with RAM to spare, 257 µs per blob off, **555 µs on**. So the slowdown reproduces at 10 GiB with no memory pressure: landing in ordinary memory costs about 300 µs a read, against about 290 total in driver memory. One run each, and the low-RAM cells didn't run, so pressure may still add to it. That fits every run here. The laptop's unpinned tier still gained, by how much per read wasn't compared; its "waited" figure isn't the same measure as R.
+
+**`th26b`, 10 GiB rerun with RAM settled, 3 runs each:** whole run 40.9 (38.4-42.7) to 46.4 (45.2-47.3), **+13.3%**; coding +11.3%, after 50K +17.5%, follow-up +13.1%, all with no overlap. Blobs read -22.9%, waited -27.4%. Per blob 276-296 µs off, 291-297 on. Lowest free RAM 3.4-3.9 GiB. **Paged out 0 in all 3 on runs,** so the `th26` bursts came from that batch's low RAM, not from read-through itself.
+
+- **The RAM sum (user's question, 13:15, engine off between runs):** 22.25 GiB available of 31.76, so 9.5 GiB in use before the engine loads. Firefox 2.36, Claude 1.41, Spotify 1.11 and smaller apps come to about 5.8 GiB of working set (some shared and counted twice), which leaves about 3.7 GiB for Windows, about what the user expected. 22 + 9.5 = 31.5, leaving about 0.3 GiB, which matches the 0.3-0.9 GiB measured. No missing memory.
+- **At 10 GiB the whole tier page-locks, and read-through wins.** 10 GiB with read-through (47.0, `th26`) comes close to 14 GiB without it (49.5), for about 4 GiB less RAM. Different batches and RAM conditions, so rough.
+- **Default:** read-through can't be on everywhere. Setup should only write it at 10 GiB or below, or the engine should turn it off when the tier isn't fully page-locked. Other tier sizes aren't measured.
+
+**Merge first (the user's call, 2026-11-05):** read-through at 10 GiB has enough evidence: +5.2%, +6.0%, +10.9%, +13.3% over four batches here, +30% and +15% on short prompts on the laptop, byte checks clean on both PCs, identical answers here. Setup turns it on at 10 GiB or below, off above. Long sessions, the fair comparison, README numbers and the video come after the merge. Before it: the `iq_avx512.cpp` fix, then an all-off answer check and unit tests. Local branch `merge-pr1`.
+
+**Finish plan (agreed by the user 2026-11-05):** the three checks, decide the switches, merge on a new branch, all-off check, setup, then the fair comparison on the merged engine so the README describes what ships, then docs, data and video, then ask before pushing. Engine defaults stay off; `FAST-SETUP.bat` and the daily launcher turn the winners on. FORK.md's "`STRATA_DIRECT_AHEAD` about 18% slower" is out of date: K=5 measured +2.7% here and more on the laptop.
+
+## Fair comparison (asked by the user 2026-11-03, never run until 2026-11-05)
+
+The user asked for this on 2026-11-03 after watching the first video: "compare with the same literal config on both base engine and our fork (spec 4, worker 7)", then stock's best, then overall gain from stock's best to fork's best. Agreed the same day, with "assuming someone will critique us" as the bar. It was never written here, its scripts were lost with an old scratchpad, and so the 2026-11-05 README runs below missed it. Those compare each engine at its own settings.
+
+**The three claims it should support:** same settings on both engines (the code's gain), best we tried on stock against the fork's best, and the second SSD alone. Say "best we tried", never "stock's best".
+
+**Design:** fresh engine per run, mixed order, one SSD on both except the two-SSD row. 3 runs each instead of the agreed 5 and 3, by the user's 2026-11-05 call on run count. 10 GiB and checkpoints off on every arm, as setup now installs, instead of 2026-11-03's 14 GiB. Both engines get every switch they share. Fork arms also keep the switches only the fork has, since those are its code.
+
+| Arm | Engine | `--spec` | Workers | SSDs | Answers |
+|---|---|---:|---:|---:|---|
+| a | Stock | 3 | 13 | 1 | Same settings, test 1 |
+| b | Fork | 3 | 13 | 1 | Same settings, test 1 |
+| c | Stock | 4 | 7, P-cores | 1 | Same settings, test 2 |
+| d | Fork | 4 | 7, P-cores | 1 | Same settings, test 2 |
+| e | Fork | 4 | 7, P-cores | 2 | The second SSD alone, and the fork's best |
+| f | Stock | 4 | 13 | 1 | Is there a better stock setting |
+| g | Stock | 3 | 7, P-cores | 1 | Is there a better stock setting |
+
+**Windows changed before these runs:** the user updated to 26H2 on 2026-11-05, after every result above this section's date. Compare these runs among themselves, not with `readme1`, `readme2` or older numbers. Before running, check the update's background work has settled, and that the driver, "Lock pages in memory", the page file and `C:\StrataMirror` are as before.
+
+**Also agreed 2026-11-03, still open:** one 20-minute mixed session on each engine, raw runs and scripts in the repo, re-rendered comparison video from these numbers (one race, stock's best we tried against the fork's best on one SSD), README correction, `FAST-SETUP.bat` from a clean clone before any post. Answer quality with `--spec 4` isn't measured and the README must say so.
+
+## README speed rows at model card settings (2026-11-05, same morning, not in the README yet)
+
+**Each engine at its own settings, so the gains below mix code, flags and the second SSD: see "Fair comparison" above.**
+
+`memtools/readme_bench.py`, `readme_report.py`, folders `readme1` and `readme2`. Fresh engine per run, mixed order, no sampling sent so the model card applies (temperature 1.0, top_p 0.95, top_k 20), thinking on in every row, Roblox closed. 450 tokens, image 150. Installed engine, no read-through. Vanilla is `engine-before-tg`, one SSD, with the switches earlier baselines used (`STRATA_UNBUFFERED_LOAD=1 STRATA_RESIDENT_HEADROOM_GIB=1.5 STRATA_RAM_ADAPT=1`).
+
+| | Vanilla 14 GiB (3) | Fork 14 GiB (5) | Gain | Vanilla 10 GiB (3) | Fork 10 GiB (4) | Gain |
+|---|---:|---:|---:|---:|---:|---:|
+| Text | 35.7 (35.0-36.5) | 53.8 (50.4-56.2) | +51% | 30.0 (28.9-30.8) | 46.7 (44.3-48.0) | +56% |
+| After a 26K file | 28.4 (25.2-30.4) | 44.5 (42.8-47.6) | +57% | 19.7 (19.4-20.0) | 38.1 (33.9-42.6) | +93% |
+| Follow-up | 28.2 (26.7-29.8) | 47.4 (45.3-48.8) | +68% | 23.7 (22.6-24.4) | 40.2 (38.2-42.1) | +70% |
+| Image | 22.0 (20.7-24.0) | 37.0 (30.3-44.3) | +68% | 16.5 (16.1-17.1) | 30.3 (25.8-32.4) | +83% |
+| Prompt reading, 26,272 tokens | 1,017 | 1,484 | +46% | 970 | 1,432 | +48% |
+| Tokens per step | 1.67 | 1.89 | | 1.77 | 1.78 | |
+| ms per step | 47.7 | 35.4 | | 59.5 | 38.4 | |
+| Lowest free RAM | 0.37-0.59 GiB | 0.08-0.94 GiB | | 3.38-4.12 GiB | 3.59-4.52 GiB | |
+| Paged out, about 2 min windows | 1.6-20.4 GB/h | 0.8-36.2 GB/h | | 0-0.08 GB/h | 0 GB/h | |
+| Damaged answers | 0 | 0 | | 0 | 0 | |
+
+- **Gains hold:** +51% at 14 GiB against +52% in the table above, despite the different sampling and thinking on in every row. Absolute numbers drop a little: fork 57.3 to 53.8, vanilla 37.6 to 35.7. The image row isn't comparable with the old one: thinking on, so those 150 tokens are mostly thinking.
+- **Same RAM is new:** the README says Strata hasn't been measured at 10 GiB. Fork against vanilla at 10 GiB is +56% on text.
+- **What a person moving to the setup default sees:** vanilla at 14 GiB against the fork at 10 GiB, +31% on text, with about 3.5 GiB more free RAM and no paging.
+- **14 GiB is tight:** lowest free RAM 0.08-0.94 GiB and up to 36 GB/h, well over the target, so 10 GiB remains the setting to recommend.
+- **Run count:** cut to 3 vanilla runs per setting by the user. The gap is well outside the ranges on every row; the image and after-file ranges are wide.
+- **Discarded first attempt:** vanilla without those three switches ran 26.4 tok/s (25.8-27.2, 3 runs) at 14 GiB, its tier cut to 13.22 GiB by the 4 GiB default headroom, and 21.5 (21.1-21.8, 2 runs) at 10 GiB. Left out of the table as it doesn't match earlier baselines. It may be closer to what stock Strata gives without tuning, which is worth a note if that's ever claimed.
+- **Fork runs from both folders:** 2 at 10 GiB and 3 at 14 GiB came from the first attempt, about 30 minutes before the vanilla runs; the rest are interleaved with them.
+
 ## Comparison video recording (2026-11-03)
 
 Vanilla against installed, 5 runs each, fresh engine per run, mixed order (VFFVFVVFVF), the same four coding prompts as the table above but streamed. `demo\compare\strata-vs-fork.mp4` and `.gif`.
@@ -622,6 +746,511 @@ All arms: 10 GiB tier, saving off, 7 workers, vision on, temperature 0.6. MTP ar
 - **Quality not measured.** Neither switch can be judged until `tools/quant_quality.py` shows the perplexity cost. Not installed, not in setup.
 - **Normal's first paging figure** covers under 2 minutes straight after other tests, so it shouldn't be read as this arm's rate.
 - **`STRATA_ROUTE_TAIL_SKIP_FILE`:** not found in upstream. Added to this fork as an opt-in switch. It skips from the given rank only for experts that would be read from the file. Start-up check only, one 300-token answer each, not a benchmark: off 42.1 tok/s and 29,746 experts skipped, `=5` 44.2 tok/s and 39,552 skipped, so it fires. Speed and quality not measured.
+
+## `STRATA_ROUTE_TAIL_SKIP_FILE=5` (2026-11-04, 2 runs each, order file, normal, normal, file, not adopted)
+`memtools/switch_test.py`, `memtools/switch2`. The engine in `strata/build` for both arms, same settings and workload as the section above. Tail skip 5 is repeated from that section: an earlier session on the installed engine, so that column is a rough comparison.
+
+| | Normal | File-only, rank 5 | Tail skip 5, all misses |
+|---|---:|---:|---:|
+| Short context, generation | 48.8, 46.3 tok/s | **53.3, 53.4 tok/s** | 59.6, 59.7 tok/s |
+| Prefill, 50,046 tokens | 1,350, 1,332 tok/s | 1,354, 1,340 tok/s | 1,366, 1,407 tok/s |
+| Generation at 50K | 36.0, 32.3 tok/s | **37.8, 45.1 tok/s** | 46.8, 48.7 tok/s |
+| Follow-up, generation | 36.9, 37.5 tok/s | **44.4, 46.1 tok/s** | 48.1, 50.4 tok/s |
+| Experts skipped in the run | 234K-235K | 264K-275K | 373K-396K |
+| Short context, SSD wait per token | 7.3 ms | 4.6 ms | 4.7 ms |
+| Short context, everything else per token | 14.0 ms | 14.3 ms | 12.2 ms |
+| Paged out | 0.0, 0.02 GB/h | 0.0, 0.0 GB/h | 0.0, 0.0 GB/h |
+| Lowest available RAM | 2.29, 2.49 GiB | 2.15, 2.08 GiB | 3.28, 2.96 GiB |
+| Damaged answers | 0 | 0 | 0 |
+
+- **Gain against normal:** about +12% at short context, +21% at 50K, +22% on the follow-up. Tail skip 5 gains about +25%, +40% and +32% against the same normal runs. The ranges don't overlap normal's at short context or on the follow-up; at 50K they nearly touch, with only 204 and 323 tokens generated.
+- **Efficiency:** about 35K more skips than normal gave about half of what about 150K more gave under tail skip 5. Skip counts are rough because answer lengths differed.
+- **Mechanism:** both cut SSD wait by about 37%. Tail skip 5 also saves about 2 ms of CPU-side time, which file-only doesn't, because RAM-tier experts are still computed.
+- **Quality not measured.** Fewer skips suggest less change to answers, but that isn't shown. Which experts count as file reads also changes as the tier adapts.
+
+## CPU/GPU expert assignment model (2026-11-04, offline, diagnostic only, no scheduler built)
+`memtools/assign_sim.py`, `memtools/layer_cal`. `STRATA_LAYER_TRACE` on the `strata/build` engine, daily config, model card sampling, Studio and Roblox closed, 4 separate engine starts. Fitted on one run, with the PCIe cost also from the `--pcie-frac 1` run.
+
+| Check | Windows | Total decode, model / actual | Error | Period per layer, absolute p50 / p90 / p99 |
+|---|---:|---:|---:|---:|
+| Training run | 1,331 | 63.5 / 66.5 s | -4.5% | 74 / 390 / 2,323 us |
+| **Held-out run** | 1,459 | 64.5 / 65.4 s | **-1.4%** | 70 / 375 / 1,885 us |
+| `--pcie-frac 0`, not used in fitting | 1,358 | 64.6 / 67.0 s | -3.7% | 77 / 406 / 2,489 us |
+| `--pcie-frac 1`, PCIe cost only | 1,341 | 82.2 / 86.9 s | -5.4% | 80 / 430 / 1,681 us |
+
+- **Fitted costs:** PCIe 147 us per expert, against 87 us for 2 MiB at the probed 24.1 GB/s. CPU 75.5 us per job plus 28 us per entry across 8 threads. Reads 135 us plus 199 us per file expert (held-out p50 error 136 us of a 739 us mean). VRAM expert 6.4 us.
+- **Counterfactual:** `--pcie-frac 1` against 0, time per window 1.29x in the model, 1.31x actual.
+- **Weak spots:** a small bias toward too fast on every run, and a slow tail the model doesn't explain. Reads are treated as landing together, because the read trace wasn't run.
+
+Conditional results on the held-out run, within this model, with routing, VRAM contents, skips and draft sizes as recorded. Not hardware limits.
+
+| Scenario | Modeled speed | Experts per window over PCIe |
+|---|---:|---:|
+| Best assignment, RAM tier only | +0.8% | 0.6 |
+| Same, PCIe at 83 us | +0.9% | 3.6 |
+| Same, PCIe at half the fitted cost | +1.0% | 5.8 |
+| Best assignment, SSD experts allowed after reading | +1.2% | 7.8 |
+| Current assignment, no read/compute barrier | +0.8% | 0 |
+| Best assignment, RAM and SSD, no barrier | +1.2% | 7.8 |
+| Free PCIe, no barrier (not achievable) | +15.5% | 150.6 |
+
+- **Decision:** a new CPU/GPU assignment scheduler isn't worth building on this evidence. Its modeled upper bound of about +1% is smaller than the model's own error and this PC's run-to-run noise.
+- **Why:** PCIe costs more than a CPU job, and even free PCIe gains little because SSD reads and fixed GPU work stay.
+- **Not modeled:** memory contention on the CPU, changes to what's in VRAM, and changes in routing.
+- **Speed at model card sampling, normal settings:** short context 43.6, 43.9 tok/s; 50K 30.6, 33.8 tok/s; follow-up 37.3, 39.4 tok/s. `--pcie-frac 1`: 31.1, 24.5, 28.9. `--pcie-frac 0`: 47.9, 35.9, 36.8, one run with tokens per step 2.11 against 1.74-1.93, so not a clear gain.
+- `STRATA_DIRECT_BATCH` and `STRATA_READ_TRACE` are in the test engine but haven't been tested.
+
+## SSD critical path and cost-aware cache simulator (2026-11-04, offline plus 3 validation runs, no engine change)
+
+`memtools\ssd_ceiling.py`, `memtools\cost_sim.py`, `memtools\read_probe.cpp`. IQ3_S, 10 GiB tier, 12 GB VRAM, 32 GB RAM, model card sampling, Roblox closed. No extra expert skipping: rank 7+ misses stay skipped as today.
+
+**Which reads stall.** Window 44.8 ms: host side 27.7 (waited on reads 14.2), fixed GPU 10.6, after the last layer 6.6. 50% of layers wait on a read. Layers with 5 or more reads are 11.6% of layers and about half the wait.
+
+**How well the simulator predicts real runs.** Fitted on one run, tested on separate engine starts.
+
+| Run | Reads, simulated against real | VRAM share | Time per window |
+|---|---:|---:|---:|
+| 10 GiB, held out | -0.7% | 52.9% against 53.1% | -2.1% |
+| 12 GiB, held out | -1.4% | 49.0% against 49.2% | -4.9% |
+| 8 GiB, held out | -0.3% | 52.4% against 52.6% | -0.9% |
+
+- Per-window read correlation 0.99 on all three.
+- **It overstates gains.** 8 to 12 GiB: model +15%, real +10.6%. The real runs removed 36% of reads and about 10% of window time.
+- **It misses the older moves test.** `STRATA_RAM_ADAPT_ANY` plus admit-every-read: reads -11% against the -30% measured then, speed -3.0% against -6.5%. That test ran on an older setup (14 GiB, temperature 0.6). `ANY` alone: model about +1%, real -2.8%. So move-heavy policies are worse than the model says.
+
+**The latency one cached expert saves.** One avoided read saves 226 us on average: 376 us if it is alone in its layer, about 200 us otherwise. Under 1% of reading layers get nothing from it. Latency value and use count correlate 0.985, and a fixed tier ranked by latency equals one ranked by hits (52.1 ms a window both). So cost-aware ranking adds nothing here. The 96-swap loss was move cost, not bad choices. A RAM place saves about 10 us a window on average, about 4 us at the 10 GiB margin.
+
+**Read time, measured apart (`read_probe`, 2 rounds, 2.2 MiB blobs, half from each drive).** Today's path on the E-core reader: 1 blob 415 us, 2 blobs 590, 3 blobs 765, 8 blobs 1,620, 16 blobs 3,000. The fitted engine costs give 450, 652, 854, 1,864, 3,480, so the probe backs the model.
+- Each extra blob adds about 180 us at any batch size, about 12 GB/s, close to what the two drives can sustain. Mostly transfer, not latency.
+- Serial `ReadFile` submission is about 90 us per blob on the E-core and 30 on a P-core, but it overlaps the transfer. It costs a fixed amount per batch, not per blob.
+- IoRing with registered buffers: about -60 us a batch on the E-core, about -90 on a P-core sibling (which would take time from a worker). One submitter per drive: about -30 on the E-core, no extra on a P-core. Sleeping against spinning: about +20 us.
+
+**Policies, held-out run, model only, VRAM rule as today:**
+
+| Policy | ms a window | Speed | Reads |
+|---|---:|---:|---:|
+| Today | 43.9 | | |
+| No RAM moves at all | 58.8 | -25.5% | +98% |
+| Admit more (moves during rounds, routed 1, unused 2) | 44.7 | -1.8% | -17% |
+| Read-through, no copy, per layer: LRU | 39.7 | +10.3% | -19% |
+| Read-through: least used | 39.5 | +11.0% | -20% |
+| Read-through: most latency saved | 39.9 | +10.0% | -18% |
+| Read-through: second use only | 41.0 | +7.0% | -12% |
+| Oracle read-through, next 16 / 64 / all windows | 37.0 / 34.1 / 33.6 | +18% / +29% / +31% | -35% / -52% / -54% |
+
+Read-through figures assume today's 1.3 ms a window of RAM copies goes away. Without that refund, least used is +7.4%. Going by the real 8 to 12 GiB slope instead of the model, 20% fewer reads is about +5.6%.
+
+**Ceilings against 41 tok/s whole-run at 1.74 tokens a window, conditional on the model:**
+
+| Case | Speed | tok/s |
+|---|---:|---:|
+| IoRing on the reader's E-core | +3.3% | 43 |
+| Read-through, least used | +7 to +11% | 44-46 |
+| Read-through + IoRing | +15% | 47 |
+| Oracle read-through, all future windows | +31% | 54 |
+| No SSD wait at all, same VRAM | +64% | 68 |
+| Every expert in VRAM (impossible on 12 GB) | +99% | 82 |
+
+**Reading:** 70-80 tok/s isn't reachable through the SSD path at 1.74 tokens a window. A real policy gets about a quarter of what perfect foresight gets. Even zero SSD wait stops at 68. The target also needs more tokens per window or a smaller fixed GPU cost. The one lossless SSD candidate left is read-through, predicted +5.6% to +11%, and an earlier simulator's +8-9% was wrong, so it needs a real A/B.
+
+## `STRATA_RAM_THROUGH=1` prototype (2026-11-04, test engine `strata\build`, not installed, not adopted yet)
+
+A missed expert's read lands straight in the RAM place of that layer's least used expert not routed this layer, so admitting it needs no copy. It replaces the `STRATA_RAM_ADAPT` moves. Places are 4 KiB aligned and padded by the sectors around the blob, so a read can't touch a neighbour. That leaves 5,272 experts in 10 GiB instead of 5,302. Victims must have a count under 1.4: a VRAM round's incoming expert had at least 2 when chosen and counts decay by 0.7 a round, so a round in flight is never touched. This assumes `--adapt-decay` of at least 0.7.
+
+**Speed, 10 GiB, model card settings, order normal, through, through, normal, normal, through:**
+
+| | Normal (3 runs) | Read-through (3 runs) | Change |
+|---|---:|---:|---:|
+| Whole run | 42.8 (42.0-44.2) | 45.0 (44.7-45.5) | +5.2% |
+| Short prompts | 46.2 (44.9-47.8) | 47.7 (47.3-48.1) | +3.4% |
+| After a 50K prompt | 36.5 (35.7-37.6) | 39.2 (36.5-42.2) | +7.5% |
+| Follow-up | 38.5 (37.2-39.2) | 40.7 (39.8-41.7) | +5.8% |
+| Prefill | 1,370 | 1,368 | -0.2% |
+| Experts read | 106,030 | 88,888 | -16.2% |
+| Waited on reads | 21.6 s | 17.7 s | -18.2% |
+| Lowest available RAM | 1.24 GiB | 0.82 GiB | one run at 0.32 |
+| Paged out | 0.61 GB/h | 0.53 GB/h | |
+
+- Tokens per step were also 6.4% higher in these runs (1.86 against 1.98), which read-through shouldn't change, so part of the gain may be luck of the answers.
+- The result is at the bottom of the predicted +5.6% to +11%. The model's +7.4% without a copy refund was high. Reads fell less than the simulated 20%.
+
+**Correctness:**
+- **Bytes:** with swaps and PCIe on, the whole tier against the file 4 times, after up to 80,046 landings: 5,272 blobs each, 0 differ.
+- **Answers, usual settings at temperature 0:** all 6 differed from normal. That comparison can't decide anything, because the CPU share, tail skip, PCIe and swaps make answers vary between runs.
+- **Answers, the identical-output settings (`STRATA_IQ_MT_MIN=1`, `STRATA_ROUTE_TAIL_SKIP=0`, `STRATA_PREFILL_CPU_SHARE=0`, `--prompt-cache 0 --pcie-frac 0`, plus `--adapt-swaps 1 --adapt-every 1000000` so usage counts exist with VRAM fixed):** normal matched normal, read-through matched read-through, and read-through matched normal on all 6 prompts, up to 50K context. A third read-through run with the tier checked at each 2,000 landings gave 0 differ.
+- **My first version of this check was empty:** `--adapt-swaps 0` leaves no usage counts, so nothing landed. It only showed the padded layout changes nothing.
+- **Limit:** with no rounds there's no decay, so victims run out after about 6,000-8,000 landings per run. This also makes read-through worse than RAM moves in this special setup (424,085 experts read against 317,014). Answers weren't compared with swaps or PCIe on, where they vary anyway.
+
+## PR #1 on this PC, and the test branch (2026-11-04)
+
+- **Crash check:** on reading the PR, its file-scope tables in `iq_avx512.cpp` (built at start, in a file compiled with `/arch:AVX512`) looked able to crash a CPU without AVX-512. They didn't: the PR engine with every switch off started and ran 4 short prompts, a 50K prompt and a follow-up on the i7-14700KF, 0 damaged. This shows it for this one build. The compiler could still choose AVX-512 there in another build, so moving the tables behind the CPU check is still worth doing before a merge. Speed from that run doesn't count: a build was running beside it (lowest available RAM 0.03 GiB).
+- **`pool_tasks_test` on this CPU:** 792 bitwise comparisons passed, 432 with `STRATA_POOL_FUSED=1`. The part needing AVX-512 was skipped.
+- **Read-through's victim floor** now follows `--adapt-decay` (2 x decay, was a fixed 1.4), and read-through stays off on multi-GPU, peer, batch and pipelined paths.
+- **Branch `ram-through-test`:** PR #1's 3 commits plus read-through (`cef19ce8`), pushed so the PR's author can test on an RTX 4060 8 GB laptop. PR #1 itself is not merged.
+
+## `STRATA_RAM_THROUGH` on an RTX 4060 laptop (2026-11-04, measured and reported by PR #1's author, not reproduced here)
+
+RTX 4060 Laptop 8 GB, Ryzen 7 8845HS, 32 GB, unequal drives (7.1 and 3.5 GB/s, share 0.25), branch `ram-through-test` at `cef19ce`, unpinned tier. Model card sampling with a fixed seed, 3 runs each, order A B B A A B, without read-ahead, file tail skip or `STRATA_HC_Q8`. A browser stayed open with its processes capped at 256 MB each.
+
+| | 10 GiB off | 10 GiB on | Change | 16 GiB off | 16 GiB on | Change |
+|---|---:|---:|---:|---:|---:|---:|
+| Short prompts | 16.90 | 22.06 | +30.5% | 23.73 | 24.95 | +5.1% |
+| After a 50K prompt | 15.77 | 18.43 | +16.9% | 22.47 | 24.47 | +8.9% |
+| Follow-up | 18.73 | 18.63 | -0.5% | 25.93 | 26.20 | +1.0% |
+| Prompt | 653 | 646 | -1.1% | 659 | 660 | +0.2% |
+| Tokens per step | 1.86 | 1.93 | +3.5% | 1.87 | 1.88 | +0.4% |
+| Experts read | 143,888 | 89,087 | -38% | 62,549 | 43,112 | -31% |
+| Waited on reads | 43.0 s | 30.0 s | -30% | 17.4 s | 13.4 s | -23% |
+
+- **Correctness:** an unpinned 16 GiB tier against the file, 5 checks up to 100,019 landings, 8,364 blobs each, all 0 differ. No verify run at 10 GiB.
+- **Spread:** at 10 GiB every on run beat every off run on short prompts and after the long prompt. At 16 GiB the after-long-prompt ranges overlap, so he reads it as a likely gain of a few percent.
+- **Memory:** at 16 GiB, 0.3-0.6 GB stayed available and paging ran 7-63 GB/h in both arms, so memory numbers there are noise. At 10 GiB about 4 GB stayed free.
+- **Places:** 5,231 against 5,258 at 10 GiB, 8,364 against 8,406 at 16 GiB (-0.5%).
+- **Not run:** with his usual read-ahead, file tail skip or `STRATA_HC_Q8`; a pinned tier; answer comparison; Linux.
+- **Baseline, from the follow-up report:** `STRATA_RAM_ADAPT=1`, `_PAR=1` and `_BG=1` were on in both arms, and the off runs' logs show the moves happening. So a weak baseline of that kind doesn't explain the gain. Reads fell 38% there and 16% here at the same 10 GiB, and the short-prompt gain is about five times the +6% here. Off, that PC read 143,888 experts and waited 43 s in a run with one 50K prompt. Not comparable directly, but the 8 GB card has fewer VRAM slots, so more misses to save is the likely part (not tested).
+
+**Follow-up: read-through with read-ahead on in both arms (`STRATA_DIRECT_AHEAD=2 STRATA_LOOKAHEAD_K=5`), same method, 2026-11-05, reported by the author:**
+
+| | 10 GiB off | 10 GiB on | Change | 16 GiB off | 16 GiB on | Change |
+|---|---:|---:|---:|---:|---:|---:|
+| Short prompts | 19.73 | 22.60 | +14.5% | 25.23 | 26.48 | +4.9%, overlap |
+| After a 50K prompt | 18.67 | 20.77 | +11.2%, ranges touch | 24.43 | 26.93 | +10.2%, overlap |
+| Follow-up | 20.43 | 23.00 | +12.6% | 31.93 | 28.00 | **-12.3%, no overlap** |
+| Prompt | 646 | 639 | -1.1% | 654 | 650 | -0.6% |
+| Tokens per step | 1.94 | 1.94 | flat | 1.91 | 1.89 | flat |
+| Experts read | 119,171 | 97,972 | -18% | 59,765 | 48,875 | -18% |
+| Waited on reads | 25.2 s | 19.0 s | -25% | 11.2 s | 8.9 s | -20% |
+| Lowest available | 1.95 GB | 2.42 GB | | 0.62 GB | 0.31 GB | |
+| Paged out | 2.0 GB/h | 5.7 GB/h | | 2.0 GB/h | 37.8 GB/h | |
+
+- **Correctness:** 10 GiB tier with read-ahead, 6 checks up to 120,079 landings, 5,231 blobs each, all 0 differ, no crash. No verify at 16 GiB with read-ahead.
+- **Read-ahead takes part of the gain:** short prompts on 10 GiB are +30% without it and +15% with it. Across days, with other browser tabs, so rough: read-ahead lifts off from 16.90 to 19.73 and on only from 22.06 to 22.60. That matches this PC, where read-through with read-ahead (+4.9%) did no better than read-through alone (+6.0%).
+- **The 16 GiB follow-up looked like a clear loss here, but didn't repeat (see below):** every off run (31.6-32.2) beat every on run (26.8-28.7). All 3 on runs paged 25-59 GB/h with 0.13-0.59 GB available, off 1.4-2.7 GB/h with 0.50-0.81 GB. Paging wasn't timed per request.
+- **Not run in this batch:** browser closed (the owner kept it open), pinned tier, with file tail skip or `STRATA_HC_Q8`, more than 3 runs, answer comparison, Linux, power mode not recorded.
+
+**Follow-up 3: 16 GiB, browser closed, paging timed per request, same binary, order A B B A A B, two sets back to back, 2026-11-05, reported by the author:**
+
+| | Read-ahead on: off | on | Change | Read-ahead off: off | on | Change |
+|---|---:|---:|---:|---:|---:|---:|
+| Short prompts | 24.79 | 26.82 | +8.2%, no overlap | 22.44 | 25.44 | +13.4%, no overlap |
+| After a 50K prompt | 22.87 | 25.87 | +13.1%, no overlap | 22.80 | 24.80 | +8.8%, one run overlaps |
+| Follow-up | 29.90 | 29.03 | -2.9%, overlap | 26.87 | 26.70 | -0.6%, overlap |
+| Prompt | 656 | 657 | flat | 650 | 649 | flat |
+| Tokens per step | 1.96 | 1.90 | -3% | 1.91 | 1.89 | -1% |
+| Experts read | 67,036 | 50,513 | -25% | 64,318 | 42,128 | -34% |
+| Waited on reads | 12.7 s | 8.8 s | -31% | 17.5 s | 12.2 s | -30% |
+| Lowest available | 1.33 GB | 1.45 GB | | 1.54 GB | 1.40 GB | |
+
+- **The follow-up loss is mostly gone:** -12% with no overlap became -3% and -0.6%, both overlapping. Read-through's own follow-up barely moved (28.0 to 29.0). The off runs fell, 31.9 to 29.9, so that gap was mostly off running fast that day. Why isn't known.
+- **Paging doesn't explain it:** none of the 3 read-ahead on follow-ups paged (0.00 GB, at least 2.2 GB available). The one on follow-up that paged wasn't the slowest, and an off follow-up paged too.
+- **The browser mattered for RAM:** with it closed, at least 1.2 GB stayed available in every request, against 0.13-0.81 GB. Paging fell to 0-1.3 GB per run, mostly 0.
+- **16 GiB gain is larger than the earlier "few percent":** +8-13% on short and after-long prompts with free RAM. It's now about the size of the 10 GiB read-ahead gain (+11-15%).
+- **Read-ahead on top of read-through does add something on that PC, same session, not interleaved:** read-through arm short 25.44 to 26.82 (+5%), after-long 24.80 to 25.87 (+4%), follow-up 26.70 to 29.03 (+9%). The off arm gains more (+10%, flat, +11%). On this PC the pair (+4.9%) was no better than read-through alone (+6.0%), so this differs between the machines.
+- **Default so far:** positive or flat on every measure in every batch on both PCs, except the 16 GiB follow-up that didn't repeat. Left: this PC at 14 GiB, a long real session for paging, and `readme2`-style runs on 26H2. Both PCs tested only at model card sampling for speed; the identical-answer check is from this PC alone.
+- **Not run:** more than 3 runs per arm, answer comparison, with file tail skip or `STRATA_HC_Q8`, pinned tier, 10 GiB. Not controlled: whether Windows Update, BITS or Defender were working during the runs. 2 s samples can miss short paging bursts.
+
+## Layer-major prompts (2026-11-05, test engine `strata\build`, not installed)
+
+**First attempt was empty.** `STRATA_PREFILL_LAYER_MAJOR=1 STRATA_PREFILL_LM_TOKENS=32768 STRATA_PREFILL_LM_FORCE=1`, 2 runs each: every prompt logged "layer-major off for this prompt: no VRAM for a super-chunk (399-515 MiB free)", so the walk never ran and these are normal reads. Normal and "layer-major" tok/s: 31K 1,296 and 1,318, 50K 1,387 and 1,394, 228K 1,457 and 1,419. This says nothing about layer-major. The report also used `--prefill-head-alias`, which frees the output head's VRAM (521 MB here) during a prompt. The prompt plan here expects about 196 GB read from the drive per 32K-token prompt, which is the re-reading layer-major is meant to cut.
+
+**With the head alias (`--short-read 0 --prefill-head-alias`, `STRATA_HEAD_FAST_LOAD=1`, `STRATA_HEAD_ALIAS_SHORT=64`), one run:** the walk ran on all three prompts, and it's slower:
+
+| Prompt | Normal (2 runs, mean) | Layer-major with alias (1 run) | Change |
+|---|---:|---:|---:|
+| 31K tokens | 1,296 | 1,070 | -17% |
+| 50K tokens | 1,387 | 1,171 | -16% |
+| 228K tokens | 1,457 | 1,257 | -14% |
+
+- **Why, as far as the log shows:** with 400-500 MiB of VRAM free, super-chunks fit only 8,192-12,288 tokens, against 32,768 asked for and normal chunks of 6,912, so most of the re-reading stays: 327.5 GB streamed for the 50K prompt. Head restore adds 134-154 ms and rebuilding the workspace 75-91 ms per fresh prompt.
+- **Why it helped the report:** its baseline was 320-344 tok/s, on a different path, and its result of 743-847 tok/s is still well under normal here. Not compared directly.
+- **Stopped here.** It fails the rule to go on only if it beats about 1,400 tok/s, so no KL, needle test or `STRATA_LM_CPU_ROWS` here. The answer may differ on a setup with more VRAM free.
+
+## Read-through with read-ahead (2026-11-05, test engine `strata\build`, not installed)
+
+**Bytes, both on, one run:** 3 checks up to 60,143 landings, 5,272 blobs each, 0 differ.
+
+**Speed, 10 GiB, model card settings, 3 runs each, order normal, through, both, both, through, normal, normal, both, through:**
+
+| | Normal | Read-through | Both |
+|---|---:|---:|---:|
+| Whole run | 41.5 (40.9-41.9) | 44.0 (42.2-45.0), +6.0% | 43.5 (41.2-45.0), +4.9% |
+| Short prompts | 44.1 (43.9-44.5) | 47.0 (46.7-47.2), +6.7% | 45.8 (43.2-47.8), +3.8% |
+| After a 50K prompt | 36.9 (34.3-38.2) | 39.3 (36.1-41.3), +6.5% | 37.8 (35.9-40.8), +2.6% |
+| Follow-up | 37.6 (37.2-38.1) | 38.4 (34.4-40.9), +2.0% | 40.7 (38.3-42.2), +8.1% |
+| Prefill | 1,396 | 1,389 | 1,399 |
+| Tokens per window | 1.82 | 1.85 | 1.93 |
+| ms per token | 24.1 | 22.8 | 23.0 |
+| Experts read | 105,597 | 87,851, -16.8% | 97,660, -7.5% |
+| Waited on reads | 21.1 s | 17.6 s, -16.5% | 17.4 s, -17.3% |
+| Paged out | 0.0 GB/h | 1.7 GB/h (one run 5.0, the others about 0) | 0.0 GB/h |
+
+- **Read-through repeated its gain:** +5.2% in the first batch, +6.0% here. Whole-run and short-prompt ranges don't overlap here, and tokens per window nearly match. That's 6 runs each across two batches.
+- **Read-ahead adds nothing on top.** Wait is the same and ms per token no better, while it reads more. A read-ahead hit never lands in the tier, so the tier learns less: 97,660 experts read against 87,851, on top of about 89,000 blobs read ahead, 47,000 used. The follow-up's +8.1% goes with 4% more tokens per window, in one of four measures. Not worth the extra SSD work.
+- **So:** read-through alone. No answer check for the pair, since it doesn't win.
+
+## Upstream #4040, `--lookup-max-t` (2026-11-05, `strata-0210` test build, not in the fork, not installed)
+
+MTP against MTP, only `--lookup-max-t 0` against 12 changed. 10 GiB, model card sampling, thinking on, 3 runs each, order off, on, on, off, off, on. Engaged: window sizes 1, 2, 3, 4, 5, 6, 12, and some on requests averaged 9.8 tokens per window against at most 5.8 off.
+
+| | Coding off | Coding on | Change | Rewrite off | Rewrite on | Change |
+|---|---:|---:|---:|---:|---:|---:|
+| tok/s | 44.1 (43.2-45.2) | 43.0 (42.6-43.5) | -2.3% | 38.7 (37.5-39.9) | 40.3 (39.5-40.8) | +4.1% |
+| Tokens per window | 1.83 | 1.84 | | 3.57 (3.45-3.66) | 5.10 (4.56-5.54) | +43% |
+| ms per window | 41.6 | 42.7 | | 92.3 | 126.7 | +37% |
+| ms per token | 22.7 | 23.3 | | 25.9 | 24.8 | -4.0% |
+| Waited on reads, ms per token | 7.3 | 7.4 | | 13.2 | 14.1 | +6.6% |
+| Experts read per token | 35.3 | 36.1 | | 74.2 (72.3-77.7) | 83.2 (81.8-85.4) | +12% |
+| Read time per reading layer | 0.79 ms | 0.80 ms | | 1.51 ms | 1.77 ms | +17% |
+| Draft acceptance | 63.2% | 61.7% | | 90.1% | 92.7% | |
+| Suffix draft acceptance | 80.3% | 70.7% | | 98.0% | 99.1% | |
+| CPU experts per layer-window | 5.2 | 5.4 | | 10.8 | 16.6 | +54% |
+| VRAM hits per layer-window | 12.0 | 12.0 | | 16.3 | 20.3 | +25% |
+
+Only tokens per window and expert demand separate cleanly; tok/s ranges overlap in both columns. VRAM free at start 482-519 MiB off, 458-480 on, lowest logged 298-369 off, 272-325 on, slots 1,975 against 1,974. Peak VRAM wasn't sampled. The "damaged" flag on every run, both arms, is the file's own runs of dashes and spaces, not damage.
+
+**Reading:** longer windows work as designed on copy-heavy text, but demand rises with them, and in a rewrite SSD wait is over half of each token, so 43% more tokens per window gives about 4%. No gain on coding, where windows stay at 2.3 tokens. The feature is copy-only, and on this setup SSD wait cancels most of that. Not meaningful enough to port or stack with read-through.
+
+**Answers, MTP against MTP at the identical-output settings (temperature 0, tail skip, CPU share and PCIe off, VRAM fixed), order off, on, on, off:** off matched off and on matched on, on all 6 prompts. Off against on differs on all 6, at the same places in both pairs (characters 299-815). So within this test the difference comes from the switch, not noise, and the PR's "bitwise" doesn't hold on this build at these settings. "`--spec 4` changes the wording" earlier was a similar effect of window shape. Whether either answer is worse wasn't measured, as no KL was run. At these settings rewrites ran 19.4 -> 23.7 tok/s (+22%) with SSD wait up, on text that differs, so it doesn't carry over to daily settings, which gave about +4%.
+
+**Where a token's time goes, from this run:** coding 22.7 ms: 7.3 reads, 15.4 the rest. Rewrite with long windows 24.8 ms: 14.1 reads, 10.7 the rest. So tokens per window lowers the rest, and SSD wait grows back when text is cold.
+
+## Remaining bottlenecks (2026-11-05, from the runs above, not a measurement of its own)
+
+Target 70-80 tok/s is 12.5-14.3 ms a token. Coding today is about 22.7 ms a token at 1.83 tokens a window, 41.6 ms a window (v0.2.10 build, MTP):
+
+| Cost | ms a window | ms a token | Scales with |
+|---|---:|---:|---|
+| Reads (SSD wait) | about 13 | 7.3 | Experts outside VRAM and RAM |
+| CPU expert work | about 14 | 7.7 | Experts outside VRAM |
+| GPU-reach wait | about 12.5 | 6.8 | The window, not hit rate |
+| Draft | about 2.7 | 1.5 | The window |
+
+- These are rounded and don't sum exactly. SSD wait comes from the cold-read lines, the others from decode timing.
+- **Non-SSD cost fits about 13 ms a window plus 8 ms a token**, from two points of different text (coding 15.4 ms a token at 1.83 tokens a window, long-window rewrites 10.7 at 5.1). So 14 ms a token needs SSD wait of about 2 ms and about 3.4 tokens a window. At read-through's 6 ms, no window size reaches it. Rough.
+- **Rewrites at 90% acceptance and 3.6 tokens a window aren't cheaper per token than coding at 63% and 1.83:** cold text doubles reads per token.
+- **Modeled (`memtools/next_sim.py`, held-out run, real gains have run lower):** read-through about 46 tok/s; with +0.5, +1, +2 GiB of VRAM slots about 47, 48, 50. A swap budget of 96 is about +0.4% even with free swaps, though VRAM share rises to 56.9%. K/V isn't the VRAM to reclaim: 32,768 cells a layer stay in VRAM and most is in pinned RAM.
+- **Realistic on coding, same hardware and quantization, no skipping: about 50-55 tok/s by these estimates.** 70-80 isn't in reach of what's been tested.
+
+**Next experiment:** rerun `STRATA_VERIFY_PROFILE=1 STRATA_DECODE_TIMING=1` on today's setup, with no new code, and split the result by window size. Partly done before: "GPU profile" (2026-11-03, one run, older 14 GiB setup) found about 15.5 ms of real GPU work in a 39 ms step (dense matvec 3.2, hyper-connection 3.2, output projection 1.6, head 1.2, VRAM experts 2.2), and "Cache plan so far" measured 11-12 ms per extra draft row for rows 1-3. No single kernel dominates, so expect a few ms at most, not a route to 70-80. New here: today's setup, window sizes above 3, and the cost after the last layer.
+
+## Narrow head-alias loan (2026-11-05, test engine `strata\build`, uncommitted, opt-in `STRATA_HEAD_ALIAS_NARROW=1`, not installed)
+
+`--prefill-head-alias` lent from slot 1 on: 2,230 of 2,231 slots for a 2,048-token chunk that uses 1,413 MiB, and every lent expert is streamed and refilled. The narrow loan borrows only the tail slots the chunk's buffers need, as a loan without the alias does. Same chunk, same alias. `STRATA_LOAN_TRACE=1` counts the loan, `STRATA_LOAN_VERIFY=1` compares every slot marked resident with the file after each refill.
+
+**Bytes before speed (`STRATA_LOAN_VERIFY=1`, arms A-D, 2 refills each):** 8 of 8 checks, 0 differ, up to 2,273 slots a check, kept and lent slots both. That covers bytes, not answers.
+
+**Speed, 3 runs each, mixed order, read-through on in all arms, model card sampling, 64 tokens generated.** Streamed GB is blobs at about 2.05 MB each, or the log's MB for D:
+
+| Arm | Chunk | Slots lent of total | 31K prompt tok/s | Seconds | Streamed GB | 50K prompt tok/s | Seconds | Streamed GB | Refill MiB, ms first / next |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| Z normal, alias off | 6,912 | 1,663 of 1,978 | 1,262 (1,225-1,289) | 26.7 | 249 | 1,383 (1,378-1,389) | 37.9 | 398 | 3,269, 1,359 / 940 |
+| A alias off, matched | 2,048 | 738 of 2,233 | 513 (509-518) | 62.4 | 737 | 533 (532-535) | 95.6 | 1,173 | 1,443, 691 / 436 |
+| B alias, existing loan | 2,048 | 2,230 of 2,231 | 467 (464-471) | 68.3 | 787 | 486 (486-487) | 104.6 | 1,250 | 4,387, 1,569 / 1,294 |
+| C alias, narrow | 2,048 | 738 of 2,231 | 512 (507-518) | 62.5 | 736 | 530 (521-534) | 96.2 | 1,172 | 1,442, 723 / 470 |
+| D alias, narrow, layer-major | 2,048 | 738 of 2,231 | 1,547 (1,414-1,617) | 22.1 | 107 | 1,469 (1,429-1,519) | 35.7 | 226 | 1,442, 736 / 442 |
+
+- **The narrow loan alone (B to C):** +9.6% and +9.1%, refill bytes -67%, refill 1,569 -> 723 ms and 1,294 -> 470 ms. It lands exactly on A, so the existing loan was the whole cost of the alias at this chunk.
+- **A 2,048-token chunk is the real penalty here:** C is 2.6-2.5x slower than Z, streaming about 3x the bytes.
+- **Layer-major needed the narrow loan's slots kept and the head's VRAM:** D against Z is +23% on 31K and +6% on 50K, in 4.6 s and 2.2 s less, with -57% and -43% bytes streamed. The earlier 14-17% loss had the old loan and `0 resident`.
+- **D is two-mode at 31K:** 2 super-chunks of up to 16,384 (1,608 and 1,617 tok/s, 91.8 GB) or 3 of up to 12,288 (1,414, 136 GB), depending on VRAM free.
+- **Slots at decode:** alias arms have 2,231, normal 1,978. A, with its reserve lowered to match, showed about 110 MiB of VRAM free with the head loaded, so alias arms should have about that at decode. Low: the engine warns under 1,024 MiB. Generation here is only 64 tokens, so decode isn't tested.
+- **Paging:** D 53-60 GB/h and Z 3-49 GB/h during these 1-2 minute runs. Short windows, so rough, but well over the 0.3 GB/h target. Needs a long-run check.
+- **Overlap:** disk scans on D: by another session ran 09:12:30-09:17:31, covering A run 2 and Z run 2 fully, and the end of B run 2 and the start of B run 3. Those numbers look like the others, and so did the reruns with nothing else on the disk (one more each: Z 1,309 and 1,402 tok/s, A 513 and 530, B 456 and 488).
+
+**228K check and more short runs, order Z, D, D, Z, model card sampling, nothing else on the disk:**
+
+| Prompt | Normal (Z) | D | Change | Streamed GB, Z to D |
+|---|---:|---:|---:|---:|
+| 31K, all runs (6 Z, 5 D) | 1,290 tok/s, 26.1 s | 1,581 tok/s, 21.4 s | -18% time | 249 to 92-136 |
+| 50K, all runs (6 Z, 5 D) | 1,394 tok/s, 37.8 s | 1,488 tok/s, 35.3 s | -6.5% time | 398 to 226 |
+| 228K (2 each) | 1,468 tok/s (1,451-1,486), 157.3 s | 1,563 (1,561-1,565), 147.8 s | -6% time | 1,674 to 869 |
+
+- **Bytes fall far more than time:** at 228K, -48% bytes for -6% time. Above about 50K, reading the SSD isn't what limits the prompt.
+- **Needle:** 6 of 6 found on both, 32K and 128K at depths 10, 50, 90.
+- **KL of the first window at these settings, full vocabulary, 2 runs each.** Same top token in every pair:
+
+| Prompt | Z vs Z | D vs D | Z vs D (2 pairs) |
+|---|---:|---:|---:|
+| 31K, first request | 0.00000 | 0.00000 | 0.00008, 0.00008 |
+| 50K | 0.00569 | 0.00998 | 0.05798, 0.16063 |
+| 228K | 0.05358 | 0.01513 | 0.02524, 0.06957 |
+
+  The first request is close, but 50K sits about 10x over the noise between runs, with p(top) 0.943 against 0.991-0.999. One token per prompt is thin, and the same-arm numbers show state left by earlier requests matters.
+
+**KL at the identical-output settings (`loan7`, order Z, D, D, Z), where each arm repeats itself exactly:**
+
+| Prompt | Z vs Z | D vs D | Z vs D | p(top), Z / D |
+|---|---:|---:|---:|---:|
+| 31K, first request | 0.00000 | 0.00000 | 0.00007 | 0.999 / 0.999 |
+| 50K | 0.00000 | 0.00000 | 0.02022 | 0.904 / 0.951 |
+| 228K | 0.00000 | 0.00000 | 0.01181 | 0.646 / 0.572 |
+
+So the gap is real and comes from the arm, not from run-to-run state. Same top token on all three. Prompt speed at these settings: 31K -17% time, 50K -5%, 228K -2.5% (1,480 against 1,517 tok/s, 156.3 against 152.4 s). Source comments put layer-major's difference down to rounding from expert sum order, but 0.02 at 50K is a lot larger than the 0.00007 at 31K, so that isn't shown yet. Unproven guess: chunk size or `--kv-resident 32768`, since only the prompts past 32,768 tokens show it. 
+
+**Control (`loan8`, one run each, same settings, no layer-major), against normal:**
+
+| Prompt | Chunk 2,048, alias off (A) | Chunk 2,048, narrow alias (C) | D, for comparison |
+|---|---:|---:|---:|
+| 31K | 0.00025 | 0.00031 | 0.00007 |
+| 50K | 0.00227 | 0.00220 | 0.02022 |
+
+- **Chunk size alone moves the logits a little,** and A and C agree, so the alias, the narrow loan and the extra slots add nothing measurable. The narrow loan on its own is clean.
+- **Layer-major is about 9x that at 50K,** and smaller than it at 31K. So chunk size doesn't explain the gap. What changes between 31K and 50K isn't known: 2 super-chunks against 4, or crossing `--kv-resident 32768` are the candidates. Not cleared: layer-major stays off until this is explained.
+
+**Decode and paging (`loan6`), `switch_test.py`, read-through against D, 3 runs each, order R, E, E, R, R, E, model card sampling, 450 tokens:**
+
+| | Read-through | D | Change |
+|---|---:|---:|---:|
+| Coding answers | 50.5 (48.3-51.7) | 52.3 (51.8-53.1) | +3.5% |
+| After 50K | 42.4 (40.7-45.1) | 44.1 (43.1-44.8) | +4.1%, overlap |
+| Follow-up | 45.2 (42.9-46.6) | 43.9 (41.7-46.2) | -2.8%, overlap |
+| Whole run | 48.2 (46.5-49.4) | 49.1 (48.6-49.9) | +1.9%, overlap |
+| 50K prompt | 1,398 | 1,508 | +7.8% |
+| Tokens per window | 1.80 | 1.87 | overlap |
+| Blobs read | 83,114 | 80,098 | -3.6%, overlap |
+| Lowest free RAM | 3.76 GiB | 3.79 GiB | |
+| Paged out | 0.0-0.13 GB/h | 0.0-0.28 GB/h | under the target |
+| Damaged answers | 0 | 0 | |
+
+- **Paging:** the 53-60 GB/h above belongs to the prompt-only runs. Over these whole runs it's gone, 100 s windows, so a long session is still needed.
+- **Two costs the prompt table doesn't show:**
+  - **VRAM at decode:** 54-58 MiB free once the head is back, against 482 MiB on normal. The 253 extra slots are the likely source of the small decode gain, and the engine warns this is where the driver can start paging GPU memory, with decode falling to a few tok/s. It didn't happen here, with nothing else using the GPU. The image path isn't tested.
+  - **Short prompts:** anything over 69 tokens goes the batched way: 78-84 tokens took 2.7-2.8 s against 1.8-2.1 s, and a follow-up of 260 new tokens took 2.9 s against 1.5 s for 117. About 0.4 s of that is the refill. That's paid on every agent turn and may cancel the long-prompt gain over a session. No real session has been run with this.
+- **Verdict so far:** the narrow loan is a clean fix for anyone using the alias. D is faster on long prompts, but isn't ready to enable: KL not cleared, and both costs above open. Next, if KL clears: cap the cache so VRAM stays about 500 MiB free at decode, raise `STRATA_HEAD_ALIAS_SHORT` so small turns skip the swap, then a real agent session.
+
+## PR #1's `STRATA_POOL_FUSED` (2026-11-04, PR build `strata-pr1`, not installed)
+
+Daily setup, 10 GiB, model card settings, 3 runs each, order off, on, on, off, off, on. Not the report's conditions (see its method in the queue).
+
+| | Off | On | Change |
+|---|---:|---:|---:|
+| Whole run | 43.0 (42.3-43.7) | 42.9 (42.6-43.4) | -0.2% |
+| Short prompts | 46.6 | 46.0 | -1.1% |
+| After a 50K prompt | 35.4 (31.7-39.8) | 37.6 (36.8-38.7) | +6.4% |
+| Follow-up | 38.1 | 39.5 | +3.9% |
+| ms per window | 43.8 | 44.1 | |
+| Tokens per window | 1.88 | 1.89 | |
+| CPU per reading layer, ready + just read | 0.266 + 0.139 ms | 0.268 + 0.139 ms | no change |
+
+No gain seen, and no crash or damaged answer. All ranges overlap. Its report got +5.6% on a laptop where CPU experts take about half the window.
+
+**It was active (`STRATA_POOL_PHASE_TIMING=1 STRATA_DECODE_TIMING=1`, one run each, 4 requests):** rows phases per window 137-180 off, 64-84 on, and quantize 0.08-0.14 ms off, 0.00 on. Tasks busy 88% off, 89-94% on. Host tail 1.0-1.8 ms off, 0.5-1.2 ms on. Pool wall about 14.1 ms a window off, 13.2 on, over different answers. So the barrier saving is real but small, which this A/B couldn't resolve.
+
+**Repeat at temperature 0 with pool timing, 3 runs each, order off, on, on, off, off, on:** pool time 14.94 (14.85-15.10) -> 14.32 ms a window (14.03-14.75), -4.1%, with no overlap. Tasks busy 88.5% -> 93.1%. Host tail 1.38 -> 0.83 ms. Whole run 48.3 -> 48.1 tok/s, overlapping. Follow-up 44.3 -> 42.3 tok/s, without overlap, but tokens per window also fell 4.3% in this arm (2.20 -> 2.10), so that's more likely the answers than the switch.
+
+**Verdict for this PC:** the saving is real, about 0.6 ms of a 45 ms window (about 1.4%), and doesn't show in tok/s. Not pushed to `speed-fork` on its own. Harmless when off. Bitwise test passed here, but no whole-engine answer check has been run with it. Temperature 0 didn't make answers repeat: off against off matched on 0 of 6 prompts at these settings.
+
+## Read-ahead at K=5 (2026-11-04, test engine `strata\build`, not installed)
+
+`STRATA_DIRECT_AHEAD=2 STRATA_LOOKAHEAD_K=5`, from PR #1's report. Daily setup otherwise, 10 GiB, model card settings, 3 runs each, order off, on, on, off, off, on.
+
+| | Off | K=5 | Change |
+|---|---:|---:|---:|
+| Whole run | 43.2 (41.3-44.2) | 44.4 (44.0-44.5) | +2.7% |
+| Short prompts | 46.5 | 47.5 | +2.1% |
+| After a 50K prompt | 36.5 (31.1-40.2) | 36.6 (32.1-40.5) | +0.5% |
+| Follow-up | 38.5 (37.3-40.0) | 40.8 (38.5-42.9) | +6.1% |
+| Prefill | 1,392 | 1,395 | |
+| ms per window | 44.1 | 42.1 | -4.5% |
+| Tokens per window | 1.90 | 1.87 | |
+| Read time per reading layer | 0.842 ms | 0.757 ms | -10% |
+| Waited on reads | 21.1 s (19.8-22.5) | 18.3 s (17.7-18.8) | -13.2% |
+| Lowest available RAM | 3.18 GiB | 3.61 GiB | |
+| Paged out | 0.07 GB/h | 0.02 GB/h | |
+
+- **Active:** one run's last count was 79,175 blobs read ahead, 43,282 used (55%), 35,814 never asked for, 0 too late. K=10 used about 28% and ran about 18% slower. So about 45% of what it reads is wasted SSD work.
+- **Only the wait doesn't overlap.** Tokens per window were lower in this arm, so ms per window is the fairer measure: about +4.7% at equal tokens per window.
+- **Same answers:** normal against K=5 at the identical-output settings, identical on all 6 prompts up to 50K, with read-ahead active (158,768 blobs read). One pair only. Those settings have swaps nearly off, and tail skip and PCIe off.
+- **Passes as a candidate.** Combination with read-through is untested.
+
+## Test queue and what remains (living list, started 2026-11-04)
+
+Update this as tests finish: move results to their own sections and keep only what's still open here. Nothing below is measured unless it says so.
+
+**Queue, in order. Main focus: PR #1, then upstream Strata PRs.**
+
+Part 1, PR #1 and its report:
+
+| # | Test | Status |
+|---|---|---|
+| 1 | Read-ahead K=5 (`STRATA_DIRECT_AHEAD=2 STRATA_LOOKAHEAD_K=5`) A/B, 6 runs | Done, see its section |
+| 2 | Read-ahead answer check, identical-output settings | Done, identical |
+| 3 | `STRATA_POOL_FUSED`: proved active, repeated at temperature 0 | Done: real but about 1.4% here, not pushed alone |
+| 4 | Layer-major prompts with the head alias | First result 14-17% slower, caused by the old loan. With the narrow loan -18% and -6% time, see "Narrow head-alias loan" |
+| 4a | Narrow loan, arms A-D, 228K, needle, decode and paging | Done, see its section |
+| 4b | Layer-major KL at identical-output settings (`loan7`), chunk control (`loan8`) | Done: layer-major itself, 0.012-0.020 past 32K, chunk size alone 0.002, same top token |
+| 4b2 | Where the layer-major gap starts: a prompt just under and just over 32,768 tokens, and 50K with a larger `--kv-resident` | Next, about 15 minutes |
+| 4c | D with the cache capped for about 500 MiB free at decode, and `STRATA_HEAD_ALIAS_SHORT` raised | Only if the gap is explained and accepted. Then a real agent session |
+| 5 | `STRATA_LM_CPU_ROWS` | Back open if layer-major clears 4b: changes bits per its comment, so KL first |
+| 6 | `--prefill-head-alias`, `STRATA_HEAD_FAST_LOAD`, `STRATA_HEAD_ALIAS_SHORT`, `STRATA_REFILL_PINNED` | Alias measured with the narrow loan. `STRATA_REFILL_PINNED` alone is untested: the narrow loan's refill is already 400-700 ms, so at most that |
+| 7 | Read-through with read-ahead K=5 | Done: read-through alone wins, read-ahead adds nothing on top |
+| 8 | PR #1 results from its author on the RTX 4060 laptop (branch `ram-through-test`) | Done, see its section, including the 16 GiB rerun with the browser closed. Open from it: read-through at 14 GiB on this PC, with paging timed per request |
+| 9 | PR #1 merge plan, below: decide switch by switch | After 1-8 |
+
+Part 2, upstream Strata PRs:
+
+| # | Test | Status |
+|---|---|---|
+| 10 | #4040: `--lookup-max-t 0` against 12 on `strata-0210` | Done: about +4% on rewrites, none on coding, and answers differ from off. Not ported |
+| 11 | #1324 (LRU part of the RAM tier) | Dropped 2026-11-05 by the user: read-through has its own results |
+| 12 | #3517 (conversation cache retention) | Dropped 2026-11-05 by the user: saving is off in daily use. Reconsider only if the conversation cache is turned on. If reopened, also read Maya #607: shared system-prompt state kept apart from conversations, reported about 19x sooner first token on DeepSeek. Not checked if the fork already does this at `--conversation-cache-mib 0` |
+| 13 | #4283 (routed prompt stream) | Dropped 2026-11-05 by the user: small at long context |
+
+Part 3, Project Maya (github.com/mw00/project-maya, v1.1.53), queued only, none run. Placed after Parts 1 and 2 for now; the order against them is the user's call. MIT licence, so ported code needs its notice and credit. Details as sent by the session reviewing it, not checked here. All figures are from other models and GPUs, and most settings are GLM-specific and may need porting. Only about half of its settings and changelog was read in detail. Developed on Linux. Only its GLM `MAYA_GLM_CPU_PIN` never pins on Windows; its Qwen pool does pin there. Source check by that session in `maya-review.md` (source reading only, not checked here); the statuses below are its suggestions, and moving items is the user's call. SSD ideas stay under the modeled zero-SSD-wait ceiling of about 68 tok/s.
+
+| # | Test | Status |
+|---|---|---|
+| 14 | Maya's Qwen against the 10 GiB daily setup and vanilla | Suggested low priority: `--import-model` matches by size and sha256, so it won't take IQ3_S, and Maya's Qwen is a different 112.5 GB fine-tune. Its Qwen path lacks several read paths this fork has, so expected slower here (a prediction from source) |
+| 15 | `MAYA_GLM_STREAM_FETCH` (GPU copy starts as SSD pieces land). Reported about +22%, V100 | Suggested hold: GLM only. First check if SSD-read experts go to the GPU here at all. `STRATA_STAGE_PIN`'s comment records corrupted output from an asynchronous copy out of a recycled stage buffer |
+| 16 | `MAYA_GLM_LEND_PARK_LRU` (eviction ties broken by recency) | Suggested drop: GLM only, and decayed float counts already carry recency |
+| 17 | `--prompt-cache-every 0` against the default 16384 on a long prompt (this fork's flag, no port; Maya's `MAYA_GLM_CKPT_EVERY` is GLM only) | Suggested cheap flag test, low expected gain: its reported cost is on a split, and 116,780 tokens here already read at about 1,500 tok/s |
+| 18 | `--expert-profile-save`, a learned profile, on unseen prompts (this fork's flag; `--expert-profile` is already used). Reported 40.7 against 35.4 tok/s is GLM on 9 GPUs at a fresh start | Suggested cheap flag test after 17. Helps fresh starts only. Fixed profiles lost to adapting in "Cache miss audit" |
+| 19 | `--calibrate`, as a method only: unseen prompts, keep a setting only above 3% | Suggested later: its tuning is GLM, and Qwen's only measured choice is drafter on or off |
+
+Not queued: its read-ahead (mostly flat or worse there), expert skipping and Turbo (trade quality), DFlash2 (already tested here; CC BY-NC-ND), multi-GPU.
+
+**If `STRATA_POOL_FUSED` passes** (gain above noise, same answers, no crashes): one commit on `speed-fork` with only its `pool.cpp`, `pool.hpp` and `pool_tasks_test.cpp` changes, the PR's author as commit author, off by default. Check the normal path and the build first, and push after the user confirms.
+
+**Combinations still untested:**
+
+| Switch | With | Why it matters |
+|---|---|---|
+| Read-through | `STRATA_POOL_FUSED` | Both change the cold-read layers; gains may not add up |
+| Read-through | Read-ahead | Both use the stage buffers, and read-through drops its aliases each layer |
+| Read-through | `STRATA_ROUTE_TAIL_SKIP_FILE` | Read-through changes what's in RAM, so it changes what gets skipped |
+| Read-through | `STRATA_HC_Q8` | More VRAM slots, fewer reads, so less to gain |
+| Read-through | Conversation cache on | Restores and parking near a moving tier |
+| Read-through | `--mmproj` image prompts | No image was run with it |
+| Read-through | `--adapt-decay` other than 0.7 | The floor follows decay now, but only 0.7 has run |
+| `STRATA_POOL_FUSED` | Read-ahead, `STRATA_ROUTE_TAIL_SKIP_FILE`, `STRATA_HC_Q8` | Only on or off alone so far |
+| Read-ahead | K other than 5, and tail skip | K=10 is ruled out, K=5 is only the PR author's result |
+| `--lookup-max-t` | Read-through, `STRATA_POOL_FUSED` | Not in the fork, needs a port first |
+| Layer-major | `STRATA_HC_REQ8` | Don't combine on the fork without upstream #4715's fix: it loses the prompt |
+| Layer-major | `STRATA_LM_CPU_ROWS`, CPU share | Its code comment says "other bits", so check KL |
+
+**Read-through before any default:**
+- More runs here: tokens per step were 6% higher in the first A/B.
+- Tiers other than 10 GiB. The 6-14 GiB gains are model only.
+- A long real session. Open: one run at 0.32 GiB lowest available, and 4.15 and 5.61 GB/h paged in the two verify runs (normal read-through runs about 0.5 GB/h).
+- The PR author's results on the RTX 4060 laptop, with an unpinned tier and unequal drives (branch `ram-through-test`).
+
+**PR #1 switches not run here:** `STRATA_HEAD_FAST_LOAD`, `STRATA_HEAD_ALIAS_SHORT`, `STRATA_REFILL_PINNED`, `STRATA_LM_CPU_ROWS`, `STRATA_POOL_PHASE_TIMING`. `STRATA_EXPERTS_MIRROR_SHARE` has no use with equal drives, and `STRATA_IQ3_VBMI` can't run on this CPU.
+
+**PR #1 merge plan (later):** move the `iq_avx512.cpp` tables behind the CPU check, check all switches off, HIP, SYCL and Linux builds, and decide how to merge. Also:
+- With `STRATA_POOL_FUSED` on, its time all lands in the gate/up counter and the quantize and down counters stay at 0, so any stats built on them mislead.
+- The report's working-set cap (`SetProcessWorkingSetSizeEx`, 256 MiB per browser process, held about 35 tok/s with a browser open) isn't in the PR's code. Ask for it if it's wanted: it could help beside other apps here.
+- The report's other settings not tried here: `--mtp-q4` (no net gain there), stage ring 128 x 8 threads, `--prefill-head-alias`.
+
+**Measured or modeled, not built or run:**
+- IoRing reads: modeled +3.3% on the reader's E-core, +5.1% on a P-core sibling.
+- `STRATA_DIRECT_BATCH` 4 and 8 against 16. The read trace's "a finished blob waits" figure isn't usable when split by phase.
+
+**Parked:**
+- More tokens per window or less fixed GPU time: the only way to 70-80 tok/s, since zero SSD wait stops at about 68.
+- Task benchmark (vision, CTF, systems, webapp, math and physics).
+- Conversation cache at 10 GiB, with upstream #3517.
+- README speed numbers: measured 2026-11-05, see "README speed rows at model card settings". README text not updated yet: the user's call.
+- Two-terminal race GIF.
 
 ## Measurement tools added
 - `STRATA_ROUTE_TRACE=<path>`: records expert routing to a file (`src/core/expert_source.cpp`). Off unless set.
