@@ -995,6 +995,8 @@ struct Prefill::Impl {
     const int32_t* host_res = nullptr;
     int64_t T = 0, T_max = 0;
     bool borrowed = false, borrow_spill = false;
+    uint64_t ws_used = 0;
+    bool ws_spilled = false;
     cudaStream_t cs = nullptr, copy = nullptr;
     Gemm gemm;
     std::vector<void*> owned;
@@ -1870,6 +1872,8 @@ bool Prefill::carve(size_t T, void* alloc) {
     m.ple_norm = o.take<float>((size_t) strata::kernels::NG_HC_DIM, ok);
     take_stage(o, ss, s, m.stage, ok);
     m.T = (int64_t) T;
+    m.ws_used = o.used;
+    m.ws_spilled = o.spilled;
     return ok;
 }
 
@@ -1912,6 +1916,8 @@ bool Prefill::relayout(int64_t chunk, void* borrow, uint64_t borrow_bytes, std::
 }
 
 int64_t Prefill::chunk() const { return impl_->T; }
+uint64_t Prefill::workspace_used() const { return impl_->ws_used; }
+bool Prefill::workspace_spilled() const { return impl_->ws_spilled; }
 
 bool Prefill::draft_kv(core::MtpDrafter& mtp, const float* R_rows, const int32_t* next_tokens, int64_t n, int64_t cell0,
                        std::string& err, const char** why) {

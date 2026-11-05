@@ -9797,6 +9797,29 @@ int main(int argc, char** argv) {
                     o.prefill_chunk = candidate;
                     break;
                 }
+            // STRATA_HEAD_ALIAS_CHUNK=N (test, opt-in): this chunk instead of the list above, if it fits as they must
+            if (const char* cv = std::getenv("STRATA_HEAD_ALIAS_CHUNK"); cv != nullptr && std::atoll(cv) > 0) {
+                const int64_t c = std::atoll(cv);
+                if (strata::prefill::Prefill::bytes_needed(g, ss, c) + (512ull << 20) <= free_b + borrow_bytes) o.prefill_chunk = c;
+                else std::fprintf(stderr, "strata serve: STRATA_HEAD_ALIAS_CHUNK=%lld does not fit: staying at %lld\n", (long long) c, (long long) o.prefill_chunk);
+            }
+            // STRATA_HEAD_ALIAS_NARROW=1 (opt-in): borrow only the tail slots this chunk's buffers need, as a loan without the alias does, not
+            // slot 1 on.  The slots below it stay resident through the prompt, so those experts aren't streamed and aren't refilled.  A buffer that
+            // doesn't fit spills to its own allocation (the head's freed VRAM), as the alias already allows.  Same chunk and same head alias.
+            static const bool alias_narrow = [] { const char* v = std::getenv("STRATA_HEAD_ALIAS_NARROW"); return v != nullptr && v[0] == '1'; }();
+            if (alias_narrow && lend_first >= 0) {
+                PfPart& p0 = pf_parts[0];
+                const int64_t need = part_slots(p0, o.prefill_chunk);
+                if (need > 0) {
+                    p0.first = (int32_t) std::max<int64_t>(1, p0.cache->slots() - need);
+                    p0.first_now = p0.first;
+                    lend_first = p0.first;
+                    borrow = xcache.device_slot(lend_first);
+                    borrow_bytes = part_bytes(p0, lend_first);
+                    std::fprintf(stderr, "strata serve: STRATA_HEAD_ALIAS_NARROW: a %lld-token chunk borrows the last %lld of %lld slots\n",
+                                 (long long) o.prefill_chunk, (long long) (p0.cache->slots() - lend_first), (long long) p0.cache->slots());
+                }
+            }
             std::fprintf(stderr, "strata serve: prompt chunk head alias: %lld tokens with %lld MiB borrowed and "
                                  "%lld MiB free\n",
                          (long long) o.prefill_chunk, (long long) (borrow_bytes >> 20), (long long) (free_b >> 20));
@@ -14267,6 +14290,10 @@ int main(int argc, char** argv) {
                 return v != nullptr ? (int64_t) std::max(0LL, std::atoll(v)) : (int64_t) 0;
             }();
             const bool alias_defer = o.prefill_head_alias && alias_short > 0 && !kvg.on;
+            // STRATA_LOAN_TRACE=1 (measurement only): what this request's loan cost
+            static const bool loan_trace = std::getenv("STRATA_LOAN_TRACE") != nullptr;
+            struct LoanCount { int64_t lends = 0, lent = 0, refills = 0, refilled = 0, refill_bytes = 0, chunk = 0; double refill_ms = 0, lend_ms = 0; uint64_t ws_used = 0; bool ws_spilled = false, ended = false; strata::prefill::PrefillStats pf0, pf1; } lc;
+            lc.pf0 = sp.stats();
             auto alias_out = [&]() -> bool {   // the head out, the prompt workspace in
                 if (!o.prefill_head_alias || !native_head.loaded()) return true;
                 const auto head_t0 = Clock::now();
@@ -14278,11 +14305,14 @@ int main(int argc, char** argv) {
                 }
                 std::fprintf(stderr, "strata serve: --prefill-head-alias: prompt workspace rebuilt in %.1f ms\n",
                              std::chrono::duration<double, std::milli>(Clock::now() - head_t0).count());
+                lc.pf0 = sp.stats();   // a new prompt path: its counters start again
                 tr("head out");
                 return true;
             };
             auto alias_in = [&]() -> bool {   // the prompt workspace out, the head back
                 if (!o.prefill_head_alias || native_head.loaded()) return true;
+                lc.pf1 = sp.stats();   // STRATA_LOAN_TRACE: the reset below clears the prompt path's counters
+                lc.ended = true;
                 sp.reset();
                 const auto head_t0 = Clock::now();
                 if (!native_head.load(o.native_head_shards, g.n_embd, n_vocab, err)) {
@@ -15204,6 +15234,12 @@ int main(int argc, char** argv) {
                 int64_t n_lent = 0, n_parts = 0;
                 for (PfPart& p : pf_parts)
                     if (!p.lent.empty()) { n_lent += (int64_t) p.lent.size(); ++n_parts; }
+                if (loan_trace && n_parts > 0) {
+                    ++lc.refills;
+                    lc.refilled += n_lent;
+                    for (const PfPart& p : pf_parts)
+                        for (const auto& [i, slot] : p.lent) lc.refill_bytes += (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(i / g.n_expert);
+                }
                 if (n_parts > 1 && !refill_serial) {
                     for (PfPart& p : pf_parts)
                         if (!p.lent.empty() && !refill_issue(p, e)) return false;
@@ -15214,6 +15250,37 @@ int main(int argc, char** argv) {
                         if (!p.lent.empty() && !refill_one(p, e)) return false;
                 }
                 if (n_parts > 0) res_upload();
+                if (loan_trace && n_parts > 0) lc.refill_ms += std::chrono::duration<double, std::milli>(Clock::now() - t_rf).count();
+                // STRATA_LOAN_VERIFY=1 (slow, tests only): every slot the table calls resident against the file, after the refill: a buffer that ran
+                // over a kept expert, or a lent slot given back to the wrong expert, shows here
+                static const bool loan_verify = std::getenv("STRATA_LOAN_VERIFY") != nullptr;
+                if (loan_verify && n_parts > 0 && srcp == &src && pf_parts.size() == 1) {
+                    const auto t_v = Clock::now();
+                    const auto& lay = strata::kernels::cpu::expert_layout();
+                    const int32_t first = pf_parts[0].first_now;
+                    std::vector<uint8_t> vb, fb;
+                    int64_t kept = 0, back = 0, bad = 0;
+                    for (int64_t l = 0; l < g.n_layers; ++l) {
+                        const size_t nb = (size_t) lay.blob_bytes(l);
+                        vb.resize(nb);
+                        fb.resize(nb);
+                        for (int64_t ex = 0; ex < g.n_expert; ++ex) {
+                            const int32_t slot = host_res[(size_t) (l * g.n_expert + ex)];
+                            if (slot < 0) continue;
+                            int32_t ll = (int32_t) l, ee = (int32_t) ex;
+                            uint8_t* d = fb.data();
+                            bool same = cudaMemcpy(vb.data(), pf_parts[0].cache->device_slot(slot), nb, cudaMemcpyDeviceToHost) == cudaSuccess &&
+                                        srcp->copy_blobs(&ll, &ee, &d, 1) && std::memcmp(vb.data(), fb.data(), nb) == 0;
+                            ++(slot < first ? kept : back);
+                            if (!same) {
+                                if (bad < 8) std::fprintf(stderr, "strata loan verify: layer %lld expert %lld in slot %d differs from the file (%s)\n", (long long) l, (long long) ex, (int) slot, slot < first ? "kept" : "lent");
+                                ++bad;
+                            }
+                        }
+                    }
+                    std::fprintf(stderr, "strata loan verify: first lent slot %d: %lld kept and %lld lent slots checked, %lld differ, %.1f s\n", (int) first, (long long) kept, (long long) back, (long long) bad,
+                                 std::chrono::duration<double>(Clock::now() - t_v).count());
+                }
                 if (trace && n_parts > 0) {
                     std::fprintf(stderr, "strata trace: refilled %lld slots on %lld stage(s) in %.1f ms\n",
                                  (long long) n_lent, (long long) n_parts,
@@ -15300,6 +15367,14 @@ int main(int argc, char** argv) {
                 for (const PfPart& p : pf_parts)
                     if (p.first >= 0) seg_lend = std::max(seg_lend, p.lent_chunk);
                 if (any) res_upload();
+                if (loan_trace) {
+                    ++lc.lends;
+                    lc.chunk = std::max(lc.chunk, seg_lend);
+                    lc.ws_used = sp.workspace_used();
+                    lc.ws_spilled = sp.workspace_spilled();
+                    for (const PfPart& p : pf_parts) lc.lent = std::max(lc.lent, (int64_t) p.lent.size());
+                    lc.lend_ms += std::chrono::duration<double, std::milli>(Clock::now() - t_ln).count();
+                }
                 if (trace) {
                     int64_t n_lent = 0;
                     for (const PfPart& p : pf_parts) n_lent += (int64_t) p.lent.size();
@@ -17743,6 +17818,16 @@ int main(int argc, char** argv) {
                          prompt_ms > 0 ? 1000.0 * read_n / prompt_ms : 0.0, (long long) produced_n, decode_ms,
                          decode_ms > 0 ? 1000.0 * produced_n / decode_ms : 0.0, (long long) draft_accepted,
                          (long long) draft_offered, checks.size(), cancelled ? " (cancelled)" : "");
+            if (loan_trace) {
+                const strata::prefill::PrefillStats ps1 = lc.ended ? lc.pf1 : sp.stats();
+                const int32_t lf = pf_parts.empty() ? -1 : pf_parts[0].first_now;
+                std::fprintf(stderr, "strata loan: read %lld tokens in %.0f ms; chunk %lld; first lent slot %d of %lld; lends %lld, slots lent %lld; refills %lld, slots %lld, %.1f MiB, %.1f ms; lend %.1f ms; "
+                                     "workspace used %.1f MiB, spilled %d; chunks %lld, streamed %lld (DMA %lld), resident groups %lld, CPU %lld; alias %d\n",
+                             (long long) read_n, prompt_ms, (long long) lc.chunk, (int) lf, (long long) xcache.slots(), (long long) lc.lends, (long long) lc.lent, (long long) lc.refills, (long long) lc.refilled,
+                             (double) lc.refill_bytes / 1048576.0, lc.refill_ms, lc.lend_ms, (double) lc.ws_used / 1048576.0, lc.ws_spilled ? 1 : 0,
+                             (long long) (ps1.chunks - lc.pf0.chunks), (long long) (ps1.experts_streamed - lc.pf0.experts_streamed), (long long) (ps1.experts_dma - lc.pf0.experts_dma),
+                             (long long) (ps1.experts_resident - lc.pf0.experts_resident), (long long) (ps1.experts_cpu - lc.pf0.experts_cpu), o.prefill_head_alias ? 1 : 0);
+            }
             if (serve_adapt_drain_ms >= 1.0)
                 std::fprintf(stderr, "strata serve: the request first waited %.0f ms for the adaptive tier's round in flight\n",
                              serve_adapt_drain_ms);
