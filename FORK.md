@@ -8,17 +8,27 @@ generate faster on one PC by changing software only: same model, quant, context 
 
 ## Result
 
-Measured 2026-11-05, mixed order, same morning, before the Windows 26H2 update. Model card sampling, thinking on, a fresh engine per run. i7-14700KF, 32 GB DDR5-6000, RTX 4070 Ti 12 GB, two 990 PRO 1 TB, Windows 11. IQ3_S, `--kv int8`, 262K context. Upstream 3 runs a setting, this fork 5 at 14 GiB and 4 at 10 GiB. Read-through is off in this table.
+Measured 2026-11-05 on Windows 11 26H2. Model card sampling, thinking on, a fresh engine per run, 3 runs a setting. i7-14700KF, 32 GB DDR5-6000, RTX 4070 Ti 12 GB, two 990 PRO 1 TB. IQ3_S, `--kv int8`, 262K context, 10 GiB tier, checkpoints off. 27 runs, 0 failed. Mean text tok/s (low-high).
 
-| | Upstream, 14 GiB | This fork, 14 GiB | Upstream, 10 GiB | This fork, 10 GiB |
-|---|---:|---:|---:|---:|
-| Text | 35.7 tok/s (35.0-36.5) | **53.8 tok/s (50.4-56.2)**, +51% | 30.0 tok/s (28.9-30.8) | **46.7 tok/s (44.3-48.0)**, +56% |
-| Generating after a 26K file | 28.4 tok/s | 44.5 tok/s, +57% | 19.7 tok/s | 38.1 tok/s, +93% |
-| Follow-up | 28.2 tok/s | 47.4 tok/s, +68% | 23.7 tok/s | 40.2 tok/s, +70% |
-| Image answer | 22.0 tok/s | 37.0 tok/s, +68% | 16.5 tok/s | 30.3 tok/s, +83% |
-| Prompt reading | 1,017 tok/s | 1,484 tok/s, +46% | 970 tok/s | 1,432 tok/s, +48% |
+| Engine | `--spec`, workers | Switches | SSDs | Text | After 26K file | Follow-up | Image | Prompt read | ms/step |
+|---|---|---|---:|---:|---:|---:|---:|---:|---:|
+| Upstream | 3, 13 | Three memory switches | 1 | 28.2 (26.9-29.9) | 20.8 | 22.0 | 15.2 | 941 | 64.6 |
+| **Upstream, best we tried** | 4, 7 on P-cores | Three memory switches | 1 | **30.0** (29.1-31.5) | 22.9 | 23.4 | 15.2 | 945 | 64.9 |
+| Upstream | 3, 13 | Those + read overlap, page locking | 1 | 23.6 (23.2-24.2) | 17.8 | 17.4 | 14.5 | 931 | 75.4 |
+| Upstream | 4, 7 on P-cores | Those + read overlap, page locking | 1 | 24.9 (23.2-26.1) | 15.6 | 18.5 | 16.1 | 938 | 78.2 |
+| Upstream | 4, 13 | Those + read overlap, page locking | 1 | 22.3 (21.2-23.3) | 18.3 | 17.8 | 14.0 | 928 | 81.1 |
+| Upstream | 3, 7 on P-cores | Those + read overlap, page locking | 1 | 24.2 (23.5-24.7) | 16.9 | 18.0 | 15.5 | 925 | 73.8 |
+| This fork | 3, 13 | All, one SSD | 1 | 41.4 (40.4-42.5) | 35.6 | 34.6 | 31.8 | 948 | 41.6 |
+| This fork | 4, 7 on P-cores | All, one SSD | 1 | 41.8 (39.8-42.8) | 33.8 | 32.0 | 30.5 | 932 | 43.7 |
+| **This fork, best** | 4, 7 on P-cores | All | 2 | **48.9** (48.1-49.8) | 43.3 | 42.2 | 38.6 | 1,410 | 40.4 |
 
-Upstream ran at `--spec 3` with 13 workers on one SSD, with `STRATA_UNBUFFERED_LOAD`, `STRATA_RESIDENT_HEADROOM_GIB=1.5` and `STRATA_RAM_ADAPT`; this fork ran at `--spec 4` with 7 workers on the P-cores and two SSDs. So the table shows the gain from code and settings together. The same settings on both engines haven't been measured yet, and Strata 0.2.10 hasn't been tested.
+- **Best against best:** +39% on one SSD, +63% on two. The upstream best came about an hour after these fork runs and wasn't mixed in with them. The fork with two SSDs ran 45.9 in a later batch, closer to those runs, which would make it +53%.
+- **Same settings:** +75% at `--spec 3` with 13 workers, +68% at `--spec 4` with 7. These flatter the fork. Upstream's read overlap creates threads for every layer, and upstream ran faster with overlap and page locking off. Which of the two costs it wasn't tested. The fork arms also have its own switches on.
+- **The second SSD alone:** text +17%, prompt reading +51%. On one SSD the fork's code doesn't speed up prompt reading.
+- **The gain is time per step, not tokens per step.** Tokens per step were 1.7-2.0 on every row.
+- **Expert skip:** both engines ran upstream's default `STRATA_ROUTE_TAIL_SKIP=7`. With it off, the fork's daily setup went from 45.9 to 35.9 tok/s (-22%), 3 runs each, mixed order.
+
+The three memory switches are `STRATA_UNBUFFERED_LOAD`, `STRATA_RESIDENT_HEADROOM_GIB=1.5` and `STRATA_RAM_ADAPT`. Strata 0.2.10 hasn't been compared this way.
 
 This has only been measured on the PC above. Other cards and CPUs may gain less or lose speed. The placement settings below are for this CPU's layout.
 
@@ -38,7 +48,10 @@ This has only been measured on the PC above. Other cards and CPUs may gain less 
 `FAST-SETUP.bat` works these out for your PC ([README](README.md#easy-setup)). By hand, they are upstream options plus the switches above. Adjust the CPU numbers and the path for your PC.
 
 ```bat
+set STRATA_UNBUFFERED_LOAD=1
+set STRATA_RESIDENT_HEADROOM_GIB=1.5
 set STRATA_RAM_ADAPT=1
+set STRATA_RAM_THROUGH=1
 set STRATA_EXPERTS_MIRROR=C:\StrataMirror\experts.bin
 rem P-cores only, the host thread on the eighth
 set STRATA_POOL_CORES=2,4,6,8,10,12,14
@@ -50,22 +63,22 @@ set STRATA_RAM_ADAPT_PAR=1
 set STRATA_RAM_ADAPT_BG=1
 ```
 
-Engine args: `--pool-workers 7 --spec 4 --spec-min-p 0.5 --adapt-swaps 24 --resident-budget-gib 14 --max-context 262144 --kv int8`.
+Engine args: `--pool-workers 7 --spec 4 --spec-min-p 0.5 --adapt-swaps 24 --resident-budget-gib 10 --conversation-cache-mib 0 --max-context 262144 --kv int8`.
 
 The dual SSD copy must be the same file as the pack's `experts.bin`. The engine only compares file sizes, so copy it again if the pack changes.
 
 `FAST-SETUP.bat` no longer writes 14 GiB. It asks how much RAM to use, defaulting to 10 GiB on a 32 GB PC, and writes `--conversation-cache-mib 0`. [README](README.md#how-much-memory-it-uses) has the numbers for that setting and for running beside a large app.
 
-## What the top table's settings were
+## What setup installs
 
-| Setting | Upstream | This fork | What setup installs |
-|---|---|---|---|
-| Experts cached in RAM | 14 or 10 GiB | 14 or 10 GiB | **10 GiB**, or what you choose |
-| Saved conversation checkpoints in RAM | Up to 2,048 MiB at 14 GiB, off at 10 | Up to 2,048 MiB at 14 GiB, off at 10 | **Off** |
-| Drafting | `--spec 3` | `--spec 4` | `--spec 4` |
-| CPU workers | 13 | 7, on P-cores | One per P-core, leaving the first for the host (7 here) |
-| SSDs | One | Two | Two if you pick a second drive |
-| Read-through | Doesn't have it | Off | **On at 10 GiB or below** |
+| Setting | What setup installs |
+|---|---|
+| Experts cached in RAM | **10 GiB**, or what you choose |
+| Saved conversation checkpoints in RAM | **Off** |
+| Drafting | `--spec 4` |
+| CPU workers | One per P-core, leaving the first for the host (7 here) |
+| SSDs | Two if you pick a second drive |
+| Read-through | **On at 10 GiB or below** |
 
 ## Read-through
 

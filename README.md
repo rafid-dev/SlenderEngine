@@ -8,19 +8,25 @@ This fork of [Strata](https://github.com/Niko1221/Strata) is tuned for Qwen3.8-F
 
 ## Speed
 
-The speed and memory tables come from one PC: i7-14700KF, 32 GB DDR5-6000, RTX 4070 Ti 12 GB, two 990 PRO 1 TB, Windows 11. Your numbers will differ.
+The speed and memory tables come from one PC: i7-14700KF, 32 GB DDR5-6000, RTX 4070 Ti 12 GB, two 990 PRO 1 TB, Windows 11 26H2. Your numbers will differ.
 
-Each engine ran at its own settings, and this fork also had a second SSD. The gain isn't from code alone. Both engines on the same settings haven't been measured yet.
+This compares each engine at the best settings we tried, with a 10 GiB cache and 3 runs per setting.
 
-| At the default 10 GiB cache | Strata | This fork |
-|---|---:|---:|
-| **Text generation** | 30.0 tok/s | **46.7 tok/s** (+56%) |
-| Generating after reading a 26K file | 19.7 tok/s | **38.1 tok/s** (+93%) |
-| Follow-up question | 23.7 tok/s | **40.2 tok/s** (+70%) |
-| Answering about an image | 16.5 tok/s | **30.3 tok/s** (+83%) |
-| Reading a prompt | 970 tok/s | **1,432 tok/s** (+48%) |
+| | Strata | This fork, one SSD | This fork, two SSDs |
+|---|---:|---:|---:|
+| **Text generation** | 30.0 tok/s | **41.8 tok/s** (+39%) | **48.9 tok/s** (+63%) |
+| Generating after reading a 26K file | 22.9 tok/s | 33.8 tok/s (+48%) | 43.3 tok/s (+89%) |
+| Follow-up question | 23.4 tok/s | 32.0 tok/s (+37%) | 42.2 tok/s (+80%) |
+| Answering about an image | 15.2 tok/s | 30.5 tok/s (+101%) | 38.6 tok/s (+154%) |
+| Reading a prompt | 945 tok/s | 932 tok/s (-1%) | 1,410 tok/s (+49%) |
 
-Read-through puts SSD reads straight into the RAM cache. It isn't in the table above. In separate runs it raised text generation from 44.2 to 49.2 tok/s (+11%). Setup turns it on at a 10 GiB cache or below. It lost about 19% at 14 GiB on this PC, so it stays off above that.
+Strata's column is the fastest of the 6 setups we tried on it. Its runs came about an hour after the fork's. In a later batch closer to them, the fork with two SSDs ran 45.9 tok/s, which would make that gain +53%.
+
+With the same `--spec`, workers and one SSD, Strata ran 24.9 tok/s against this fork's 41.8 (+68%). That gap flatters the fork, because read overlap and page locking were on for both, and Strata was faster without them.
+
+Both engines use Strata's default expert skip, which leaves out some low-ranked experts that aren't in VRAM and changes answers slightly. Turning it off took this fork from 45.9 to 35.9 tok/s.
+
+The fork's columns include read-through, which puts SSD reads straight into the RAM cache. Setup turns it on at a 10 GiB cache or below. It lost about 19% at 14 GiB on this PC, so it stays off above that.
 
 Answer quality wasn't measured, and `--spec 4` changes the wording of answers. [FORK.md](FORK.md) explains the changes, settings and measurements. [The worklog](docs/fork/WORKLOG.md) records every test, including the ones that failed.
 
@@ -30,9 +36,11 @@ Setup asks how much RAM to give the model's cache. This sets the cache size, not
 
 | Measured on the PC above | 10 GiB cache (default) | 14 GiB cache |
 |---|---:|---:|
-| Text generation | 46.7 tok/s, or about 49 with read-through | 53.8 tok/s |
-| Lowest free RAM | 3.6-4.5 GB | 0.08-0.94 GB |
-| Written to the page file | 0 GB/h | 0.8-36.2 GB/h |
+| Text generation | 46-49 tok/s | About 50 tok/s |
+| Lowest free RAM, 25-minute sessions | 1.8-2.4 GB | Not repeated |
+| Written to the page file, 25-minute sessions | 1.5-2.9 GB/h, in short bursts | Not repeated |
+| Lowest free RAM, short tests | 1.9-3.6 GB | 0.08-0.94 GB |
+| Written to the page file, short tests | Up to about 0.4 GB a run | 0.8-36.2 GB/h |
 
 About 9 GB was already in use before the engine started, including open apps. Closing yours leaves more RAM free. Task Manager's process row shows less than the total because it leaves out about 4 GB of pinned memory.
 

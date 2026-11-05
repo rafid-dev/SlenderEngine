@@ -95,6 +95,8 @@ All at 10 GiB, so tier size doesn't change between cells (the user's point). The
 - **At 10 GiB the whole tier page-locks, and read-through wins.** 10 GiB with read-through (47.0, `th26`) comes close to 14 GiB without it (49.5), for about 4 GiB less RAM. Different batches and RAM conditions, so rough.
 - **Default:** read-through can't be on everywhere. Setup should only write it at 10 GiB or below, or the engine should turn it off when the tier isn't fully page-locked. Other tier sizes aren't measured.
 
+**Pushed to `speed-fork` at `450dd436` on 2026-11-05, by the user's OK.** Installed the same day with the user's OK: `strata\engine` is this build (old one in `strata\engine-before-merge`), and `run-strata.bat` sets `STRATA_RAM_THROUGH=1` (old one in `run-strata.before-merge.bat`). The real launcher started, read-through active, tier page-locked, one answer fine. Left: close PR #1 on GitHub, the long sessions, the fair comparison on this engine, the README's same-settings table, raw data, the re-rendered video and GIF, and the clean-clone `FAST-SETUP.bat` test.
+
 **Merge first (the user's call, 2026-11-05):** read-through at 10 GiB has enough evidence: +5.2%, +6.0%, +10.9%, +13.3% over four batches here, +30% and +15% on short prompts on the laptop, byte checks clean on both PCs, identical answers here. Setup turns it on at 10 GiB or below, off above. Long sessions, the fair comparison, README numbers and the video come after the merge. Before it: the `iq_avx512.cpp` fix, then an all-off answer check and unit tests. Local branch `merge-pr1`.
 
 **Finish plan (agreed by the user 2026-11-05):** the three checks, decide the switches, merge on a new branch, all-off check, setup, then the fair comparison on the merged engine so the README describes what ships, then docs, data and video, then ask before pushing. Engine defaults stay off; `FAST-SETUP.bat` and the daily launcher turn the winners on. FORK.md's "`STRATA_DIRECT_AHEAD` about 18% slower" is out of date: K=5 measured +2.7% here and more on the laptop.
@@ -119,7 +121,61 @@ The user asked for this on 2026-11-03 after watching the first video: "compare w
 
 **Windows changed before these runs:** the user updated to 26H2 on 2026-11-05, after every result above this section's date. Compare these runs among themselves, not with `readme1`, `readme2` or older numbers. Before running, check the update's background work has settled, and that the driver, "Lock pages in memory", the page file and `C:\StrataMirror` are as before.
 
-**Also agreed 2026-11-03, still open:** one 20-minute mixed session on each engine, raw runs and scripts in the repo, re-rendered comparison video from these numbers (one race, stock's best we tried against the fork's best on one SSD), README correction, `FAST-SETUP.bat` from a clean clone before any post. Answer quality with `--spec 4` isn't measured and the README must say so.
+**Order agreed by the user 2026-11-05:** read-through-on long session finishes, then this comparison (21 runs in `memtools/fair2`, read-through added to the fork arms because setup ships it at 10 GiB), then the read-through-off long session. The chain was stopped between the two long sessions for this, so they are not back to back. The user dropped the two-terminal race the same day, so no new recording or video; the 2026-11-03 video stays in `demo\compare` but its numbers are out of date.
+
+**Read-through-on long session (`memtools/sess_on`, 2026-11-05, 26H2, merged engine, 10 GiB, Edge and Spotify open, Firefox closed):** 25 minutes, 17 requests, context up to 143,970 tokens, 55,549 tokens generated, 46.0 tok/s, 3 rereads of the long context taking 139 s, no failures. Paged out 1.21 GB (2.9 GB/h, counted from engine start), 3 bursts of at least 20 MB/s, lowest free RAM 2.36 GiB, median 3.11. Over the 0.3 GB/h target. Needs the read-through-off session, same apps open, before blaming read-through. By time (`memtools/paging_view.py`): 828 MB in the first 3 minutes, 344 MB at minutes 12-15, 46 MB in the other 19 minutes. Pages read back in weren't recorded; `real_session.py` records them from the off session on, and `memtools/paging_whole_1434.csv` logs reads, writes and faults machine-wide from fair comparison run 5 on.
+
+**Read-through-off long session (`memtools/sess_off`, 15:24-15:49, same engine and tier, one session each, not back to back; Chrome open and Spotify closed by then, so apps weren't the same as `sess_on`):**
+
+| | On | Off |
+|---|---:|---:|
+| Overall tok/s | 46.0 | 43.1 |
+| Context up to 50K | 46.7 | 46.8 |
+| 50-100K | 45.4 | 43.4 |
+| 100-150K | 45.7 | 43.1 |
+| 150K and above | not reached | 39.2 |
+| Largest context | 143,970 | 199,179 |
+| Rereads of long context | 3, 139 s | 0 |
+| Written to page file | 1.21 GB, 2.9 GB/h, 3 bursts | 0.62 GB, 1.5 GB/h, 1 burst |
+| Lowest free RAM, median | 2.36, 3.11 GiB | 1.77, 3.43 GiB |
+| Failures | 0 | 0 |
+
+- **The overall figures aren't a fair race:** off reached higher context, where it ran slower. Compare the rows up to 150K: read-through's edge is about 0 at short context and about 5-6% from 50K to 150K, on different text.
+- **Paging isn't only read-through.** Off also wrote 573 MB in one burst, at minutes 15-18, more than any one 3-minute block of on's later bursts, and went over the 0.3 GB/h target too. On wrote twice as much in this pair, but one session each with different apps can't settle the cause.
+- **Pages read back, off:** 3.13 GB, which includes mapped file reads.
+
+**Results (`memtools/fair2`, 2026-11-05 14:20-15:24, 26H2, merged engine, 21 runs, 0 failed, 0 damaged). Mean (low-high) of 3 runs, tok/s:**
+
+| Arm | Text | After 26K file | Follow-up | Image | Prompt read | ms/step | tok/step |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| a Stock, spec 3, 13 workers | 23.6 (23.2-24.2) | 17.8 | 17.4 | 14.5 | 931 | 75.4 | 1.7 |
+| b Fork, same | **41.4** (40.4-42.5) | 35.6 | 34.6 | 31.8 | 948 | 41.6 | 1.7 |
+| c Stock, spec 4, 7 workers | 24.9 (23.2-26.1) | 15.6 | 18.5 | 16.1 | 938 | 78.2 | 1.9 |
+| d Fork, same | **41.8** (39.8-42.8) | 33.8 | 32.0 | 30.5 | 932 | 43.7 | 1.8 |
+| e Fork, same, two SSDs | **48.9** (48.1-49.8) | 43.3 | 42.2 | 38.6 | 1,410 | 40.4 | 2.0 |
+| f Stock, spec 4, 13 workers | 22.3 (21.2-23.3) | 18.3 | 17.8 | 14.0 | 928 | 81.1 | 1.8 |
+| g Stock, spec 3, 7 workers | 24.2 (23.5-24.7) | 16.9 | 18.0 | 15.5 | 925 | 73.8 | 1.8 |
+
+- **Same settings, one SSD:** text +75% at a/b, +68% at c/d. After the file +100%, +117%. Prompt reading +2%, -1%, so no prompt gain from the fork's code on one SSD.
+- **Second SSD alone, d to e:** text +17%, after the file +28%, follow-up +32%, image +27%, prompt reading +51%.
+- **The speed gap is time per step, not tokens per step.** Stock 74-81 ms, fork 40-44 ms, with tokens per step about equal.
+- **Not yet a claim: stock's best.** All stock arms here ran 22-25 tok/s, below stock's own 30.0 in `readme2` (10 GiB, its three switches, 13 workers, spec 3, old Windows). These arms also had `STRATA_COLD_OVERLAP` and `STRATA_PARTIAL_PIN`. Stock's overlap makes new threads per layer. So either these two switches hurt stock or 26H2 did; not tested. Stock at only its three switches on 26H2 is needed before any "best stock" number. A critic would call 24.9 a handicapped stock. Don't publish +96% (c to e). **Agreed with the user the same day:** after the skip test, stock with only its three switches, 3 runs each, order `WjjWWj`, `memtools/stock3`: arm W repeats the settings of the 30.0, arm j is spec 4 with 7 P-core workers.
+- **Fork arms all include read-through,** so b and d aren't only shared settings: they include every fork-only switch.
+- **Disturbance:** lowest free RAM fell to 1.06-2.17 GiB on runs ending 14:42-14:59, both engines, and returned to 3.1-3.5 after. That fits Chrome research during the batch, not confirmed. Order was mixed. The text ranges above are narrow anyway.
+- **Paging, written per run:** stock 0.14 GB on average, fork 0.22 GB, bursts in both, and stock's runs last longer. Whole PC from run 5 on: 3.46 GB written in about 50 minutes. Pages Input was 95.66 GB, which also counts mapped file reads, so it isn't all page file.
+
+**Stock with only its three memory switches (`memtools/stock3`, 16:04-16:22, same afternoon, 3 runs each, order `WjjWWj`, 0 failed, 0 damaged):**
+
+| Arm | Text | After 26K file | Follow-up | Image | Prompt read | ms/step | tok/step |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| W Stock, spec 3, 13 workers | 28.2 (26.9-29.9) | 20.8 | 22.0 | 15.2 | 941 | 64.6 | 1.8 |
+| j Stock, spec 4, 7 P-core workers | **30.0** (29.1-31.5) | 22.9 | 23.4 | 15.2 | 945 | 64.9 | 1.9 |
+
+- **So stock's best we tried is 30.0, arm j.** `STRATA_COLD_OVERLAP` and `STRATA_PARTIAL_PIN` cost stock about 17% at both settings (24.9 and 23.6 against 30.0 and 28.2), about 10-13 ms a step. Which of the two wasn't tested. 26H2 isn't the main cause: W matches the old 30.0 within noise.
+- **Best against best:** fork one SSD 41.8, +39%; fork two SSDs 48.9, +63%. Not interleaved with these stock runs. The fork's skip-7 arm, 45.9, ended just before them, which would make it +53%.
+- **Same-settings gains flatter the fork,** since those shared switches hurt stock. Lead with best against best.
+
+**Also agreed 2026-11-03, still open:** one 20-minute mixed session on each engine, raw runs and scripts in the repo, README correction, `FAST-SETUP.bat` from a clean clone before any post. Answer quality with `--spec 4` isn't measured and the README must say so.
 
 ## README speed rows at model card settings (2026-11-05, same morning, not in the README yet)
 
@@ -1163,6 +1219,51 @@ No gain seen, and no crash or damaged answer. All ranges overlap. Its report got
 - **Same answers:** normal against K=5 at the identical-output settings, identical on all 6 prompts up to 50K, with read-ahead active (158,768 blobs read). One pair only. Those settings have swaps nearly off, and tail skip and PCIe off.
 - **Passes as a candidate.** Combination with read-through is untested.
 
+## Research: lossless or near-lossless speed, no expert skipping (2026-11-05, reading only, nothing run)
+
+The asked rule: no expert skipping or rerouting. Sources were read at abstract or summary level. FluxMoE, DALI and the delayed tree paper couldn't be opened, so only their titles and search snippets are known. Gains below are estimates, and real gains here have run lower than modeled.
+
+| Candidate | Output | Evidence | Estimate here | Next step |
+|---|---|---|---|---|
+| `STRATA_HC_Q8` | Slightly changed, unmeasured | Measured here, 2 runs each: 2,181 slots, short +8%, prefill +10%, 50K and follow-up within noise | About +3-8% | KL and `tools/quant_quality.py` |
+| More VRAM slots | Same | `next_sim.py`: +0.5 GiB about +2%. 593 MiB free at start, 833 MiB used before the engine, engine warns below 1,024 MiB free | About +1-2% | Slot count A/B, fewer GPU-using apps |
+| Expert pointers instead of gathering | Same | vLLM RFC: gathering 2.1-3.2 ms a layer against 0.87 ms of compute, pointers 1.39x in the kernel, on Intel GPU | Unknown, this engine not checked | Read the kernels |
+| Better draft by training for acceptance (LK losses) | Same text distribution in theory | Abstract only. Own arithmetic: 1.83 to 2.2 tokens a window about +5% | About +5% if reached | Large: training needed |
+| IoRing, Windows native NVMe driver | Same | Modeled +3.3-5.1%; driver reported as preview, not checked on 26H2 | About +3% | Prototype; driver is the user's setting |
+| Large pages | Same | No source found; 2.1 "points towards memory" only | Unknown | The right is the user's to change |
+| Expert split (MoEpic) | Not stated as lossless | Qwen1.5 and Mixtral; speedups against other offloaders | Unknown | `next_sim.py` first, large engine work |
+| Delayed tree branching | Same text distribution in theory | Paper unread. Own second-choice data: 37% at depth 0, 47% at depth 1, gross limit +4.7% | Break-even or small | Not now |
+
+**Ruled out:** lossless compression for speed, since published ratios are for floats and no results were found for quantized weights (still cheap to sample after the benchmarks). Edge0's prerouter replaces the routing, and quality fell (79.2 against 83.2 on 35B). Expert substitution. AMX, which this CPU doesn't have. Coalesced batches, since the batch here is 1. Router read-ahead is what we already tested: the vLLM RFC's about -1% on a discrete GPU fits the small gain here.
+
+**Reading:** this doesn't change the estimate of about 50-55 tok/s on coding. Nothing here is a route to 70-80.
+
+**Agreed with the user 2026-11-05:** after the read-through-off session, the daily setup with `STRATA_ROUTE_TAIL_SKIP` at the default 7 against 0, 3 runs each, order `zyyzzy`, `memtools/skip1`, arms y and z in `readme_bench.py`. Also check that skip 0 really fired by the missing banner and skip counter. Then, if the user agrees: the #5166 benchmark here, `STRATA_HC_Q8` KL and quality, and a port of `STRATA_PREFILL_ROUTED_STREAM`.
+
+**Result (`memtools/skip1`, 15:50-16:03, daily setup, two SSDs, read-through on, order `zyyzzy`):**
+
+| | Skip 7 (default) | Skip 0 | Skip 0 against 7 |
+|---|---:|---:|---:|
+| Text | 45.9 (45.9-46.0) | 35.9 (35.7-36.0) | -21.8% |
+| After 26K file | 38.0 | 29.1 | -23.4% |
+| Follow-up | 40.2 | 29.5 | -26.6% |
+| Image | 31.2 | 24.4 | -21.8% |
+| Prompt read | 1,381 | 1,388 | Same |
+| ms/step | 42.1 | 55.1 | |
+| tok/step | 1.9 | 2.0 | |
+| Written per run | 0, 0, 0 GB | 0.37, 0.31, 0 GB | |
+
+Ranges don't overlap on text. It fired: skip 0's log has no banner or skip counter, skip 7's first run skipped 244,615 experts. 0 damaged, 0 failed. Answer quality wasn't compared. The same skip 7 settings ran 48.9 in `fair2` an hour earlier, so about 6% between batches; compare inside a batch. Upstream's source comment gives skip 7's cost as KL about 0.003-0.006; not measured on this setup. **Agreed with the user:** after the stock runs, `memtools/tool_probe.py` (two tools, one enum, temperature 0, 30 identical requests per engine start, order `7007`, `memtools/probe1`), then `tools/quant_quality.py` at 1,978 slots with skip 0 and 7, order `0707`, `memtools/kl_skip`.
+
+**Second pass the same day, through Chrome (full paper text and upstream issues). Corrects the table above:**
+
+- **The daily setup already skips experts.** `STRATA_ROUTE_TAIL_SKIP=7` is on by default on both engines (`sess_on/engine.log` line 63). That session skipped 4,948,041 missed experts, against 10,730,049 RAM blobs and 34,244 file blobs, so roughly a third of misses if the counters compare. Every speed in this log and the "no skipping" estimate above include it, except the identical-output checks. Cost of turning it off here isn't measured; upstream advertises +10-20% decode. Upstream #5225 (R9700, engine 0.1.56): tool-call arguments corrupted with copied schema text in about 6% of scripted requests, gone with skip 0 in 32 requests; the link to skipping is the reporter's suspicion. Not seen or checked on this PC.
+- **Large pages: crossed off for now.** Upstream #5238, ABAB on an RTX 5080 with 96 GB and 4,161 slots: no gain, 4 KB ahead in 7 of 8 decode metrics, within spread. That PC has more experts in VRAM than this one, so it isn't proof here, but there is no reason left to ask for the right.
+- **New lossless, prompts only:** `STRATA_PREFILL_ROUTED_STREAM` (upstream PR #4283, open): stops copying experts no token routes to. RTX 3090: follow-up read -17.9%, 2K read +19.9%, 4K +8.2%, 32K +5.3%; byte-identical in its deterministic lane; agent decode -3.5% on differing texts; flat or slower on 2x RX 6900. `STRATA_SELECT_TWO_PASS` (PR #4119, open): 256K read +5.2%, 32K +0.2%, byte-identical; not run on sm_89 or Windows.
+- **Lead to compare:** upstream #5166, RTX 5070 12 GB, IQ3_XXS, 64 GB, Linux, 141.3 tok/s at temperature 0, thinking off, short prompts: 94.7% cache hits, 2,918 slots in 4,887 MiB at 192K, `spec=12 mtp_max=4 lookup=3`, 11 workers. Another card, pack, OS and workload. Its 1 GiB more of expert cache than the 3.8 GiB here is unexplained. Its `mtp-bench-3.py` (PR #4877) can run here for a direct comparison.
+- **Figures now read:** LK losses up to 8-10% longer acceptance, which is about +3% here by the 13 ms a window + 8 ms a token fit, not +5%. Delayed tree: about 5% with a neural selector, on other verification methods. DALI: its prefetch added only 9%; its greedy assignment matches what `assign_sim.py` put at about +1% here, and its cache gain comes from workload across a batch, while the batch here is 1. MoEpic: half an expert over PCIe is about 42 us against about 50 us on the CPU pool, serialized on one link, so about break-even by arithmetic. FluxMoE: 32% smaller by coding BF16 exponents, decoded on the GPU at about 400 GB/s on an H20. This pack's experts aren't BF16, so it needs the sample. KV exact-cell window (PR #4068) refuses `--kv-resident`, so it doesn't fit this setup.
+- **Route prior (`STRATA_ROUTE_PRIOR`, 0.2.7-0.2.8):** rerouting, excluded, and upstream turned it off for repeated text in long sessions.
+
 ## Test queue and what remains (living list, started 2026-11-04)
 
 Update this as tests finish: move results to their own sections and keep only what's still open here. Nothing below is measured unless it says so.
@@ -1250,7 +1351,6 @@ Not queued: its read-ahead (mostly flat or worse there), expert skipping and Tur
 - Task benchmark (vision, CTF, systems, webapp, math and physics).
 - Conversation cache at 10 GiB, with upstream #3517.
 - README speed numbers: measured 2026-11-05, see "README speed rows at model card settings". README text not updated yet: the user's call.
-- Two-terminal race GIF.
 
 ## Measurement tools added
 - `STRATA_ROUTE_TRACE=<path>`: records expert routing to a file (`src/core/expert_source.cpp`). Off unless set.
