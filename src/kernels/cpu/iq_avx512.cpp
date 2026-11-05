@@ -80,17 +80,13 @@ inline bool cpu_vbmi_popcnt() {   // AVX512_VBMI, VPOPCNTDQ and AVX512VL (the 25
 #endif
     return ((c >> 1) & 1u) != 0 && ((c >> 14) & 1u) != 0 && ((b >> 31) & 1u) != 0;
 }
-const bool vbmi3 = [] {
-    const char* v = std::getenv("STRATA_IQ3_VBMI");
-    return v != nullptr && std::atoi(v) != 0 && cpu_vbmi_popcnt();
-}();
 // (IQ2_S the same way - 10-bit indices through two byte planes of 2-bit codes, 16 vpermt2b + 14 blends a block - is exact
 // but 2x SLOWER than its 8 scalar u64 lookups a chunk: 2.8 vs 5.8 GB/s a core.  Not kept.)
 struct Iq3Tables {
     // per grid entry two bytes of 4-bit codes (entry bytes 0,1 -> s_a, 2,3 -> s_b): IQ3_S grid bytes are 1..15 (the
     // code is the byte), IQ3_XXS's are {4,12,20,28,36,44,52,62} (code 0-7, mapped back by `xlut`)
     alignas(64) uint8_t s_a[512], s_b[512], x_a[256], x_b[256], expand[4][64], xlut[64];
-    Iq3Tables() {
+    void init() {
         for (int i = 0; i < 512; ++i) {
             const uint32_t g = iq3s_grid[i];
             s_a[i] = (uint8_t) ((g & 15) | (((g >> 8) & 15) << 4));
@@ -111,7 +107,15 @@ struct Iq3Tables {
             for (int c = 0; c < 16; ++c) xlut[16 * l + c] = c < 8 ? xv[c] : 0;
     }
 };
-const Iq3Tables iq3t;
+// Filled only once the switch is on and the CPU check has passed: this file is compiled with AVX-512, and code run at load would
+// reach CPUs without it.  Until then the tables are zero and nothing reads them.
+Iq3Tables iq3t;
+const bool vbmi3 = [] {
+    const char* v = std::getenv("STRATA_IQ3_VBMI");
+    if (v == nullptr || std::atoi(v) == 0 || !cpu_vbmi_popcnt()) return false;
+    iq3t.init();
+    return true;
+}();
 // the packed codes of a block's 64 entries -> the four 64-value chunks (codes, one per byte)
 inline void iq3_expand(__m512i a, __m512i b, __m512i g[4]) {
     const __m512i lo4 = _mm512_set1_epi8(15);
