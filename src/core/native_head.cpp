@@ -10,9 +10,116 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <exception>
+#include <memory>
+#include <string>
+#include <thread>
+#include <vector>
 
 namespace strata::core {
+
+// STRATA_HEAD_FAST_LOAD=1 (fork, opt-in): --prefill-head-alias reloads the head at every request, so the upload goes
+// through two pinned 16 MiB buffers that 4 threads fill from the mapping (parallel page faults) while the other
+// buffer crosses PCIe, instead of one pageable cudaMemcpy.
+namespace {
+bool head_fast_load() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_HEAD_FAST_LOAD"); return v && std::atoi(v) != 0; }();
+    return on;
+}
+
+constexpr size_t kChunk = (size_t) 16 << 20;
+constexpr int kThreads = 4;
+void* buf[2] = {};   // ponytail: kept for the process (32 MiB pinned), freed by the driver at exit
+cudaEvent_t done[2] = {};
+cudaStream_t st = nullptr;
+cudaError_t ensure_buffers() {
+    if (st != nullptr) return cudaSuccess;
+    for (int b = 0; b < 2; ++b) {
+        if (buf[b] == nullptr)
+            if (cudaError_t e = cudaHostAlloc(&buf[b], kChunk, cudaHostAllocDefault); e != cudaSuccess) return e;
+        if (done[b] == nullptr)
+            if (cudaError_t e = cudaEventCreateWithFlags(&done[b], cudaEventDisableTiming); e != cudaSuccess) return e;
+    }
+    return cudaStreamCreateWithFlags(&st, cudaStreamNonBlocking);
+}
+
+cudaError_t upload_pinned(void* dst, const uint8_t* src, uint64_t bytes) {
+    if (cudaError_t e = ensure_buffers(); e != cudaSuccess) return e;
+    for (uint64_t at = 0, i = 0; at < bytes; at += kChunk, ++i) {
+        const int b = (int) (i & 1);
+        const size_t n = (size_t) std::min<uint64_t>(kChunk, bytes - at);
+        cudaEventSynchronize(done[b]);   // the buffer's last copy has left it
+        std::vector<std::thread> ts;
+        const size_t part = (n + kThreads - 1) / kThreads;
+        for (int t = 0; t < kThreads; ++t) {
+            const size_t o = (size_t) t * part;
+            if (o >= n) break;
+            ts.emplace_back([=] { std::memcpy((uint8_t*) buf[b] + o, src + at + o, std::min(part, n - o)); });
+        }
+        for (auto& t : ts) t.join();
+        if (cudaError_t e = cudaMemcpyAsync((uint8_t*) dst + at, buf[b], n, cudaMemcpyHostToDevice, st); e != cudaSuccess) return e;
+        cudaEventRecord(done[b], st);
+    }
+    return cudaStreamSynchronize(st);
+}
+
+#if defined(_WIN32)
+// The head's bytes [off, off + bytes) of `path` read unbuffered (4 threads, 4 MiB each, sector-aligned around the
+// tensor) into the pinned buffers: no page cache, so the speed does not depend on whether the head's pages are still
+// in RAM (by page faults from disk the upload took 340-380 ms) and the reload does not fill the standby list.
+// False: not done (the caller copies from the mapping).
+bool upload_direct(void* dst, const std::string& path, uint64_t off, uint64_t bytes) {
+    constexpr uint64_t kSector = 4096;
+    if (ensure_buffers() != cudaSuccess) { (void) cudaGetLastError(); return false; }
+    HANDLE h[kThreads];
+    int opened = 0;
+    for (; opened < kThreads; ++opened) {
+        h[opened] = CreateFileA(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                                FILE_FLAG_NO_BUFFERING | FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+        if (h[opened] == INVALID_HANDLE_VALUE) break;
+    }
+    bool ok = opened == kThreads;
+    const uint64_t end = off + bytes;
+    const uint64_t a_end = (end + kSector - 1) & ~(kSector - 1);
+    for (uint64_t c0 = off & ~(kSector - 1), i = 0; ok && c0 < end; c0 += kChunk, ++i) {
+        const int b = (int) (i & 1);
+        const uint64_t c1 = std::min<uint64_t>(c0 + kChunk, a_end);
+        const uint64_t part = ((c1 - c0) / kThreads + kSector - 1) & ~(kSector - 1);
+        if (cudaEventSynchronize(done[b]) != cudaSuccess) { ok = false; break; }   // the buffer's last copy has left it
+        std::atomic<bool> good{true};
+        std::vector<std::thread> ts;
+        for (int t = 0; t < kThreads; ++t) {
+            const uint64_t s = c0 + (uint64_t) t * part;
+            if (s >= c1) break;
+            const uint64_t n = std::min<uint64_t>(part, c1 - s);
+            ts.emplace_back([&, t, s, n] {
+                OVERLAPPED ov = {};
+                ov.Offset = (DWORD) (s & 0xffffffffu);
+                ov.OffsetHigh = (DWORD) (s >> 32);
+                DWORD got = 0;
+                // a read that reaches the end of the file returns fewer bytes: enough when they cover the tensor
+                if (!ReadFile(h[t], (uint8_t*) buf[b] + (s - c0), (DWORD) n, &got, &ov) ||
+                    s + got < std::min<uint64_t>(s + n, end))
+                    good = false;
+            });
+        }
+        for (auto& t : ts) t.join();
+        if (!good) { ok = false; break; }
+        const uint64_t s = std::max<uint64_t>(c0, off), e = std::min<uint64_t>(c1, end);   // the tensor's part
+        if (cudaMemcpyAsync((uint8_t*) dst + (s - off), (uint8_t*) buf[b] + (s - c0), e - s, cudaMemcpyHostToDevice, st) != cudaSuccess ||
+            cudaEventRecord(done[b], st) != cudaSuccess)
+            ok = false;
+    }
+    if (cudaStreamSynchronize(st) != cudaSuccess) ok = false;
+    for (int t = 0; t < opened; ++t) CloseHandle(h[t]);
+    if (!ok) (void) cudaGetLastError();
+    return ok;
+}
+#endif
+}   // namespace
 
 NativeHead::~NativeHead() {
     unload();
@@ -38,7 +145,11 @@ bool NativeHead::load(const std::vector<std::string>& shards, int64_t n_in, int6
     try {
         // The architecture is the metadata shard's; output.weight comes from whichever shard holds it (shard 2
         // of Unsloth's UD-Q4_K_XL, whose shard 1 holds no tensor).  GgufModel refuses a duplicate across shards.
+        const auto t0 = std::chrono::steady_clock::now();
+        // (not kept between loads: a kept mapping holds the head's ~0.5 GB of faulted pages in the working set, which
+        // on a full 32 GB machine cost 30 % prefill and 10 % decode; the parse itself is ~17 ms)
         const strata::GgufModel model(shards);
+        const auto t1 = std::chrono::steady_clock::now();
         err = strata::check_engine_architecture(model.meta());
         if (!err.empty()) return false;
         size_t at = 0;
@@ -84,9 +195,28 @@ bool NativeHead::load(const std::vector<std::string>& shards, int64_t n_in, int6
         }
         if (status == cudaSuccess)
             status = cudaMalloc(&scratch, strata::kernels::native_q8_1_bytes((int) n_in, 1));
-        strata::platform::advise_willneed(gguf.tensor_data(*tensor), bytes);
-        if (status == cudaSuccess && host == nullptr)
+        if (!head_fast_load()) strata::platform::advise_willneed(gguf.tensor_data(*tensor), bytes);
+#if defined(_WIN32)
+        bool direct = false;   // STRATA_HEAD_FAST_LOAD: unbuffered reads first (see upload_direct)
+        if (status == cudaSuccess && host == nullptr && head_fast_load())
+            direct = upload_direct(weights, gguf.path(), gguf.data_start() + tensor->offset, bytes);
+        if (direct) {
+        } else
+#endif
+        if (status == cudaSuccess && host == nullptr && head_fast_load()) {
+            status = upload_pinned(weights, gguf.tensor_data(*tensor), bytes);
+            if (status != cudaSuccess) {   // no pinned buffers: the plain copy
+                (void) cudaGetLastError();
+                status = cudaMemcpy(weights, gguf.tensor_data(*tensor), bytes, cudaMemcpyHostToDevice);
+            }
+        } else if (status == cudaSuccess && host == nullptr) {   // (upstream: a head spilled to pinned host memory is already in place)
             status = cudaMemcpy(weights, gguf.tensor_data(*tensor), bytes, cudaMemcpyHostToDevice);
+        }
+        if (head_fast_load())
+            std::fprintf(stderr, "strata: native head: parse %.1f ms, upload %.1f ms (%.0f MiB)\n",
+                         std::chrono::duration<double, std::milli>(t1 - t0).count(),
+                         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t1).count(),
+                         bytes / 1048576.0);
         if (status != cudaSuccess) {
             if (host) cudaFreeHost(host);
             weights = host ? nullptr : weights;

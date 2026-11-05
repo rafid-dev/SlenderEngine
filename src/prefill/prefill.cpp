@@ -6848,6 +6848,8 @@ bool Prefill::lm_run(const std::vector<Seg>& segs, int depth, const std::vector<
         ~StagerStop() { if (st) st->finish(); }   // an early return in a layer's attention halves
     } stager_stop{m.stager.get()};
     int64_t lm_streamed = 0, lm_resident = 0, lm_groups = 0, lm_supers = 0, lm_groups_f16 = 0;
+    int64_t lm_cpu_experts = 0, lm_cpu_rows_n = 0;   // STRATA_LM_CPU_ROWS
+    double ms_cpu_wait = 0;
     uint64_t lm_bytes = 0;
     const int64_t G = m.T * K;   // the MoE buffers' rows (Xq, GU, H, Hq, Dm): a group's most
 
@@ -6876,18 +6878,75 @@ bool Prefill::lm_run(const std::vector<Seg>& segs, int depth, const std::vector<
             ++cnt[(size_t) e];
         }
         for (int32_t e = 0; e < NE; ++e) off[(size_t) e + 1] = off[(size_t) e] + cnt[(size_t) e];
+        auto resident = [&](int32_t e) { return m.host_res && m.cache && m.host_res[(size_t) l * NE + e] >= 0; };
+        // STRATA_LM_CPU_ROWS=N (fork, opt-in, other bits): a streamed expert of at most N rows (N <= 8 MAXT) whose blob
+        // is in RAM runs on the CPU pool while the GPU streams the others - its blob does not cross PCIe.  Its rows go
+        // last in the row order, as their own groups, and go up into Dm for the same combine (chunk-major's CPU share)
+        static const int lm_cpu_rows = [] {
+            const char* v = std::getenv("STRATA_LM_CPU_ROWS");
+            return std::clamp(v ? std::atoi(v) : 0, 0, 8 * (int) strata::kernels::cpu::MAXT);
+        }();
+        std::vector<const uint8_t*> cpu_blob;   // non-null: the expert runs on the CPU
+        int64_t rows_cpu = 0;
+        const strata::kernels::cpu::NativeFmt* cpu_fmt = lay.native ? &lay.fmt[(size_t) l] : nullptr;
+        struct PoolLayer {   // the pool for this layer's CPU experts (released at the layer's end)
+            bool held = false;
+            ~PoolLayer() { if (held) g_cpu_pool_busy.store(false, std::memory_order_release); }
+        } pool_layer;
+        if (lm_cpu_rows > 0 && cpu_pool_ != nullptr && m.src != nullptr && cpu_fmt != nullptr &&
+            !strata::kernels::cpu::q2_native_kernels(cpu_fmt->gu_type)) {
+            bool expect = false;
+            pool_layer.held = g_cpu_pool_busy.compare_exchange_strong(expect, true, std::memory_order_acq_rel);
+        }
+        if (pool_layer.held) {
+            for (int32_t e = 0; e < NE; ++e) {
+                const int32_t c = cnt[(size_t) e];
+                if (c == 0 || c > lm_cpu_rows || resident(e) || !(m.src->pinned(l, e) || !m.src->transient(l, e))) continue;
+                const uint8_t* b = m.src->blob_stable(l, e);
+                if (b == nullptr) continue;
+                if (cpu_blob.empty()) cpu_blob.assign((size_t) NE, nullptr);
+                cpu_blob[(size_t) e] = b;
+                rows_cpu += c;
+            }
+            // pinned: the rows' inputs (copied down) and outputs (copied up), at most rows_cpu rows each
+            auto grow = [](float*& p, size_t& have, size_t want) {
+                if (have >= want) return true;
+                if (p) cudaFreeHost(p);
+                p = nullptr;
+                have = 0;
+                if (cudaHostAlloc((void**) &p, want * 3 / 2 * sizeof(float), cudaHostAllocDefault) != cudaSuccess) {
+                    (void) cudaGetLastError();
+                    p = nullptr;
+                    return false;
+                }
+                have = want * 3 / 2;
+                return true;
+            };
+            if (rows_cpu > 0 && (rows_cpu > G || !grow(m.cpu_x, m.cpu_x_n, (size_t) rows_cpu * N) ||
+                                 !grow(m.cpu_rows, m.cpu_rows_n, (size_t) rows_cpu * N))) {
+                cpu_blob.clear();   // the GPU takes them all
+                rows_cpu = 0;
+            }
+            if (rows_cpu > 0) {   // the GPU's experts in id order, then the CPU's
+                int32_t r = 0;
+                for (int pass = 0; pass < 2; ++pass)
+                    for (int32_t e = 0; e < NE; ++e)
+                        if ((cpu_blob[(size_t) e] != nullptr) == (pass == 1)) { off[(size_t) e] = r; r += cnt[(size_t) e]; }
+            }
+        }
+        auto on_cpu = [&](int32_t e) { return !cpu_blob.empty() && cpu_blob[(size_t) e] != nullptr; };
+        const int64_t r_cpu0 = rows - rows_cpu;   // the CPU's rows: [r_cpu0, rows)
         // ---- the routed experts in id order: resident ones from the cache, the others staged once (run_impl's walk)
         // (started before the tables are built: the stager's threads read while the host builds them)
         std::vector<int32_t> uniq;
         for (int32_t e = 0; e < NE; ++e)
-            if (cnt[(size_t) e] > 0) uniq.push_back(e);
-        auto resident = [&](int32_t e) { return m.host_res && m.cache && m.host_res[(size_t) l * NE + e] >= 0; };
+            if (cnt[(size_t) e] > 0 && !on_cpu(e)) uniq.push_back(e);
         // the stager was started with every streamed expert of the layer when its attention halves began (the
         // prefetch); an expert the routing skipped is never waited for (a later job's issue covers its buffer)
         std::vector<int> job_of(uniq.size(), -1), stage_of(uniq.size(), -1);
         for (size_t u = 0; u < uniq.size(); ++u) job_of[u] = pf_job[(size_t) uniq[u]];
-        for (int32_t e = 0; e < NE; ++e)   // prefetched but not routed: not read, if not started yet
-            if (cnt[(size_t) e] == 0 && pf_job[(size_t) e] >= 0) m.stager->skip(pf_job[(size_t) e]);
+        for (int32_t e = 0; e < NE; ++e)   // prefetched but not routed (or on the CPU): not read, if not started yet
+            if ((cnt[(size_t) e] == 0 || on_cpu(e)) && pf_job[(size_t) e] >= 0) m.stager->skip(pf_job[(size_t) e]);
         if (!pf_on && m.src != nullptr) {   // STRATA_LM_PREFETCH=0: the routed experts only, started now
             std::vector<Stager::Job> js;
             const bool pdirect = false;   // (STRATA_PREFILL_DIRECT, #1670's other commit, is not ported)
@@ -6927,9 +6986,16 @@ bool Prefill::lm_run(const std::vector<Seg>& segs, int depth, const std::vector<
         }
         struct Entry { int32_t e, r0, nr; };
         std::vector<Entry> ents;
-        for (int32_t e = 0; e < NE; ++e)
-            for (int32_t r = off[(size_t) e]; r < off[(size_t) e + 1]; r += (int32_t) G)
-                ents.push_back({e, r, (int32_t) std::min<int64_t>(G, off[(size_t) e + 1] - r)});
+        for (int pass = 0; pass < (rows_cpu > 0 ? 2 : 1); ++pass)   // (STRATA_LM_CPU_ROWS: the CPU's entries last)
+            for (int32_t e = 0; e < NE; ++e) {
+                if (rows_cpu > 0 && on_cpu(e) != (pass == 1)) continue;
+                const int32_t end = off[(size_t) e] + cnt[(size_t) e];
+                for (int32_t r = off[(size_t) e]; r < end; r += (int32_t) G)
+                    ents.push_back({e, r, (int32_t) std::min<int64_t>(G, end - r)});
+            }
+        size_t n_gpu_ents = ents.size();
+        if (rows_cpu > 0)
+            while (n_gpu_ents > 0 && on_cpu(ents[n_gpu_ents - 1].e)) --n_gpu_ents;
         struct Grp { size_t j0, j1; int32_t r0, nr, maxr; int64_t b_at, u_at, uo_at, nu; };
         std::vector<Grp> grps;
         for (size_t j = 0; j < ents.size();) {
@@ -6937,7 +7003,8 @@ bool Prefill::lm_run(const std::vector<Seg>& segs, int depth, const std::vector<
             gp.j0 = j;
             gp.r0 = ents[j].r0;
             int32_t nr = 0, maxr = 0;
-            while (j < ents.size() && j - gp.j0 < (size_t) MMQ_GROUP && nr + ents[j].nr <= G) {
+            const size_t j_end = j < n_gpu_ents ? n_gpu_ents : ents.size();   // a group is the GPU's or the CPU's
+            while (j < j_end && (j >= n_gpu_ents || j - gp.j0 < (size_t) MMQ_GROUP) && nr + ents[j].nr <= G) {
                 nr += ents[j].nr;
                 maxr = std::max(maxr, ents[j].nr);
                 ++j;
@@ -7002,9 +7069,56 @@ bool Prefill::lm_run(const std::vector<Seg>& segs, int depth, const std::vector<
         const int32_t* d_u_rows = d_u_off + rows + lm_entries_max(rows, G);
         const float* d_u_w = (const float*) (d_u_rows + rows);
         ms_host_tables += ms_since(th1);
+        // STRATA_LM_CPU_ROWS: the CPU's rows' inputs gathered from `mixed` into Dm (the groups write it only later on
+        // this stream) and copied down; a thread quantizes them and runs the pool while this one streams the GPU's
+        // experts.  The outputs (unweighted, in row order) land in cpu_rows and go up per group after the loop.
+        struct EvHold {
+            cudaEvent_t e = nullptr;
+            ~EvHold() { if (e) cudaEventDestroy(e); }
+        } cpu_down;   // (declared before the future: destroyed after it is joined)
+        std::future<void> cpu_fut;
+        if (rows_cpu > 0) {
+            gather_rows16((const uint16_t*) lb.mixed, d_row_tok + r_cpu0, (uint16_t*) m.Dm, rows_cpu, 2 * N, cs);
+            cudaMemcpyAsync(m.cpu_x, m.Dm, (size_t) rows_cpu * N * sizeof(float), cudaMemcpyDeviceToHost, cs);
+            if (cudaEvent_t ev = nullptr; cudaEventCreateWithFlags(&ev, cudaEventDisableTiming | cudaEventBlockingSync) == cudaSuccess)
+                cpu_down.e = ev;
+            if (cpu_down.e == nullptr || cudaEventRecord(cpu_down.e, cs) != cudaSuccess) {   // no event: the copy is waited for here
+                (void) cudaGetLastError();
+                cudaStreamSynchronize(cs);
+            }
+            constexpr int MT = strata::kernels::cpu::MAXT;
+            constexpr size_t AB = strata::kernels::cpu::kNativeActBytes;
+            if (m.cpu_nact.size() < (size_t) rows_cpu * AB) m.cpu_nact.resize((size_t) rows_cpu * AB);
+            m.cpu_jobs.clear();
+            for (int32_t e = 0; e < NE; ++e) {
+                if (!on_cpu(e)) continue;
+                for (int32_t r0 = 0; r0 < cnt[(size_t) e]; r0 += MT) {   // a job takes MAXT rows: more read the blob again
+                    strata::kernels::cpu::ExpertJobMulti j;
+                    j.blob = cpu_blob[(size_t) e];
+                    j.nt = std::min(MT, cnt[(size_t) e] - r0);
+                    for (int r = 0; r < j.nt; ++r) {
+                        const int64_t q = (int64_t) off[(size_t) e] + r0 + r - r_cpu0;   // the row's place in the CPU block
+                        j.nact[r] = m.cpu_nact.data() + (size_t) q * AB;
+                        j.out[r] = m.cpu_rows + (size_t) q * N;
+                    }
+                    m.cpu_jobs.push_back(j);
+                }
+            }
+            int dev = 0;
+            cudaGetDevice(&dev);
+            cpu_fut = std::async(std::launch::async, [&m, ev = cpu_down.e, dev, cpu_fmt, rows_cpu, this]() {
+                cudaSetDevice(dev);
+                if (ev) cudaEventSynchronize(ev);
+                for (int64_t q = 0; q < rows_cpu; ++q)
+                    strata::kernels::cpu::native_quant_act(*cpu_fmt, m.cpu_x + (size_t) q * N, m.cpu_nact.data() + (size_t) q * AB);
+                cpu_pool_->run_split_multi_native(*cpu_fmt, m.cpu_jobs.data(), (int) m.cpu_jobs.size());
+            });
+            lm_cpu_experts += (int64_t) std::count_if(cpu_blob.begin(), cpu_blob.end(), [](const uint8_t* b) { return b != nullptr; });
+            lm_cpu_rows_n += rows_cpu;
+        }
         // (the entries' last index per expert, for releasing a staged blob's ring slot)
         std::vector<size_t> last_ent;
-        for (size_t j = 0; j < ents.size(); ++j) {
+        for (size_t j = 0; j < n_gpu_ents; ++j) {
             if (j == 0 || ents[j - 1].e != ents[j].e) last_ent.push_back(j);
             else last_ent.back() = j;
         }
@@ -7049,7 +7163,7 @@ bool Prefill::lm_run(const std::vector<Seg>& segs, int depth, const std::vector<
         const uint8_t* blob_dev = nullptr;
         size_t gi = 0;
         int dq = -1;   // FP16 path: the dequant slot of the current expert
-        for (size_t j = 0; j < ents.size(); ++j) {
+        for (size_t j = 0; j < n_gpu_ents; ++j) {
             const int32_t e = ents[j].e;
             if (j == 0 || ents[j - 1].e != e) {   // the next expert: staged ahead, waited for, its blob located
                 if (j > 0) ++u;
@@ -7142,6 +7256,19 @@ bool Prefill::lm_run(const std::vector<Seg>& segs, int depth, const std::vector<
             ++lm_groups;
             ++gi;
             core::progress_beat();
+        }
+        if (cpu_fut.valid()) {   // STRATA_LM_CPU_ROWS: the CPU's groups, once its rows are done
+            const auto tw = Clock::now();
+            cpu_fut.get();
+            ms_cpu_wait += ms_since(tw);
+            pt.mark(kPfCombine, cs);
+            for (; gi < grps.size(); ++gi) {
+                const Grp& gp = grps[gi];
+                cudaMemcpyAsync(m.Dm, m.cpu_rows + (size_t) (gp.r0 - r_cpu0) * N, (size_t) gp.nr * N * sizeof(float),
+                                cudaMemcpyHostToDevice, cs);
+                moe_scatter_add(m.Dm, d_u_tok + gp.u_at, d_u_off + gp.uo_at, d_u_rows + gp.r0, d_u_w + gp.r0, gp.nu, lb.acc, cs);
+                ++lm_groups;
+            }
         }
         ms_experts += ms_since(th0);
         return true;
@@ -7694,6 +7821,9 @@ bool Prefill::lm_run(const std::vector<Seg>& segs, int depth, const std::vector<
                  lb.r_dev ? "VRAM" : "pinned RAM", (long long) lb.free_mib,
                  (long long) lm_streamed, (double) lm_bytes / 1e6, (long long) lm_resident, (long long) lm_groups,
                  (long long) lm_groups_f16, ms_since(t_start), ms_attn, ms_experts, ms_wait_a, ms_host_tables);
+    if (lm_cpu_experts > 0)
+        std::fprintf(stderr, "strata prefill: layer-major CPU share: %lld experts (%lld rows) on the CPU, %.0f ms waited for it\n",
+                     (long long) lm_cpu_experts, (long long) lm_cpu_rows_n, ms_cpu_wait);
     if (pt.on) {
         pt.fold();
         double total = 0.0;
