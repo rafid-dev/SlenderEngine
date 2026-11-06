@@ -610,6 +610,10 @@ struct Stager {
     // role slices; a pointer to it would not live as long as the queue)
     struct Job { const uint8_t* src; size_t bytes; core::ExpertSource* from = nullptr; int32_t l = 0, e = 0; };
     std::vector<uint8_t*> buf;
+    // PF-STAGE (STRATA_STAGER_IN_PLACE=1): a source's blob is read straight into its buffer at its sector offset
+    // (copy_blob_aligned), so a buffer has 8 KiB more room and the blob starts at buf + skip_of
+    bool in_place = false;
+    std::vector<uint32_t> skip_of;
     std::vector<char> pinned;
     std::vector<std::vector<uint8_t>> pageable;   // the fallback when no more RAM can be pinned
     std::vector<cudaEvent_t> dma_done;
@@ -631,6 +635,12 @@ struct Stager {
 
     bool init(size_t blob_bytes, int nthreads) {
         if (const char* v = std::getenv("STRATA_STAGER_RING")) kRing = std::clamp(std::atoi(v), 2, 256);
+        {
+            const char* v = std::getenv("STRATA_STAGER_IN_PLACE");
+            in_place = v != nullptr && v[0] == '1';
+        }
+        if (in_place) blob_bytes += 8192;   // the aligned read's sector rounding on both ends
+        skip_of.assign((size_t) kRing, 0);
         buf.assign((size_t) kRing, nullptr);
         pinned.assign((size_t) kRing, 0);
         dma_done.assign((size_t) kRing, nullptr);
@@ -713,7 +723,17 @@ struct Stager {
                 for (int i = j; i < j + k; ++i) {
                     if (skipped[(size_t) i].load(std::memory_order_acquire)) continue;   // nothing will read it: no copy
                     const Job& jb = jobs[(size_t) i];
+                    skip_of[(size_t) (i % kRing)] = 0;
                     if (jb.from == nullptr) { std::memcpy(buf[i % kRing], jb.src, jb.bytes); continue; }
+                    if (in_place) {   // PF-STAGE: straight into the buffer, one blob a request (published by ready below)
+                        const int64_t sk = jb.from->copy_blob_aligned(jb.l, jb.e, buf[i % kRing]);
+                        if (sk < 0) {
+                            std::fprintf(stderr, "prefill: the expert source could not copy expert %d of layer %d\n", jb.e, jb.l);
+                            std::abort();
+                        }
+                        skip_of[(size_t) (i % kRing)] = (uint32_t) sk;
+                        continue;
+                    }
                     from = jb.from;
                     rl[nr] = jb.l; re[nr] = jb.e; rd[nr] = buf[i % kRing]; ++nr;
                 }
@@ -773,7 +793,7 @@ struct Stager {
     /// Job j's bytes, in a pinned buffer (waits for the copy).
     const uint8_t* wait(int j) {
         while (!ready[(size_t) j].load(std::memory_order_acquire)) std::this_thread::yield();
-        return buf[j % kRing];
+        return buf[j % kRing] + skip_of[(size_t) (j % kRing)];
     }
     /// The launching thread queued job j's DMA on `copy`: its buffer is free once that is done.
     void issued_one(int j, cudaStream_t copy) {

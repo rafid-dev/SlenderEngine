@@ -4065,6 +4065,27 @@ bool FileExpertSource::copy_blobs(const int32_t* layers, const int32_t* experts,
     return true;
 }
 
+// PF-STAGE (STRATA_STAGER_IN_PLACE=1): the prompt path's stager hands a 4 KiB-aligned pinned buffer; the blob is read
+// unbuffered straight into it at its sector offset, so the stager thread copies nothing and goes back to its drive queue.
+// A blob the RAM copy holds, a GGUF read in place, or no unbuffered handle: copy_blob at offset 0, as before.
+int64_t FileExpertSource::copy_blob_aligned(int64_t layer, int64_t expert, uint8_t* buf) {
+    if (buf == nullptr || base_ == nullptr || layer < 0 || expert < 0 || layer >= n_layers_ || expert >= n_expert_) return -1;
+    const size_t index = (size_t) layer * (size_t) n_expert_ + (size_t) expert;
+    const bool held = complement_ready_ &&
+                      (resident_blob(index) != nullptr || (!override_.empty() && override_[index] != nullptr));
+    if (held || direct_.empty() || !role_ptr_.empty() || (uintptr_t) buf % 4096 != 0)
+        return copy_blob(layer, expert, buf) ? 0 : -1;
+    const uint64_t per = layer_blob_bytes_[(size_t) layer];
+    const uint64_t skip = (layer_offsets_[(size_t) layer] + (uint64_t) expert * per) % 4096;
+    const Fill f{0, layer, expert, buf + skip, true};
+    const auto t0 = std::chrono::steady_clock::now();
+    if (!read_direct(&f, 1)) return copy_blob(layer, expert, buf) ? 0 : -1;
+    file_us_.fetch_add((uint64_t) std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count(),
+                       std::memory_order_relaxed);
+    file_read_bytes_.fetch_add(per, std::memory_order_relaxed);
+    return (int64_t) skip;
+}
+
 const uint8_t* FileExpertSource::mapped_blob(int64_t layer, int64_t expert) const {
     if (!role_ptr_.empty()) return nullptr;   // the GGUF in place: no contiguous blob in any file
     if (unmapped_) return nullptr;            // pp-opt: drop_mapping closed the view; read_direct reads them
