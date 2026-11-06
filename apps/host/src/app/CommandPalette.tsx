@@ -136,7 +136,7 @@ export function CommandPalette({ open }: {
           <input ref={inputRef} className="st-input st-input--bare" style={{ flex: 1 }} placeholder={tr("Search chats, screens or actions…")} aria-label={tr("Search commands")} aria-activedescendant={flat[cursor] ? `command-${flat[cursor].id}` : undefined} value={query} onChange={(e) => setQuery(e.target.value)} onKeyDown={onKeyDown}/>
           <kbd className="kbd">{tr("esc")}</kbd>
         </div>
-        <div className="palette__list">
+        <div style={{ overflowY: 'auto', padding: 8 }}>
           {tr(flat.length === 0 ? (<div className="small muted" style={{ padding: 18 }}>{tr("Nothing matches “{0}”. Try > for commands, # for conversations, or @ for workspaces.", [query])}</div>) : (grouped.map(([group, items]) => (<div key={group} style={{ marginBottom: 6 }}>
                 <div className="navgroup__label" style={{ padding: '8px 12px 4px' }}>
                   {tr(group)}
@@ -166,11 +166,6 @@ export function CommandPalette({ open }: {
                     </button>);
             }))}
               </div>))))}
-        </div>
-        <div className="palette__foot">
-          <span className="palette__hint"><kbd className="kbd">Enter</kbd>{tr("Open")}</span>
-          <span className="spacer"/>
-          <span className="palette__hint"><kbd className="kbd">esc</kbd>{tr("Close")}</span>
         </div>
       </div>
     </>);

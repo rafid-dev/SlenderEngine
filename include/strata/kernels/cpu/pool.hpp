@@ -253,6 +253,11 @@ public:
     /// run_split_multi's phases, accumulated ms: gate/up rows, the intermediate quantization, down rows.
     double ms_multi_gu = 0, ms_multi_q = 0, ms_multi_down = 0;
     int64_t multi_bytes = 0;
+    /// STRATA_POOL_PHASE_TIMING=1 (diagnostic): the rows phases (modes 5/6), accumulated ms: the host's waits for the
+    /// workers to park, publish to last task done, the host's wait after its own drain, and every thread's summed task time.
+    double pt_park_ms = 0, pt_wall_ms = 0, pt_tail_ms = 0, pt_busy_ms = 0;
+    int64_t pt_phases = 0;
+    int pt_threads() const { return n_ + (host_works_ ? 1 : 0); }
 
     /// Total `_mm_pause` iterations spent waiting, over all workers, is no longer counted - see the note on the
     /// atomics below.  It was a LOCKED read-modify-write in the park loop, so measuring the contention added to
@@ -301,6 +306,8 @@ private:
     void publish();
 
     int n_ = 0;
+    bool pt_on_ = false;                            // STRATA_POOL_PHASE_TIMING
+    alignas(64) std::atomic<int64_t> pt_busy_ns_{0};
     bool explicit_cores_ = false;
     bool pinned_ = true;
     std::vector<LogicalCpuInfo> layout_;   // the logical processors and their cores, read when the pool was built (the caller may be pinned later)
@@ -369,6 +376,18 @@ private:
     const NativeFmt* nfmt_ = nullptr;
     NativeArithmetic narithmetic_ = NativeArithmetic::Default;
     std::vector<SplitBufMulti> split_multi_;
+    // STRATA_POOL_FUSED=1 (opt-in, not with the NUMA split): mode 7, a native layer's gate/up and down rows in ONE batch,
+    // tasks [0, t5_) as mode 5's and [t5_, t5_ + t6_) as mode 6's.  The thread that finishes an expert's last gate/up task
+    // quantizes its h and stamps `h_ready_` with the epoch; a down task waits for its experts' stamps.  Every gate/up task
+    // is claimed before any down task, so that wait is only ever on running work.  Same row ranges, kernels and
+    // quantization as the two phases: the same bits, without the barrier, the second publish and the serial quantize.
+    bool fused_on_ = false;
+    int64_t r5_ = 0, r6_ = 0;
+    int t5_ = 1, t6_ = 1;
+    std::atomic<int32_t> gu_left_[kMaxSplitMulti] = {};
+    std::atomic<uint32_t> h_ready_[kMaxSplitMulti] = {};
+    void quant_expert_h(int e);
+    void wait_h_ready(int e, uint32_t epoch);
     // STRATA_NUMA_SPLIT=1 (opt-in, Linux, exactly 2 nodes): in the native row phases (modes 5/6) every expert's rows
     // are cut into one slice per NUMA node (slice k = rows [per*k/2, per*(k+1)/2) of the gate/up or down matrix, the
     // part the resident complement places on node k in step B), and each node's threads claim and count on their own

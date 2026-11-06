@@ -22,15 +22,7 @@ Measured on the PC under [Speed](#speed), with the model card's sampling. Speeds
   - The CPU went from 87% to 10% busy while reading.
 
   Answers stayed byte-identical at temperature 0. The thread and request settings were tuned for two 990 PROs, so `FAST-SETUP.bat` doesn't write any of the four. It's off unless you set it, and it's only tested on Windows with CUDA.
-- **Now built on Strata 0.2.11, and drafting with DFlash2.** The fork's engine changes are now on top of upstream v0.2.11 (engine 0.1.57) instead of 0.1.55. With the MTP drafter, 0.2.11 measured the same as the old base. Upstream's DFlash2 drafter now replaces the MTP layer. At skip 0 with everything above, 3 runs each against the MTP:
-  - It's right more often: 85% of its guesses are accepted, against 68%.
-  - It offers fewer guesses, so tokens per step don't change. Thinking-on short answers and generation after a 50K prompt are level (45.1 against 45.4, 36.6 against 35.8 tok/s).
-  - Follow-ups are faster: 41.8 against 39.9 tok/s (+5%, ranges apart). Thinking-off answers are 51.8 against 48.9 (+6%, ranges overlap).
-  - A 50K prompt is read faster: 1,728 against 1,561 tok/s (+11%, ranges apart), probably because the drafter takes 343 MiB less VRAM, leaving more room for experts.
-
-  `FAST-SETUP.bat` turns DFlash2 on when its drafter file is in `Strata-data\dflash2`. `strata launch --drafting dflash2` downloads it once (1.2 GB). The DFlash2 drafter has its own license, CC BY-NC-ND, so it's for non-commercial use. Coupled sampling for the MTP drafter (`STRATA_SPEC_COUPLED=1`) raised its acceptance 5-7 points but gave no measurable speed, so it stays off.
-- **Not carried over to 0.2.11:** PR #1's switches for 8 GB cards, and the off-by-default switches `STRATA_ROUTE_TAIL_SKIP_FILE`, `STRATA_SPEC_CUM_MIN`, `STRATA_PARK_TAIL_MAX`, `STRATA_TIER_*_MIB` and `STRATA_HEAD_ALIAS_NARROW`. None of them is in the setup we run. They're in the history before this update (commit `60af6a2a`).
-- **The setup we run now:** skip 0, `--pcie-frac 0`, K/V lending, `STRATA_DIRECT_BATCH=1`, the in-place prompt stager and DFlash2. About 45 tok/s on short thinking-on answers, about 37 after a 50K prompt, about 42 on a follow-up, and about 52 with thinking off. A 50K prompt is read at about 1,700 tok/s.
+- **The setup we run now:** skip 0, `--pcie-frac 0`, K/V lending, `STRATA_DIRECT_BATCH=1` and the in-place prompt stager. About 43-45 tok/s on short answers and 37-40 after a 50K prompt. Prompts are read 9-21% faster than with the default stager.
 
 ## Speed
 
@@ -111,7 +103,7 @@ Your chat page opens at http://127.0.0.1:8080. Apps can connect there too, becau
 
 ## Credit
 
-Optional switches for 8 GB cards were contributed by [Gamination](https://github.com/Gamination). See the [RTX 4060 8 GB laptop report](docs/fork/LAPTOP-RTX4060.md). They aren't in the 0.2.11 base yet; they're in the history up to commit `60af6a2a`.
+Optional switches for 8 GB cards were contributed by [Gamination](https://github.com/Gamination). They are off by default. See the [RTX 4060 8 GB laptop report](docs/fork/LAPTOP-RTX4060.md).
 
 All of the engine is the work of [Niko1221 and the Strata contributors](https://github.com/Niko1221/Strata). For other models, AMD, Mac, the desktop app or multiple GPUs, see the [original project](https://github.com/Niko1221/Strata) and the [docs](docs/DETAILS.md) in this repo.
 

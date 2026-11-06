@@ -873,6 +873,12 @@ public:
     /// STRATA_RAM_ADAPT: the same move as replace_resident, but `in` is copied out of the finished stage buffer
     /// a demand read left it in (no file read).  False, nothing changed, when `in` is not staged or still filling.
     bool replace_resident_staged(int64_t layer, int64_t in, int64_t out);
+    /// STRATA_TIER_LOW_MIB: balances the copy against the PC's free RAM. Under `low` bytes available, the copy's unregistered
+    /// tail is released `step` bytes at a time, down to the part registered for the GPU: those blobs are read from the file
+    /// again when wanted, and being copies of it they leave without a write to the page file. Over `high` available, a
+    /// minute after the last release, up to `step` bytes come back. Same rules as replace_resident: the caller's thread,
+    /// nothing reading the copy, no adaptive round in flight. Windows; elsewhere it does nothing.
+    void balance_resident(uint64_t low, uint64_t high, uint64_t step);
     /// STRATA_RAM_ADAPT_PAR=1: a round's staged moves together, the copies shared with the kept reader threads.  moved[i]: pair i moved.
     struct RamMove { int32_t layer, in, out; };
     void replace_resident_staged_many(const RamMove* m, int n, uint8_t* moved, bool during_round = false);
@@ -1339,6 +1345,9 @@ private:
     bool complement_registered_ = false;      ///< the arena is ordinary memory registered with cudaHostRegister (not cudaHostAlloc)
     uint64_t complement_pin_limit_ = 0;
     uint64_t complement_lock_off_ = 0;        ///< the working-set lock covers [lock_off, lock_off + locked)
+    uint64_t tier_end_ = 0;                   ///< STRATA_TIER_LOW_MIB: the copy holds blobs below this offset (0: not started)
+    std::vector<std::pair<size_t, uint64_t>> tier_released_;   ///< ...and the (index, offset) it released, to bring back
+    std::chrono::steady_clock::time_point tier_last_release_{};
     bool complement_ready_ = false;
     uint64_t complement_locked_ = 0;          ///< bytes held in the working set (pin refused)
     int64_t complement_lent_slots_ = 0;
@@ -1431,21 +1440,6 @@ public:
     /// What backing was obtained and why, for the startup print.  "The engine adapts to the machine it is on" is
     /// only true if the engine says what it got.
     const std::string& note() const { return note_; }
-    /// #4846: called by `open` once, when the RAM still falls short of the arena after the wait and before anything is registered.
-    /// The owner of a lock the engine took on its own (the PLE table's residency lock) gives it back here and returns the bytes
-    /// it released (0: nothing to give); `open` then reads the available RAM again.  Unset: nothing is given back.
-    std::function<uint64_t()> give_back_ram;
-    /// #4846 (owner 11-01): set before `open` when a RAM shortage that survives the wait and the give-back must not be loaded into
-    /// (arena_ram_verdict, ple_residency.hpp).  `open` then registers and allocates nothing, returns false with `ram_short()` true and the
-    /// numbers in `err`; the caller uses the --mmap-experts source for this run.  Unset: the shortage is only warned about, as before.
-    bool fall_back_when_ram_short = false;
-    /// --ram-keep-gib W, in bytes (0: none): the arena is chosen only if this much RAM stays available after it (ple_residency.hpp,
-    /// arena_need_with_keep).  Set before `open`.  With the fallback not allowed the shortfall is only warned about, as for any other.
-    uint64_t ram_keep_bytes = 0;
-    /// The headroom the arena must find under a HARD memory limit (cgroup, container, job object) beyond its own size when the fallback is
-    /// allowed: the RAM copy's headroom (ple_residency.hpp, arena_hard_limit_need).  0: none.  Set before `open`.
-    uint64_t hard_limit_headroom_bytes = 0;
-    bool ram_short() const { return ram_short_; }
     /// #633: set by `open` when the RAM available is less than the arena needs (a recommendation; it still loads)
     const std::string& ram_warning() const { return ram_warning_; }
     uint64_t pinned_arena_bytes() const { return pinned_bytes_; }   ///< what the driver registered (the pinned prefix, or the total by need)
@@ -1469,7 +1463,6 @@ private:
     std::atomic<int64_t> reads_{0};   ///< (a counter only; two threads can read blobs at once)
     std::string note_;
     std::string ram_warning_;
-    bool ram_short_ = false;
     double gib_per_s_ = 0.0;
     double load_seconds_ = 0.0;
     double load_read_s_ = 0.0;

@@ -339,14 +339,11 @@ def kept_key(name: str | None = None) -> str | None:
         for row in profiles.list_profiles():
             if not row["id"].startswith("launch-"):
                 continue
-            source = row.get("source_config")                  # an unreadable profile is listed as {id, error}: skip that row, keep looking
-            if not source:
-                continue
-            key = _config_key(source)
+            key = _config_key(row["source_config"])
             if not key:
                 continue
             try:
-                stamp = Path(source).stat().st_mtime
+                stamp = Path(row["source_config"]).stat().st_mtime
             except OSError:
                 continue
             if stamp > newest:
