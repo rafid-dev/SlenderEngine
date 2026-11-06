@@ -173,7 +173,25 @@ bool bf16_as_q8_0(const strata::TensorInfo& tensor, const WeightRef& ref) {
            ref.ne0 > 0 && ref.ne0 <= INT_MAX && ref.ne1 > 0 && ref.ne1 <= INT_MAX && ref.ne0 % 32 == 0 &&
            tensor.shape[0] == (uint64_t) ref.ne0 && tensor.shape[1] == (uint64_t) ref.ne1;
 }
-struct DeviceFree { void operator()(void* p) const { if (p) cudaFree(p); } };
+// STRATA_DENSE_ARENA=1 (opt-in): the matrices are carved from one allocation instead of one cudaMalloc each, so the
+// 2 MiB granule rounding above is paid once, not per matrix.  The bytes, their 256-byte alignment (cudaMalloc's) and
+// every kernel are unchanged; only the addresses differ.  The arenas' ranges are kept here so that no carved pointer
+// is ever handed to cudaFree.
+bool dense_arena_env() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_DENSE_ARENA"); return v != nullptr && v[0] == '1'; }();
+    return on;
+}
+constexpr uint64_t kArenaAlign = 256;
+uint64_t arena_round(uint64_t b) { return (b + kArenaAlign - 1) / kArenaAlign * kArenaAlign; }
+std::mutex g_arena_mu;
+std::vector<std::pair<uintptr_t, uintptr_t>> g_arenas;   // [lo, hi) of every live arena
+bool in_arena(const void* p) {
+    std::lock_guard<std::mutex> lk(g_arena_mu);
+    const uintptr_t a = (uintptr_t) p;
+    for (const auto& r : g_arenas) if (a >= r.first && a < r.second) return true;
+    return false;
+}
+struct DeviceFree { void operator()(void* p) const { if (p && !in_arena(p)) cudaFree(p); } };
 using DevicePtr = std::unique_ptr<void, DeviceFree>;
 struct Pending {
     WeightRef* ref;
@@ -272,7 +290,15 @@ NativeDense::~NativeDense() {
                 if (b != nullptr && std::find(weights_.begin(), weights_.end(), b) != weights_.end()) b = nullptr;
     for (const void* p : packed_keys_) strata::kernels::native_q8_0_packed_unregister(p);
     if (scratch_) cudaFree(scratch_);
-    for (void* p : weights_) cudaFree(p);
+    for (void* p : weights_) if (!in_arena(p)) cudaFree(p);
+    if (arena_ != nullptr) {
+        {
+            std::lock_guard<std::mutex> lk(g_arena_mu);
+            g_arenas.erase(std::remove(g_arenas.begin(), g_arenas.end(),
+                                       std::make_pair((uintptr_t) arena_, (uintptr_t) arena_ + (uintptr_t) arena_bytes_)), g_arenas.end());
+        }
+        cudaFree(arena_);
+    }
 }
 
 bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& table, std::string& err,
@@ -292,6 +318,46 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
         uint64_t split_count = 0, split_tensors = 0;
         std::set<uint64_t> split_numbers;
         bool have_architecture = false;
+        // STRATA_DENSE_ARENA=1: the bytes of every matrix the walk below uploads through the plain path (the same filters, in
+        // the same order), each rounded to 256 bytes, then one allocation for all of them.  A matrix that would not fit
+        // (the two walks out of step) takes its own cudaMalloc as before.
+        uint64_t arena_off = 0;
+        uint64_t arena_payload = 0, arena_granules = 0;
+        if (dense_arena_env()) {
+            std::set<std::string> pre_seen;
+            uint64_t need = 0;
+            for (const auto& path : shards) {
+                strata::GgufFile gguf(path);
+                for (const auto& tensor : gguf.tensors()) {
+                    if (!eligible(tensor, include_ple_key) || outside(tensor.name)) continue;
+                    if (!in_range(tensor.name) && tensor.name.find("ple") == std::string::npos) continue;
+                    if (!pre_seen.insert(tensor.name).second) continue;
+                    auto found = table.table_.find(tensor.name);
+                    if (found == table.table_.end()) continue;
+                    const auto& ref = found->second;
+                    if (ref.native_data || bf16_as_q8_0(tensor, ref)) continue;
+                    if (!strata::kernels::native_mmvq_supported(tensor.type)) continue;
+                    if (tensor.name == "blk.1.ple_key.weight" && !ref.quantized()) continue;
+                    if (!ref.quantized() || tensor.shape.size() != 2 || ref.ne0 <= 0 || ref.ne0 > INT_MAX || ref.ne1 <= 0 || ref.ne1 > INT_MAX ||
+                        tensor.shape[0] != (uint64_t) ref.ne0 || tensor.shape[1] != (uint64_t) ref.ne1) continue;
+                    const uint64_t b = strata::kernels::native_mmvq_weight_bytes(tensor.type, (int) ref.ne0, (int) ref.ne1);
+                    need += arena_round(b);
+                    arena_granules += alloc_bytes(b);
+                }
+            }
+            if (need > 0) {
+                if (cudaMalloc(&arena_, need) == cudaSuccess) {
+                    arena_bytes_ = need;
+                    std::lock_guard<std::mutex> lk(g_arena_mu);
+                    g_arenas.emplace_back((uintptr_t) arena_, (uintptr_t) arena_ + (uintptr_t) need);
+                } else {
+                    (void) cudaGetLastError();
+                    arena_ = nullptr;
+                    std::fprintf(stderr, "native dense: STRATA_DENSE_ARENA: one %.1f MiB allocation failed; one per matrix as before\n",
+                                 (double) need / 1048576.0);
+                }
+            }
+        }
         for (const auto& path : shards) {
             strata::GgufFile gguf(path);
             const auto* count = gguf.get("split.count");
@@ -395,7 +461,15 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
                 const auto bytes = strata::kernels::native_mmvq_weight_bytes(
                     tensor.type, (int) ref.ne0, (int) ref.ne1);
                 void* allocation = nullptr;
-                auto status = cudaMalloc(&allocation, bytes);
+                const bool carved = arena_ != nullptr && arena_off + arena_round(bytes) <= arena_bytes_;
+                cudaError_t status = cudaSuccess;
+                if (carved) {
+                    allocation = (uint8_t*) arena_ + arena_off;
+                    arena_off += arena_round(bytes);
+                    arena_payload += bytes;
+                } else {
+                    status = cudaMalloc(&allocation, bytes);
+                }
                 DevicePtr data(allocation);
                 if (status == cudaSuccess)
                     status = cudaMemcpy(data.get(), gguf.tensor_data(tensor), bytes, cudaMemcpyHostToDevice);
@@ -404,7 +478,7 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
                 }
                 max_in = (std::max)(max_in, (int) ref.ne0);
                 total += bytes;
-                allocated += alloc_bytes(bytes);
+                if (!carved) allocated += alloc_bytes(bytes);
                 // STRATA_Q8_PACKED=1: a second, packed copy of an eligible Q8_0 matrix for the decode MMVQ (the GGUF
                 // copy stays: the prompt path's GEMMs read it).
                 DevicePtr packed;
@@ -537,6 +611,13 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
                          packed_count, packed_bytes / 1048576.0);
         scratch_ = scratch.release();
         bytes_ = total + hc_q8_bytes;
+        if (arena_ != nullptr) {
+            allocated += alloc_bytes(arena_bytes_);
+            std::fprintf(stderr, "native dense: STRATA_DENSE_ARENA: %.1f MiB of matrices in one %.1f MiB allocation (%.1f MiB carved); "
+                                 "one allocation per matrix would take about %.1f MiB\n",
+                         (double) arena_payload / 1048576.0, (double) arena_bytes_ / 1048576.0, (double) arena_off / 1048576.0,
+                         (double) arena_granules / 1048576.0);
+        }
         allocated_ = allocated;
         if (hc_q8_env())
             std::fprintf(stderr, "strata: STRATA_HC_Q8=1: %.2f GiB of Q8_0 hyper-connection projections for the verify read\n",

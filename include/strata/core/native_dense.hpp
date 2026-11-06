@@ -63,5 +63,7 @@ private:
     void* scratch_ = nullptr;
     uint64_t bytes_ = 0;
     uint64_t allocated_ = 0;
+    void* arena_ = nullptr;          // STRATA_DENSE_ARENA=1: one allocation the matrices are carved from (weights_ holds pointers into it)
+    uint64_t arena_bytes_ = 0;
 };
 } // namespace strata::core
