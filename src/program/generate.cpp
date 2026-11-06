@@ -16125,6 +16125,18 @@ int main(int argc, char** argv) {
                              n_checks == 1 ? "" : "s", n_parked, n_parked == 1 ? "" : "s", n_slots,
                              n_slots == 1 ? "" : "s", n_running, n_running == 1 ? "" : "s");
             }
+            // STRATA_TIER_LOW_MIB=N: keep N MiB of RAM available by releasing the RAM tier's unregistered tail between requests,
+            // and bring it back when there is room (STRATA_TIER_HIGH_MIB, default N + 3072; STRATA_TIER_STEP_MIB, default 1024).
+            {
+                static const uint64_t tier_low = [] { const char* v = std::getenv("STRATA_TIER_LOW_MIB"); return v != nullptr ? (uint64_t) std::atoll(v) << 20 : (uint64_t) 0; }();
+                static const uint64_t tier_high = [] { const char* v = std::getenv("STRATA_TIER_HIGH_MIB"); return v != nullptr ? (uint64_t) std::atoll(v) << 20 : tier_low + (3072ull << 20); }();
+                static const uint64_t tier_step = [] { const char* v = std::getenv("STRATA_TIER_STEP_MIB"); return (v != nullptr ? (uint64_t) std::atoll(v) : 1024ull) << 20; }();
+                if (tier_low > 0 && srcp == &src) {
+                    if (ajob) ajob->wait();
+                    if (ram_bg_job) ram_bg_job->wait();
+                    src.balance_resident(tier_low, tier_high, tier_step);
+                }
+            }
             int64_t resume = 0;
             bool from_live = false;
             if (o.prompt_cache > 0 && want_cvec == cvec_cached) {
@@ -16328,6 +16340,16 @@ int main(int argc, char** argv) {
                                          : 0;
             const bool park_worth = o.conversation_cache_park_gain <= 0 || park_held == 0 ||
                                     (int64_t) live.size() >= (int64_t) park_held + o.conversation_cache_park_gain;
+            // STRATA_PARK_TAIL_MAX=N: this request is the conversation the session holds with at most its last N tokens
+            // rewritten (a client re-rendering its last turn).  Parking would copy the whole K/V and checkpoints to the
+            // host to keep a tail that is cheap to read again, as with pin_sibling above.  0 (the default) parks as before.
+            static const int64_t park_tail_max = [] { const char* v = std::getenv("STRATA_PARK_TAIL_MAX"); return v != nullptr ? (int64_t) std::atoll(v) : (int64_t) 0; }();
+            const bool same_conversation = park_tail_max > 0 && !from_live && !incoming && !borrow && slot_source < 0 && live_ok && resume > 0 &&
+                                           (int64_t) live.size() >= resume && (int64_t) live.size() - resume <= park_tail_max &&
+                                           (int64_t) ids.size() >= resume && std::equal(live.begin(), live.begin() + resume, ids.begin());
+            if (same_conversation)
+                std::fprintf(stderr, "strata serve: conversation cache: not parking %zu tokens: this request continues them with the last %lld rewritten\n",
+                             live.size(), (long long) ((int64_t) live.size() - resume));
             // STRATA_PARK_ASYNC: the checkpoints this request drops after its park - all of them when another state
             // comes in (a parked conversation, a borrow, a batch slot) or the cvec changes, else the ones off this
             // prompt's path (off_path below) - move into the parked image
@@ -16363,7 +16385,7 @@ int main(int argc, char** argv) {
                         return 1;
                     }
                 }
-            } else if ((!from_live || incoming || slot_source >= 0) && !pin_sibling && park_worth &&
+            } else if ((!from_live || incoming || slot_source >= 0) && !pin_sibling && park_worth && !same_conversation &&
                        !park_current(incoming ? incoming->bytes() : 0)) {
                 std::printf("ERR %s\n", err.c_str());
                 return 1;
@@ -18940,6 +18962,16 @@ int main(int argc, char** argv) {
                         wr.chain_rows = chain_rows; wr.cap = S_mtp; wr.start = T; wr.spec_min_p = req_spec_min_p;
                         wr.draft_conf = o.draft_conf; wr.dprob = dprob.data();
                         T = strata::spec::choose_window(wr);
+                        // STRATA_SPEC_CUM_MIN=x (opt-in, the MTP's min-p window only): also stop when the chance that every draft so far holds
+                        // falls below x: a row is paid for whether or not it is reached
+                        static const float spec_cum_min = [] { const char* v = std::getenv("STRATA_SPEC_CUM_MIN"); return v != nullptr ? (float) std::atof(v) : 0.0f; }();
+                        if (spec_cum_min > 0.0f && use_mtp && !req_df2 && req_spec_min_p > 0.0 &&
+                            !strata::spec::cost_window_applies(use_mtp, spec_cost, req_df2, first_window)) {
+                            int Tc = 1;
+                            float spec_cum = 1.0f;
+                            while (Tc < T && (spec_cum *= dprob[(size_t) Tc - 1]) >= spec_cum_min) ++Tc;
+                            T = Tc;
+                        }
                     }
                     if (first_window) T = merge_T > 0 ? merge_T : 1;
                     // a repeat of earlier context (prompt lookup) where the MTP's own first guess agrees: the policy takes it
