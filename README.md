@@ -25,7 +25,7 @@ This fork of [Strata](https://github.com/Niko1221/Strata) is tuned for Qwen3.8-F
 
 - `FAST-SETUP.bat` writes `STRATA_ROUTE_TAIL_SKIP=0` and `STRATA_DIRECT_BATCH=1`, and DFlash2 when its drafter is in `Strata-data\dflash2` (`strata launch --drafting dflash2` downloads it once, 1.2 GB). Add the other switches by hand ([FORK.md](FORK.md)). The stager settings were tuned for two 990 PROs.
 - The DFlash2 drafter is licensed CC BY-NC-ND, so it's for non-commercial use.
-- The move to 0.2.11 left out a few off-by-default switches, including PR #1's for 8 GB cards. See [FORK.md](FORK.md).
+- The fork's off-by-default switches, including PR #1's for 8 GB cards, are all in the 0.2.11 base. See [FORK.md](FORK.md).
 
 ## Speed
 
