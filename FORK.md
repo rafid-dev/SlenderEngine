@@ -1,7 +1,13 @@
 # What this fork changes
 
-This is a fork of [Niko1221/Strata](https://github.com/Niko1221/Strata), based on commit `c62d5e3` (engine 0.1.55). It makes Qwen3.8-Flash-Next IQ3_S
+This is a fork of [Niko1221/Strata](https://github.com/Niko1221/Strata). Since 2026-11-06 it's based on upstream `v0.2.11` (engine 0.1.57); before that it was based on commit `c62d5e3` (engine 0.1.55). It makes Qwen3.8-Flash-Next IQ3_S
 generate faster on one PC by changing software only: same model, quant, context and RAM tier size.
+
+**The move to 0.2.11** is a merge of upstream `v0.2.11` into this branch. Its engine source is exactly the tree that was built and measured (local branch `df2-port`). That tree is upstream `v0.2.11` with this fork's engine commits `cdbdafbd`, `6d29c597`, `7639e88c`, `a658863b` and `967062bc` replayed on top. In `cdbdafbd`, upstream's window rule was kept, so `STRATA_SPEC_CUM_MIN` is gone. The rest of the fork's engine work wasn't replayed:
+- PR #1: `771cd474`, `effb88b9`, `382c3f11`.
+- The engine part of `f0c9a5b3`: `STRATA_ROUTE_TAIL_SKIP_FILE`, `STRATA_PARK_TAIL_MAX`, `STRATA_TIER_*_MIB`.
+
+Those are all off by default and not in the measured setup, and they stay in the history before the merge. With the MTP drafter, the 0.2.11 build measured the same as the 0.1.55 one (3 runs each, worklog).
 
 **See every changed line:** [compare with upstream](https://github.com/Niko1221/Strata/compare/main...rafid-dev:Strata-32GB:speed-fork).
 **See every test, including what failed:** [docs/fork/WORKLOG.md](docs/fork/WORKLOG.md).
@@ -87,7 +93,7 @@ The dual SSD copy must be the same file as the pack's `experts.bin`. The engine 
 |---|---|
 | Experts cached in RAM | **10 GiB**, or what you choose |
 | Saved conversation checkpoints in RAM | **Off** |
-| Drafting | `--spec 4` |
+| Drafting | DFlash2 (`"drafting": "dflash2"`, the server sets `--draft dflash2 --spec 6 --draft-conf 0.8`) when its drafter is in `Strata-data\dflash2`, else the MTP layer with `--spec 4 --spec-min-p 0.5`. The DFlash2 drafter is CC BY-NC-ND |
 | CPU workers | One per P-core, leaving the first for the host (7 here) |
 | SSDs | Two if you pick a second drive |
 | Read-through | **On at 10 GiB or below** |
@@ -140,21 +146,22 @@ PCIe path and the RAM moves did not run in that check. In normal use answers can
 | `STRATA_ROUTE_TRACE`, `STRATA_WINDOW_TRACE`, `STRATA_PROMPT_TRACE`, `STRATA_ADAPT_TIMING` | Measurement only | |
 | `STRATA_MTP_TOP2` | Counts how often the draft's second choice was right (the calls were missing) | Measurement only |
 | `STRATA_RAM_ADAPT_ANY`, `STRATA_RAM_ADAPT_ROUTED`, `_UNUSED`, `_PER` | More RAM moves | No gain: fewer file reads, but copying costs more |
-| `STRATA_SPEC_CUM_MIN` | Stops drafting on a low joint chance | Within noise or worse |
+| `STRATA_SPEC_CUM_MIN` | Stops drafting on a low joint chance | Within noise or worse. Not in the 0.2.11 base, see the top |
 | `STRATA_ADAPT_TAIL_WEIGHT`, `STRATA_ADAPT_SSD_BOOST` | Cache scoring | Not used |
 | `STRATA_DIRECT_AHEAD` | Read-ahead from the router's prediction | The first version was about 18% slower. With `STRATA_LOOKAHEAD_K=5`: +2.7% here, no gain on top of read-through, 45% of its reads wasted. More on an RTX 4060 laptop |
-| `STRATA_POOL_FUSED`, `STRATA_IQ3_VBMI`, `STRATA_LM_CPU_ROWS`, `STRATA_HEAD_FAST_LOAD`, `STRATA_HEAD_ALIAS_SHORT`, `STRATA_REFILL_PINNED`, `STRATA_EXPERTS_MIRROR_SHARE`, `STRATA_POOL_PHASE_TIMING` | From PR #1, for 8 GB cards, see [its report](docs/fork/LAPTOP-RTX4060.md) | Here `STRATA_POOL_FUSED` gave about 0.5% over a whole run, and `STRATA_IQ3_VBMI` can't run on this CPU. The others aren't measured alone here |
-| `STRATA_HEAD_ALIAS_NARROW` | With `--prefill-head-alias`, lends only the slots the chunk needs | About 9% faster than the full loan at the same chunk. With layer-major, long prompts are 6-18% faster, but its answers differ (KL 0.02 at 50K), so that stays off |
+| `STRATA_POOL_FUSED`, `STRATA_IQ3_VBMI`, `STRATA_LM_CPU_ROWS`, `STRATA_HEAD_FAST_LOAD`, `STRATA_HEAD_ALIAS_SHORT`, `STRATA_REFILL_PINNED`, `STRATA_EXPERTS_MIRROR_SHARE`, `STRATA_POOL_PHASE_TIMING` | From PR #1, for 8 GB cards, see [its report](docs/fork/LAPTOP-RTX4060.md) | Here `STRATA_POOL_FUSED` gave about 0.5% over a whole run, and `STRATA_IQ3_VBMI` can't run on this CPU. The others aren't measured alone here. Not in the 0.2.11 base, see the top |
+| `STRATA_HEAD_ALIAS_NARROW` | With `--prefill-head-alias`, lends only the slots the chunk needs | About 9% faster than the full loan at the same chunk. With layer-major, long prompts are 6-18% faster, but its answers differ (KL 0.02 at 50K), so that stays off. Not in the 0.2.11 base, see the top |
 | `STRATA_DIRECT_POLL`, `STRATA_PROC_HIGH` | Polling and process priority | No gain |
-| `STRATA_PARK_TAIL_MAX` | Skips saving a conversation when only its last tokens were rewritten | Saved nothing: the RAM floor already refused those saves |
-| `STRATA_TIER_LOW_MIB`, `_HIGH_MIB`, `_STEP_MIB` | Resizes the RAM tier while running | Not used, no result recorded |
-| `STRATA_ROUTE_TAIL_SKIP_FILE=R` | The route tail skip from rank R, only for experts that would be read from the file. Changes answers | 10 GiB, 2 runs: about +12% at short context, +21% at 50K. Quality not measured |
+| `STRATA_PARK_TAIL_MAX` | Skips saving a conversation when only its last tokens were rewritten | Saved nothing: the RAM floor already refused those saves. Not in the 0.2.11 base, see the top |
+| `STRATA_TIER_LOW_MIB`, `_HIGH_MIB`, `_STEP_MIB` | Resizes the RAM tier while running | Not used, no result recorded. Not in the 0.2.11 base, see the top |
+| `STRATA_ROUTE_TAIL_SKIP_FILE=R` | The route tail skip from rank R, only for experts that would be read from the file. Changes answers | 10 GiB, 2 runs: about +12% at short context, +21% at 50K. Quality not measured. Not in the 0.2.11 base, see the top |
 
 ## Limits
 
-- Only the CUDA build on Windows was built and run. The HIP, SYCL and Metal builds were not built.
+- Only the CUDA build on Windows was built and run. The HIP, SYCL and Metal builds were not built, on either base.
+- On the 0.2.11 base, the all-switches-off byte-identical check hasn't been repeated. K/V lending and the in-place stager were checked byte-identical on the 0.1.55 base.
 - `nv_defaults_test` covers the `sm_89` table. Run it after building.
 - Tokens per step moves about 8% between runs of the same settings, so a small gain needs many runs. Numbers before 2026-11-05 in the worklog mostly use temperature 0.6.
-- With all switches off, this branch gave byte-identical answers to the installed engine on 6 prompts at the settings under Answers, with `--adapt-swaps 1 --adapt-every 1000000`. `tools/test_setup_choices.py` has 2 errors in `test_the_encoder_is_built_native`, in code this branch doesn't change.
+- On the 0.1.55 base, with all switches off, this branch gave byte-identical answers to the installed engine on 6 prompts at the settings under Answers, with `--adapt-swaps 1 --adapt-every 1000000`. `tools/test_setup_choices.py` has 2 errors in `test_the_encoder_is_built_native`, in code this branch doesn't change.
 
 The license is upstream's MIT license, unchanged.

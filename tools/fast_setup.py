@@ -315,6 +315,12 @@ def main():
             env["STRATA_COLD_READER_CPUS"] = ",".join(map(str, cpu["readers"]))
     if mirror is not None:
         env["STRATA_EXPERTS_MIRROR"] = str(mirror)
+    # DFlash2 drafts instead of the MTP layer when its drafter is on disk (Strata-data\dflash2\*.pack): on the PC this was tuned on, follow-ups
+    # +5% and 50K prompt reading +11%, thinking-on short answers level (FORK.md). The server then sets --draft dflash2 --spec 6 --draft-conf 0.8.
+    data_dir = Path(args[args.index("--pack") + 1]).parent.parent
+    df2_packs = sorted((data_dir / "dflash2").glob("*.pack"))
+    if df2_packs:
+        cfg["drafting"] = "dflash2"
     out = Path(a.out_dir)
     cfg["args"] = args
     cfg["log"] = str(out / "strata-fast.log")
@@ -326,7 +332,8 @@ def main():
     say("Settings:")
     for k, v in env.items():
         say(f"  {k}={v}")
-    say("  " + " ".join(args[args.index("--spec"):args.index("--spec") + 2]) + f", {budget:g} GiB of experts in RAM, conversations not saved in RAM")
+    say(("  DFlash2 drafter" if df2_packs else "  MTP drafter, " + " ".join(args[args.index("--spec"):args.index("--spec") + 2])) +
+        f", {budget:g} GiB of experts in RAM, conversations not saved in RAM")
     if a.dry_run:
         say("\nDry run: nothing was written.")
         return 0
