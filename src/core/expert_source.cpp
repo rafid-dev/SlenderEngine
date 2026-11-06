@@ -2458,26 +2458,35 @@ void FileExpertSource::through_retarget(int64_t layer) {
         if (through_usage_[e] < victim_below) cand.emplace_back(through_usage_[e], e);
     }
     const size_t want = std::min(cand.size(), async_todo_.size());
-    if (want == 0) return;
+    // DEC-KV-TAIL: an empty lent place of this layer takes a read before any resident is evicted
+    std::vector<uint64_t>* freel = (size_t) layer < lend_free_.size() ? &lend_free_[(size_t) layer] : nullptr;
+    if (want == 0 && (freel == nullptr || freel->empty())) return;
     std::partial_sort(cand.begin(), cand.begin() + (std::ptrdiff_t) want, cand.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
-    uint8_t* host = (uint8_t*) complement_host_;
     size_t c = 0;
     std::lock_guard<std::mutex> lk(stage_mu_);
     for (Fill& f : async_todo_) {
-        if (c >= want) break;
+        const bool free_place = freel != nullptr && !freel->empty();
+        if (c >= want && !free_place) break;
         const size_t i_in = lo + (size_t) f.e;
         if (complement_offsets_[i_in] != kNoComplement || (!override_.empty() && override_[i_in] != nullptr)) continue;
-        const size_t i_out = lo + (size_t) cand[c++].second;
-        const uint64_t base = complement_offsets_[i_out] / 4096 * 4096;
         const uint64_t r = (layer_offsets_[(size_t) layer] + (uint64_t) f.e * blob) % 4096;
-        if (base + r + blob > complement_bytes_) continue;
-        if (const auto it = stage_of_.find((int64_t) i_out); it != stage_of_.end() && stage_alias_[it->second] != nullptr) {
-            stage_alias_[it->second] = nullptr;   // an older alias of this place
-            stage_key_[it->second] = -1;
-            stage_of_.erase(it);
+        uint64_t base;
+        if (free_place) {
+            base = freel->back();
+            if (!place_fits(base + r, blob)) continue;
+            freel->pop_back();
+        } else {
+            const size_t i_out = lo + (size_t) cand[c++].second;
+            base = complement_offsets_[i_out] / 4096 * 4096;
+            if (!place_fits(base + r, blob)) continue;
+            if (const auto it = stage_of_.find((int64_t) i_out); it != stage_of_.end() && stage_alias_[it->second] != nullptr) {
+                stage_alias_[it->second] = nullptr;   // an older alias of this place
+                stage_key_[it->second] = -1;
+                stage_of_.erase(it);
+            }
+            complement_offsets_[i_out] = kNoComplement;
         }
-        complement_offsets_[i_out] = kNoComplement;
-        f.dst = host + (size_t) (base + r);
+        f.dst = place_host(base + r);
         f.in_place = true;
         stage_alias_[f.v] = f.dst;
         stage_land_i_[f.v] = i_in;
@@ -2521,8 +2530,7 @@ void FileExpertSource::through_purge() {
 void FileExpertSource::through_verify() {
     const auto t0 = std::chrono::steady_clock::now();
     std::vector<uint8_t> file;
-    uint64_t checked = 0, differ = 0;
-    const uint8_t* host = (const uint8_t*) complement_host_;
+    uint64_t checked = 0, differ = 0, lent = 0, lent_differ = 0;
     for (int64_t l = 0; l < n_layers_; ++l) {
         const uint64_t blob = layer_blob_bytes_[(size_t) l];
         file.resize((size_t) blob);
@@ -2532,14 +2540,19 @@ void FileExpertSource::through_verify() {
             const Fill f{0, l, e, file.data(), false};
             if (!read_direct(&f, 1)) { std::fprintf(stderr, "strata ram through verify: read of layer %lld expert %lld failed\n", (long long) l, (long long) e); continue; }
             ++checked;
-            if (std::memcmp(host + (size_t) at, file.data(), (size_t) blob) != 0) {
+            if (at >= kLendBase) ++lent;
+            if (std::memcmp(place_host(at), file.data(), (size_t) blob) != 0) {
                 if (differ < 8) std::fprintf(stderr, "strata ram through verify: layer %lld expert %lld differs from the file\n", (long long) l, (long long) e);
                 ++differ;
+                if (at >= kLendBase) ++lent_differ;
             }
         }
     }
     std::fprintf(stderr, "strata ram through verify: %llu admits so far, %llu blobs checked, %llu differ, %.1f s\n", (unsigned long long) through_admits_,
                  (unsigned long long) checked, (unsigned long long) differ, std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+    if (!lend_arrays_.empty())
+        std::fprintf(stderr, "strata kv lend verify: %llu of them in lent K/V places, %llu of those differ\n", (unsigned long long) lent,
+                     (unsigned long long) lent_differ);
 }
 
 FileExpertSource::KeptReaders::~KeptReaders() {
@@ -4836,7 +4849,192 @@ bool FileExpertSource::pin_cache_complement(
 
 const uint8_t* FileExpertSource::resident_blob(size_t index) const {
     if (exchange_storage_.active()) return exchange_storage_.resident(index).host;
-    return detail::cache_complement_blob_or_fallback(index, complement_offsets_, complement_host_, nullptr);
+    if (lend_arrays_.empty())
+        return detail::cache_complement_blob_or_fallback(index, complement_offsets_, complement_host_, nullptr);
+    if (complement_host_ == nullptr || index >= complement_offsets_.size() || complement_offsets_[index] == kNoComplement)
+        return nullptr;
+    return place_host(complement_offsets_[index]);
+}
+
+// ---- DEC-KV-TAIL (STRATA_KV_LEND=1): lent places in the K/V host copy's tails
+uint8_t* FileExpertSource::place_host(uint64_t at) const {
+    if (at < kLendBase) return (uint8_t*) complement_host_ + (size_t) at;
+    const uint64_t v = at - kLendBase;
+    return lend_arrays_[(size_t) (v / kLendStride)].anchor + (size_t) (v % kLendStride);
+}
+
+const uint8_t* FileExpertSource::place_dev(uint64_t at) const {
+    if (at < kLendBase) return complement_device_ == nullptr ? nullptr : complement_device_ + (size_t) at;
+    const uint64_t v = at - kLendBase;
+    const LendArr& A = lend_arrays_[(size_t) (v / kLendStride)];
+    return A.anchor_dev == nullptr ? nullptr : A.anchor_dev + (size_t) (v % kLendStride);
+}
+
+bool FileExpertSource::place_fits(uint64_t at, uint64_t bytes) const {
+    if (at == kNoComplement) return false;
+    if (at < kLendBase) return at <= complement_bytes_ && bytes <= complement_bytes_ - at;
+    const uint64_t v = at - kLendBase;
+    const size_t a = (size_t) (v / kLendStride);
+    if (a >= lend_arrays_.size()) return false;
+    const uint64_t off = v % kLendStride;
+    const LendArr& A = lend_arrays_[a];
+    return off >= A.lo && off <= A.hi && bytes <= A.hi - off;
+}
+
+bool FileExpertSource::kv_lend_setup(const std::vector<KvLendArray>& arrays, std::string& err) {
+    err.clear();
+    if (!complement_ready_ || complement_host_ == nullptr) err = "the RAM tier (--resident-budget-gib) is not ready";
+    else if (!through_padded_) err = "it needs read-through's padded places (STRATA_RAM_THROUGH=1)";
+    else if (!role_ptr_.empty()) err = "not with the experts read from the GGUF shards in place";
+    else if (exchange_storage_.active() || [] { const char* v = std::getenv("STRATA_EXCHANGE_ROTATE"); return v != nullptr && std::strcmp(v, "1") == 0; }())
+        err = "not with STRATA_EXCHANGE_ROTATE";
+    else if (fs_swap_.load(std::memory_order_acquire) != nullptr) err = "not with Foresight swaps";
+    else if (arrays.empty()) err = "no streamed K/V host copy to lend from (--kv-resident, --kv int8)";
+    else if (arrays.size() > (size_t) ((~0ull - kLendBase) / kLendStride)) err = "too many K/V arrays";
+    if (!err.empty()) return false;
+    std::vector<LendArr> out;
+    int64_t blocks = -1;
+    for (const KvLendArray& x : arrays) {
+        if (x.host == nullptr || x.block_bytes == 0 || x.blocks <= 0 || (blocks >= 0 && x.blocks != blocks)) {
+            err = "a K/V array without blocks, or arrays of different lengths";
+            return false;
+        }
+        blocks = x.blocks;
+        LendArr A;
+        A.anchor = (uint8_t*) ((uintptr_t) x.host / 4096 * 4096);
+        A.skew = (uint64_t) (x.host - A.anchor);
+        A.anchor_dev = x.dev == nullptr ? nullptr : x.dev - A.skew;
+        A.block_bytes = x.block_bytes;
+        A.blocks = x.blocks;
+        A.hi = (A.skew + (uint64_t) x.blocks * x.block_bytes) / 4096 * 4096;
+        A.lo = A.hi;
+        if (A.hi >= kLendStride) { err = "a K/V array over 256 GiB"; return false; }
+        out.push_back(A);
+    }
+    lend_arrays_ = std::move(out);
+    lend_blocks_ = blocks;
+    lend_first_block_ = blocks;
+    lend_places_.clear();
+    lend_free_.assign((size_t) n_layers_, {});
+    lend_count_.assign((size_t) n_layers_, 0);
+    lend_weight_.assign((size_t) n_layers_, 0);
+    for (size_t i = 0; i < complement_offsets_.size(); ++i)
+        if (complement_offsets_[i] != kNoComplement) ++lend_weight_[i / (size_t) n_expert_];
+    std::fprintf(stderr, "FileExpertSource: STRATA_KV_LEND: %zu K/V arrays of %lld blocks can lend their tails to the RAM tier "
+                         "(nothing lent until a request reserves its cells)\n", lend_arrays_.size(), (long long) blocks);
+    return true;
+}
+
+int64_t FileExpertSource::kv_lend_set(int64_t first_block) {
+    if (lend_arrays_.empty()) return 0;
+    first_block = std::clamp<int64_t>(first_block, 0, lend_blocks_);
+    const size_t na = lend_arrays_.size();
+    std::vector<uint64_t> cut(na);
+    for (size_t a = 0; a < na; ++a) {
+        const LendArr& A = lend_arrays_[a];
+        cut[a] = std::min(A.hi, (A.skew + (uint64_t) first_block * A.block_bytes + 4095) / 4096 * 4096);
+    }
+    auto arr_of = [&](uint64_t at) { return (size_t) ((at - kLendBase) / kLendStride); };
+    auto off_of = [&](uint64_t at) { return (at - kLendBase) % kLendStride; };
+    // 1. take back every place that starts below its array's cut: its expert drops to the SSD tier
+    std::vector<LendPlace> keep, gone;
+    keep.reserve(lend_places_.size());
+    for (const LendPlace& p : lend_places_) {
+        if (off_of(p.at) < cut[arr_of(p.at)]) { gone.push_back(p); --lend_count_[(size_t) p.layer]; }
+        else keep.push_back(p);
+    }
+    int64_t dropped = 0;
+    std::lock_guard<std::mutex> lk(stage_mu_);   // through_retarget edits the offsets and the free lists under it
+    if (!gone.empty()) {
+        std::sort(gone.begin(), gone.end(), [](const LendPlace& x, const LendPlace& y) { return x.at < y.at; });
+        auto in_gone = [&](uint64_t at) {
+            auto it = std::upper_bound(gone.begin(), gone.end(), at, [](uint64_t v, const LendPlace& p) { return v < p.at; });
+            if (it == gone.begin()) return false;
+            --it;
+            return at < it->at + it->bytes;
+        };
+        auto ptr_in_gone = [&](const uint8_t* q) {
+            for (const LendPlace& p : gone) {
+                const uint8_t* h = place_host(p.at);
+                if (q >= h && q < h + p.bytes) return true;
+            }
+            return false;
+        };
+        // the caller has drained every read (adapt round, background jobs, device): a stage entry or a landing that
+        // still points into a place taken back would be a bug - it is cut loose here and said, never served
+        int64_t loose = 0;
+        for (size_t v = 0; v < stage_alias_.size(); ++v) {
+            if (stage_alias_[v] == nullptr || !ptr_in_gone(stage_alias_[v])) continue;
+            if (v < stage_key_.size() && stage_key_[v] >= 0) stage_of_.erase(stage_key_[v]);
+            if (v < stage_key_.size()) stage_key_[v] = -1;
+            stage_alias_[v] = nullptr;
+            ++loose;
+        }
+        for (size_t v = 0; v < stage_land_i_.size() && v < stage_land_at_.size(); ++v)
+            if (stage_land_i_[v] != SIZE_MAX && stage_land_at_[v] >= kLendBase && in_gone(stage_land_at_[v])) {
+                stage_land_i_[v] = SIZE_MAX;
+                ++loose;
+            }
+        if (loose > 0)
+            std::fprintf(stderr, "strata kv lend: WARNING: %lld stage entries still pointed into places taken back (cut loose)\n",
+                         (long long) loose);
+        for (size_t i = 0; i < complement_offsets_.size(); ++i) {
+            const uint64_t at = complement_offsets_[i];
+            if (at != kNoComplement && at >= kLendBase && in_gone(at)) { complement_offsets_[i] = kNoComplement; ++dropped; }
+        }
+        for (auto& fl : lend_free_) fl.erase(std::remove_if(fl.begin(), fl.end(), in_gone), fl.end());
+        lend_places_.swap(keep);
+    }
+    // the lowest lent byte of every array: its lowest remaining place, or its end
+    for (size_t a = 0; a < na; ++a) lend_arrays_[a].lo = lend_arrays_[a].hi;
+    for (const LendPlace& p : lend_places_) {
+        LendArr& A = lend_arrays_[arr_of(p.at)];
+        A.lo = std::min(A.lo, off_of(p.at));
+    }
+    // 2. carve places down from the lowest lent byte to the cut, each for the layer least covered against its share
+    int64_t carved = 0;
+    for (size_t a = 0; a < na; ++a) {
+        LendArr& A = lend_arrays_[a];
+        for (;;) {
+            int64_t best = -1;
+            double best_cov = 0.0;
+            for (int64_t l = 0; l < n_layers_; ++l) {
+                if (lend_weight_[(size_t) l] <= 0) continue;
+                const uint64_t psz = lend_place_bytes(l);
+                if (A.lo < cut[a] + psz) continue;   // does not fit what is left of this array
+                const double cov = (double) lend_count_[(size_t) l] / (double) lend_weight_[(size_t) l];
+                if (best < 0 || cov < best_cov) { best = l; best_cov = cov; }
+            }
+            if (best < 0) break;
+            const uint64_t psz = lend_place_bytes(best);
+            A.lo -= psz;
+            const uint64_t at = kLendBase + (uint64_t) a * kLendStride + A.lo;
+            lend_places_.push_back({at, psz, (int32_t) best});
+            lend_free_[(size_t) best].push_back(at);
+            ++lend_count_[(size_t) best];
+            ++carved;
+        }
+    }
+    lend_first_block_ = first_block;
+    lend_dropped_ += (uint64_t) dropped;
+    if (!gone.empty() || carved > 0)
+        std::fprintf(stderr, "strata kv lend: the K/V keeps %lld of %lld blocks; %zu places lent (%.2f GiB, %lld empty), %zu taken back "
+                             "(%lld experts back to the SSD tier), %lld new\n", (long long) first_block, (long long) lend_blocks_,
+                     lend_places_.size(), (double) kv_lend_bytes() / 1073741824.0, (long long) kv_lend_free(), gone.size(),
+                     (long long) dropped, (long long) carved);
+    return dropped;
+}
+
+uint64_t FileExpertSource::kv_lend_bytes() const {
+    uint64_t b = 0;
+    for (const LendPlace& p : lend_places_) b += p.bytes;
+    return b;
+}
+
+int64_t FileExpertSource::kv_lend_free() const {
+    int64_t n = 0;
+    for (const auto& fl : lend_free_) n += (int64_t) fl.size();
+    return n;
 }
 
 bool FileExpertSource::has_resident(int64_t layer, int64_t expert) const {
@@ -4980,9 +5178,8 @@ int64_t FileExpertSource::commit_exchanges() {
             continue;
         }
         const uint64_t at = complement_offsets_[x.in];
-        if (src != nullptr && at != kNoComplement && at <= complement_bytes_ && x.bytes <= complement_bytes_ - at &&
-            complement_host_ != nullptr) {
-            std::memcpy((uint8_t*) complement_host_ + (size_t) at, src, (size_t) x.bytes);
+        if (src != nullptr && complement_host_ != nullptr && place_fits(at, x.bytes)) {
+            std::memcpy(place_host(at), src, (size_t) x.bytes);
             if (detail::exchange_cache_complement(complement_offsets_, x.in, x.out)) ++n;
         }
         override_[x.out] = nullptr;
@@ -5002,9 +5199,7 @@ bool FileExpertSource::replace_resident(int64_t layer, int64_t in, int64_t out) 
     if (i_in >= complement_offsets_.size() || i_out >= complement_offsets_.size()) return false;
     if (!override_.empty() && (override_[i_in] != nullptr || override_[i_out] != nullptr)) return false;
     const uint64_t at = complement_offsets_[i_out], bytes = layer_blob_bytes_[(size_t) layer];
-    if (at == kNoComplement || complement_offsets_[i_in] != kNoComplement || at > complement_bytes_ ||
-        bytes > complement_bytes_ - at) return false;
-    (void) at;
+    if (complement_offsets_[i_in] != kNoComplement || !place_fits(at, bytes)) return false;
     // read beside the copy first: a failed read leaves `out` where it was
     if (ram_adapt_buf_.size() < (size_t) bytes) ram_adapt_buf_.resize((size_t) bytes);
     const auto t0 = std::chrono::steady_clock::now();
@@ -5089,8 +5284,7 @@ bool FileExpertSource::replace_resident_staged(int64_t layer, int64_t in, int64_
     if (i_in >= complement_offsets_.size() || i_out >= complement_offsets_.size()) return false;
     if (!override_.empty() && (override_[i_in] != nullptr || override_[i_out] != nullptr)) return false;
     const uint64_t at = complement_offsets_[i_out], bytes = layer_blob_bytes_[(size_t) layer];
-    if (at == kNoComplement || complement_offsets_[i_in] != kNoComplement || at > complement_bytes_ ||
-        bytes > complement_bytes_ - at || bytes > stage_blob_) return false;
+    if (complement_offsets_[i_in] != kNoComplement || !place_fits(at, bytes) || bytes > stage_blob_) return false;
     ForesightSwap* fs = fs_swap_.load(std::memory_order_acquire);
     bool moved = false;
     {
@@ -5099,7 +5293,7 @@ bool FileExpertSource::replace_resident_staged(int64_t layer, int64_t in, int64_
         const auto it = stage_of_.find((int64_t) i_in);
         if (it == stage_of_.end() || stage_busy_[it->second] || stage_key_[it->second] != (int64_t) i_in) return false;
         if (fs != nullptr) fs->hold(layer, (int32_t) out);
-        std::memcpy((uint8_t*) complement_host_ + (size_t) at, stage_ptr(it->second), (size_t) bytes);
+        std::memcpy(place_host(at), stage_ptr(it->second), (size_t) bytes);
         moved = detail::exchange_cache_complement(complement_offsets_, i_out, i_in);
         if (fs != nullptr) fs->unhold(layer, (int32_t) out);
     }
@@ -5129,11 +5323,10 @@ void FileExpertSource::replace_resident_staged_many(const RamMove* m, int n, uin
         if (i_in >= complement_offsets_.size() || i_out >= complement_offsets_.size()) continue;
         if (!override_.empty() && (override_[i_in] != nullptr || override_[i_out] != nullptr)) continue;
         const uint64_t at = complement_offsets_[i_out], bytes = layer_blob_bytes_[(size_t) layer];
-        if (at == kNoComplement || complement_offsets_[i_in] != kNoComplement || at > complement_bytes_ ||
-            bytes > complement_bytes_ - at || bytes > stage_blob_) continue;
+        if (complement_offsets_[i_in] != kNoComplement || !place_fits(at, bytes) || bytes > stage_blob_) continue;
         const auto it = stage_of_.find((int64_t) i_in);
         if (it == stage_of_.end() || stage_busy_[it->second] || stage_key_[it->second] != (int64_t) i_in) continue;
-        c.push_back({(uint8_t*) complement_host_ + (size_t) at, stage_ptr(it->second), (size_t) bytes, i_in, i_out, i});
+        c.push_back({place_host(at), stage_ptr(it->second), (size_t) bytes, i_in, i_out, i});
     }
     if (c.empty()) return;
     std::atomic<size_t> next{0};
@@ -5164,12 +5357,11 @@ bool FileExpertSource::install_resident(int64_t layer, int64_t in, int64_t out, 
     if (i_in >= complement_offsets_.size() || i_out >= complement_offsets_.size()) return false;
     if (!override_.empty() && (override_[i_in] != nullptr || override_[i_out] != nullptr)) return false;
     const uint64_t at = complement_offsets_[i_out], bytes = layer_blob_bytes_[(size_t) layer];
-    if (at == kNoComplement || complement_offsets_[i_in] != kNoComplement || at > complement_bytes_ ||
-        bytes > complement_bytes_ - at) return false;
+    if (complement_offsets_[i_in] != kNoComplement || !place_fits(at, bytes)) return false;
     // #2134: a Foresight slot may be copying out of `out`'s place right now; it is dropped (never served) before the place is rewritten
     ForesightSwap* fs = fs_swap_.load(std::memory_order_acquire);
     if (fs != nullptr) fs->hold(layer, (int32_t) out);
-    std::memcpy((uint8_t*) complement_host_ + (size_t) at, src, (size_t) bytes);
+    std::memcpy(place_host(at), src, (size_t) bytes);
     const bool moved = detail::exchange_cache_complement(complement_offsets_, i_out, i_in);
     if (fs != nullptr) fs->unhold(layer, (int32_t) out);
     if (!moved) return false;
@@ -5297,9 +5489,8 @@ void FileExpertSource::commit_copies() {
     for (const Exchange& x : staged_) {
         const uint8_t* src = override_.empty() ? nullptr : override_[x.out];
         const uint64_t at = complement_offsets_[x.in];
-        if (src != nullptr && at != kNoComplement && at <= complement_bytes_ && x.bytes <= complement_bytes_ - at &&
-            complement_host_ != nullptr)
-            std::memcpy((uint8_t*) complement_host_ + (size_t) at, src, (size_t) x.bytes);
+        if (src != nullptr && complement_host_ != nullptr && place_fits(at, x.bytes))
+            std::memcpy(place_host(at), src, (size_t) x.bytes);
     }
 }
 
@@ -5319,8 +5510,8 @@ int64_t FileExpertSource::commit_flip() {
         }
         const uint64_t at = complement_offsets_[x.in];
         // the same test as commit_copies: an exchange whose bytes were copied is the one that flips
-        if (src != nullptr && at != kNoComplement && at <= complement_bytes_ && x.bytes <= complement_bytes_ - at &&
-            complement_host_ != nullptr && detail::exchange_cache_complement(complement_offsets_, x.in, x.out))
+        if (src != nullptr && complement_host_ != nullptr && place_fits(at, x.bytes) &&
+            detail::exchange_cache_complement(complement_offsets_, x.in, x.out))
             ++n;
         override_[x.out] = nullptr;
     }
@@ -5418,6 +5609,8 @@ bool FileExpertSource::pinned(int64_t layer, int64_t expert) const {
     // soft_commit_exchanges: a staged `out` is judged by the place it will take (`in`'s), as after the commit
     const size_t at_index = !soft_in_.empty() && soft_in_[index] != SIZE_MAX ? soft_in_[index] : index;
     if (at_index >= complement_offsets_.size() || complement_offsets_[at_index] == kNoComplement) return false;
+    // DEC-KV-TAIL: a lent place is pinned when its K/V array is device-mapped
+    if (complement_offsets_[at_index] >= kLendBase) return place_dev(complement_offsets_[at_index]) != nullptr;
     // a partial pin (CS-T): only the registered prefix
     return !complement_partial_ ||
            complement_offsets_[at_index] + layer_blob_bytes_[(size_t) layer] <= complement_pin_limit_;
@@ -5430,7 +5623,7 @@ const uint8_t* FileExpertSource::device_alias(int64_t layer, int64_t expert) con
     if (!soft_in_.empty() && soft_in_[index] != SIZE_MAX)   // soft_commit_exchanges: out is read from its exchange buffer
         return override_.empty() || override_[index] == nullptr || xstage_dev_ == nullptr
                    ? nullptr : xstage_dev_ + (size_t) (override_[index] - xstage_);
-    return complement_device_ + (size_t) complement_offsets_[index];
+    return place_dev(complement_offsets_[index]);
 }
 
 bool FileExpertSource::pcie_layer(int64_t layer) const {

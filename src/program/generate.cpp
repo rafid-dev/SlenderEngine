@@ -67,6 +67,7 @@
 #include "strata/kernels/native_rope.hpp"
 #include "strata/kernels/mrope.hpp"
 #include "strata/kernels/kv_q4.hpp"
+#include "strata/kernels/kv_q8.hpp"
 #include "strata/kernels/qsa.hpp"
 #include "strata/core/native_head.hpp"
 #include "strata/core/verify.hpp"
@@ -11305,6 +11306,54 @@ int main(int argc, char** argv) {
         // STRATA_RAM_THROUGH: only on the one-GPU path it was tested on; the floor follows --adapt-decay (through_retarget)
         if (!drive.d.usage.empty() && srcp == &src && !multi_gpu && o.peer_device < 0 && o.pipeline_windows <= 0 && o.batch == 0)
             src.set_through_floor(2.0f * o.adapt_decay);
+        // DEC-KV-TAIL (STRATA_KV_LEND=1, opt-in): the streamed K/V's pinned host copy is sized for the whole context; the
+        // cells past what a request can reach are lent to the RAM tier as read-through places (read-only expert copies),
+        // and taken back at the next request's start.  One GPU, decode, int8 K/V, read-through on; nothing changes without it.
+        bool kv_lend = false;
+        {
+            const char* v = std::getenv("STRATA_KV_LEND");
+            if (v != nullptr && v[0] == '1') {
+                const char* pa = std::getenv("STRATA_PARK_ASYNC");
+                const char* ca = std::getenv("STRATA_CKPT_ASYNC");
+                std::string why;
+                if (srcp != &src || multi_gpu || o.peer_device >= 0 || o.pipeline_windows > 0 || o.batch != 0 || !stages.empty())
+                    why = "one GPU, no --batch, no --pipeline-windows, no layer split";
+                else if (drive.d.usage.empty()) why = "it needs the adaptive RAM tier (--adapt-every, --adapt-swaps)";
+                else if ((pa != nullptr && pa[0] == '1') || (ca != nullptr && ca[0] != '\0' && ca[0] != '0'))
+                    why = "not with STRATA_PARK_ASYNC or STRATA_CKPT_ASYNC (their copies read the K/V in the background)";
+                std::vector<strata::core::FileExpertSource::KvLendArray> arrays;
+                if (why.empty()) {
+                    const strata::kernels::QsaShapes qs = strata::core::qsa_shapes(g);
+                    const uint64_t rows = (uint64_t) qs.n_head_kv * (uint64_t) qs.page_size;
+                    const uint64_t code_bytes = rows * (uint64_t) qs.head_dim;
+                    const uint64_t scale_bytes = rows * (uint64_t) (qs.head_dim / strata::kernels::KV_Q8_GROUP) * 2;
+                    for (int64_t j = 0; j < ss.qsa_alloc && why.empty(); ++j) {
+                        const strata::core::QsaState& st = ss.qsa_states[(size_t) (ss.qsa_ord0 + j)];
+                        if (st.kv_mode != 1 || !st.kv_int8 || st.kv_hybrid || st.kv_q4 || st.host.k_q == nullptr ||
+                            st.host_h == nullptr || st.host_d == nullptr) {
+                            why = "every QSA layer's K/V streamed (--kv-resident) in int8 (--kv int8)";
+                            break;
+                        }
+                        auto add = [&](const void* dev, uint64_t bb) {
+                            const uint8_t* d = (const uint8_t*) dev;
+                            arrays.push_back({st.host_h + (d - st.host_d), d, bb, st.n_pages});
+                        };
+                        add(st.host.k_q, code_bytes);
+                        add(st.host.v_q, code_bytes);
+                        add(st.host.k_scale, scale_bytes);
+                        add(st.host.v_scale, scale_bytes);
+                    }
+                }
+                if (why.empty() && src.kv_lend_setup(arrays, why)) kv_lend = true;
+                if (!kv_lend) std::fprintf(stderr, "strata serve: STRATA_KV_LEND=1 is off: %s\n", why.c_str());
+            }
+        }
+        // the first block a request must keep: every cell it can write (prompt + max_new), the window past it and a margin
+        auto kv_lend_keep = [&](int64_t cells) -> int64_t {
+            const strata::kernels::QsaShapes qs = strata::core::qsa_shapes(g);
+            const int64_t c = cells + 1024 + 64;
+            return (c + qs.page_size - 1) / qs.page_size;
+        };
         PcieAuto pcie_auto;
         if (o.pcie_frac_auto && !all_experts_resident && o.batch == 0 && o.peer_device < 0 && (n_stages == 1 || pcie_auto_split_ok())) {
             const auto& pl = strata::kernels::cpu::expert_layout();
@@ -12174,6 +12223,19 @@ int main(int argc, char** argv) {
                 if (ajob) ajob->wait();
                 cudaDeviceSynchronize();
             }
+        };
+        // DEC-KV-TAIL: keep the K/V's blocks [0, first_block) for the K/V and lend the rest.  Nothing may read or write a
+        // place while it moves: the round, the background RAM moves and the device are drained first.  grow_only: only take
+        // places back (a request's start, before a park or a restore reads or writes the cells of the conversations).
+        auto kv_lend_to = [&](int64_t first_block, bool grow_only) {
+            if (!kv_lend) return;
+            const int64_t now = src.kv_lend_first_block();
+            if (first_block == now || (grow_only && first_block < now)) return;
+            adapt_quiesce();
+            if (ram_bg_job) ram_bg_job->wait();
+            if (ajob) ajob->wait();
+            cudaDeviceSynchronize();
+            src.kv_lend_set(first_block);
         };
         // --pipeline-windows 2: the loop has drained (nothing in flight on either card): what waits for a gap goes now,
         // and the round in flight goes on unfenced (a_pl_idle unset) from the next tick, the next request's drain.  The
@@ -13826,6 +13888,7 @@ int main(int argc, char** argv) {
                 // or writes the checkpoints (a join inside the session file writer would match only the copy of a checkpoint)
                 strata::core::conversation_checkpoint_join(nullptr);
                 strata::core::conversation_park_join();   // (STRATA_PARK_ASYNC: the last park's K/V)
+                if (!save) kv_lend_to(src.kv_lend_blocks(), true);   // DEC-KV-TAIL: a restore may write any cell
                 if (path.empty()) { refuse("missing path"); continue; }
                 if (!stages.empty() || multi_gpu) { refuse("session files do not support --layer-split"); continue; }
                 if (o.peer_device >= 1) { refuse("session files do not support --peer-device"); continue; }
@@ -14148,6 +14211,10 @@ int main(int argc, char** argv) {
                 std::printf("ERR prefill=1 needs a text prompt of at least 2 tokens and no --batch\n");
                 continue;
             }
+            // DEC-KV-TAIL: every cell this request can write is the K/V's again before anything below touches it (a park
+            // reads the last conversation's cells, a restore writes this one's); the rest is lent before the prompt read
+            const int64_t kv_lend_first = kv_lend ? kv_lend_keep(n + max_new) : 0;
+            kv_lend_to(kv_lend_first, true);
             req_imgs.clear();
             if (geni && !o.vision) { std::printf("ERR this engine was started without --vision\n"); continue; }
             if (geni || !mrope_identity) {
@@ -14951,6 +15018,7 @@ int main(int argc, char** argv) {
             // KV streaming: the drafter's ring may hold cells past `resume` from a longer turn; the main layers'
             // host copies and slots are always current (every writer writes both), so they need nothing
             if (use_mtp && resume > 0 && reread_to <= 0) mtp.kv_restore(resume);
+            kv_lend_to(kv_lend_first, false);   // DEC-KV-TAIL: the park and the restore are done; lend past this request
             tr("request", n, geni ? 1 : 0);
             req_times = ReqTimes{};
             if (use_mtp) mtp.set_prompt_len(n);
@@ -17012,6 +17080,14 @@ int main(int argc, char** argv) {
                 }
             }
             while (!pl_ran && !cancelled && produced_n < max_new) {
+                // DEC-KV-TAIL: the request's reservation covers prompt + max_new + a margin, so this never fires; if a
+                // window could still reach a lent cell, every place is taken back before it runs
+                if (kv_lend && src.kv_lend_first_block() < src.kv_lend_blocks() &&
+                    p + (int64_t) S + 64 > src.kv_lend_first_block() * strata::core::qsa_shapes(g).page_size) {
+                    std::fprintf(stderr, "strata kv lend: WARNING: decode at cell %lld reached the lent K/V cells: taking them all back\n",
+                                 (long long) p);
+                    kv_lend_to(src.kv_lend_blocks(), true);
+                }
                 int T = 1;
                 policy.set_context(p);
                 const bool merged = first_window && merge_T > 0;   // the prompt's last tokens and the first token

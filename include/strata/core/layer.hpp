@@ -240,6 +240,10 @@ struct QsaState {
     /// context needs - its index in layer.cpp's registry; -1: carved from the arena as before.
     int32_t kv_elastic = -1;
     strata::kernels::KvHostPools host;
+    /// The host copy's allocation as the host sees it (`host_h`) and as the device sees it (`host_d`, the base the
+    /// `host` pointers are carved from): DEC-KV-TAIL (STRATA_KV_LEND=1) lends the copy's unused tail to the RAM tier.
+    uint8_t* host_h = nullptr;
+    const uint8_t* host_d = nullptr;
     strata::kernels::KvStreamMap map;
     int64_t idx_pooled_rows = 0;     ///< rows of `idx_pooled` (a ring, which has no indexer, keeps 2)
 

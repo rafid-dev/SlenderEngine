@@ -796,6 +796,32 @@ public:
     void through_context(const int32_t* ids, int64_t n, const float* usage, int64_t n_tok) override;
     /// STRATA_RAM_THROUGH: a victim's usage count stays under this (0: nothing is admitted).  See through_retarget.
     void set_through_floor(float f) { through_floor_ = f; }
+    // ---- DEC-KV-TAIL (STRATA_KV_LEND=1, opt-in).  The pinned K/V host copy is sized for --max-context and holds a
+    // conversation's cells from block 0 up; the blocks past the request's reach are lent to this tier as extra places.
+    // A lent place is named by an offset at or above kLendBase (place_host / place_dev translate), so every path that
+    // moves an expert in or out of a place works unchanged.  Read-through fills an empty lent place before it evicts.
+    // Taking a place back drops its expert to the SSD tier: the place held a copy of the file, nothing is written back.
+    /// One array of the K/V host copy (a layer's K or V codes): its pinned host base, its device alias (null: the GPU
+    /// does not read it over PCIe), the bytes of one K/V block, and the blocks it holds.
+    struct KvLendArray {
+        uint8_t* host = nullptr;
+        const uint8_t* dev = nullptr;
+        uint64_t block_bytes = 0;
+        int64_t blocks = 0;
+    };
+    /// Takes the arrays (nothing lent yet).  False with a reason when this tier cannot take lent places.
+    bool kv_lend_setup(const std::vector<KvLendArray>& arrays, std::string& err);
+    bool kv_lend_on() const { return !lend_arrays_.empty(); }
+    /// The K/V keeps blocks [0, first_block) of every array; the rest is lent.  Places below it are taken back (their
+    /// experts drop to the SSD tier) and places are carved where the K/V gave room back.  Only while nothing reads or
+    /// writes the tier or the K/V (between requests or windows, the adaptive tier quiesced, the device idle).
+    /// Returns the experts dropped.
+    int64_t kv_lend_set(int64_t first_block);
+    int64_t kv_lend_first_block() const { return lend_first_block_; }
+    int64_t kv_lend_blocks() const { return lend_blocks_; }   ///< the arrays' block count (nothing lent at this)
+    int64_t kv_lend_places() const { return (int64_t) lend_places_.size(); }
+    uint64_t kv_lend_bytes() const;                           ///< bytes in lent places
+    int64_t kv_lend_free() const;                             ///< lent places with no expert yet
     /// Host room for `n` evicted blobs (page-locked when possible).  Idempotent for the same or a smaller `n`.
     /// `bounce`: how many of the last buffers are only staged through and never hold an exchange (STRATA_EXCHANGE_ROTATE
     /// keeps those in the largest block size alone).
@@ -1172,6 +1198,28 @@ private:
     void through_purge();
     void through_land(size_t v);
     void through_verify();
+    // DEC-KV-TAIL: offsets [kLendBase + a * kLendStride, ...) are bytes of lent array a, measured from its 4 KiB-aligned
+    // anchor, so an aligned offset is an aligned address (read-through's unbuffered reads land in place)
+    static constexpr uint64_t kLendBase = 1ull << 44, kLendStride = 1ull << 38;
+    struct LendArr {
+        uint8_t* anchor = nullptr;          ///< the host base rounded down to 4 KiB
+        const uint8_t* anchor_dev = nullptr;
+        uint64_t skew = 0;                  ///< host base - anchor
+        uint64_t block_bytes = 0;
+        int64_t blocks = 0;
+        uint64_t lo = 0, hi = 0;            ///< [lo, hi): the lent bytes from the anchor (lo == hi: none)
+    };
+    struct LendPlace { uint64_t at, bytes; int32_t layer; };
+    std::vector<LendArr> lend_arrays_;
+    std::vector<LendPlace> lend_places_;
+    std::vector<std::vector<uint64_t>> lend_free_;   ///< per layer: empty lent places (their aligned offsets)
+    std::vector<int64_t> lend_count_, lend_weight_;  ///< per layer: lent places, and the share each layer gets
+    int64_t lend_first_block_ = 0, lend_blocks_ = 0;
+    uint64_t lend_dropped_ = 0;
+    uint8_t* place_host(uint64_t at) const;
+    const uint8_t* place_dev(uint64_t at) const;
+    bool place_fits(uint64_t at, uint64_t bytes) const;
+    uint64_t lend_place_bytes(int64_t layer) const { return (layer_blob_bytes_[(size_t) layer] + 8192 + 4095) / 4096 * 4096; }
     uint8_t* stage_ptr(size_t v) const { return stage_alias_[v] != nullptr ? stage_alias_[v] : stage_buf_[v].get() + stage_skip_[v]; }
     Fill stage_fill(size_t v, int64_t layer, int64_t e) const { return {v, layer, e, stage_ptr(v), stage_in_place_[v] != 0}; }
     // set_direct_ahead: the read-ahead's queue and threads
