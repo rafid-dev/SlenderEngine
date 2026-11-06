@@ -65,8 +65,9 @@ set STRATA_RAM_ADAPT_PAR=1
 set STRATA_RAM_ADAPT_BG=1
 rem each SSD read is handed over as it lands, not in batches of 16
 set STRATA_DIRECT_BATCH=1
-rem not written by FAST-SETUP: skip 0, K/V lending and the in-place prompt stager (tuned for two 990 PROs)
+rem skip 0: no missed expert is skipped, so answers aren't changed by it
 set STRATA_ROUTE_TAIL_SKIP=0
+rem not written by FAST-SETUP: K/V lending and the in-place prompt stager (tuned for two 990 PROs)
 set STRATA_KV_LEND=1
 set STRATA_STAGER_IN_PLACE=1
 set STRATA_STAGER_THREADS=3

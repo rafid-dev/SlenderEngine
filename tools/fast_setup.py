@@ -301,7 +301,10 @@ def main():
            "STRATA_PARTIAL_PIN": "1", "STRATA_RAM_ADAPT_PAR": "1", "STRATA_RAM_ADAPT_BG": "1",
            # Each SSD read is handed over the moment it lands, not in batches of 16: about +9% after a 50K prompt on the PC this was tuned on
            # (with K/V lending on), no gain on short prompts, about +6% on an RTX 4060 8 GB laptop. It changes only when a read is handed over, not the arithmetic.
-           "STRATA_DIRECT_BATCH": "1"}
+           "STRATA_DIRECT_BATCH": "1",
+           # Skip 0: no missed expert is skipped, so answers aren't changed by it. The engine's default skip 7 was about 22% faster on the PC this
+           # was tuned on (45.9 against 35.9 tok/s), but moved answers by KL 0.081 against skip 0 (top choice the same at 90.7% of positions).
+           "STRATA_ROUTE_TAIL_SKIP": "0"}
     # Read-through: +5-13% at 10 GiB on the PC this was tuned on. At 14 GiB there it lost 19%, so it stays off above 10 until that's explained.
     if budget <= 10:
         env["STRATA_RAM_THROUGH"] = "1"
