@@ -10,27 +10,22 @@ This fork of [Strata](https://github.com/Niko1221/Strata) is tuned for Qwen3.8-F
 
 ### 2026-11-06
 
-Measured on the PC under [Speed](#speed), with the model card's sampling. Speeds are text generation in tok/s, and each one says which expert skip it ran at.
+**Method:** the PC under [Speed](#speed), Qwen3.8-Flash-Next IQ3_S at skip 0 (no expert skipped), the model card's sampling. Fresh engine per run, the two settings in mixed order, 3-6 runs each. A change counts when every run of one beats every run of the other. Details are in [FORK.md](FORK.md) and the [worklog](docs/fork/WORKLOG.md).
 
-- **Skip 0 in the setup we run.** No missed expert is skipped, so skipping no longer changes answers. It costs about 22% against Strata's default skip 7 (35.9 against 45.9 tok/s). The tables further down are still at skip 7. `FAST-SETUP.bat` now writes `STRATA_ROUTE_TAIL_SKIP=0`. Remove that line from `run-fast.bat` to go back to skip 7.
-- **`--pcie-frac 0`.** The CPU computes every expert held in RAM, so the GPU no longer pulls them over PCIe in the middle of its work. At skip 0 each step took 7% less time: 29.1 to 33.9 tok/s after a 50K prompt, and 29.1 to 32.7 on a follow-up, 3 runs each. Only rounding changes, because the CPU and GPU round differently. `FAST-SETUP.bat` doesn't write it yet, so add it to the engine args.
-- **K/V lending, new (`STRATA_KV_LEND=1`).** The part of the pinned K/V memory a request can't reach holds extra experts, so it uses no new RAM. At skip 0, 6 runs each: 27% fewer SSD reads, 9.7% less time a step, and 37.9 to 42.2 tok/s on short answers (+11%). Answers stayed byte-identical at temperature 0, up to a 178K prompt. Less memory is free to lend as the context grows: 3.06 GiB on short requests, 2.45 GiB at 50K. It's off unless you set it.
-- **`STRATA_DIRECT_BATCH=1`.** Each SSD read is handed over as soon as it lands, instead of in groups of 16, so nothing waits on the rest of its group (5.4 ms of waiting a step down to 0.15). At skip 0 with K/V lending, 5 runs at 16 against 6 at 1, in mixed order: 35.0 to 38.3 tok/s after a 50K prompt (+9%; ranges 33.0-36.9 and 37.5-40.2), and 37.2 to 39.4 on a follow-up (+6%, ranges overlap, so likely but not proven). Short answers didn't gain, and the average time a step didn't change (45.7 against 45.5 ms). A first test showed +13% and +11%, but part of that was drift between test batches. It only changes when a read is used, never the arithmetic. A friend's RTX 4060 8 GB laptop with 32 GB measured about +6%. `FAST-SETUP.bat` now writes it.
-- **Faster prompt reading, new (`STRATA_STAGER_IN_PLACE=1`).** While a prompt is read, experts from the SSD now land straight in the buffer the GPU copies from, with no extra copy in RAM. Together with fewer, smaller reads (`STRATA_STAGER_THREADS=3`, `STRATA_STAGER_BATCH=1`, `STRATA_STAGER_RING=128`), the two 990 PROs stay in their fast range. At skip 0 with K/V lending, 3 runs each, every changed run beat every default run:
-  - Prompt reading went from 541-549 to 600-634 tok/s on a 3K prompt (+13.9%), +9.2% at 29K and +8.5% at 50K.
-  - Prompts of 151 and 482 tokens were read in 21% less time, and 1,129 tokens in 9% less (2 runs each).
-  - The CPU went from 87% to 10% busy while reading.
+| Change | Switch | Result | Answers |
+|---|---|---|---|
+| Skip 0 | `STRATA_ROUTE_TAIL_SKIP=0` | About 22% slower than Strata's default skip 7, but every expert is computed | The full model (skip 7 drops some experts) |
+| CPU computes the RAM experts | `--pcie-frac 0` | 7% less time a step, 29.1 → 33.9 tok/s after a 50K prompt | Rounding only |
+| K/V lending | `STRATA_KV_LEND=1` | 27% fewer SSD reads, 37.9 → 42.2 tok/s on short answers (+11%) | Byte-identical |
+| Each SSD read used as it lands | `STRATA_DIRECT_BATCH=1` | +9% after a 50K prompt, short answers unchanged | Unchanged (same arithmetic) |
+| In-place prompt stager | `STRATA_STAGER_IN_PLACE=1` and 3 stager settings | Prompt reading +8.5% at 50K up to +21% on short prompts, CPU 87% → 10% busy | Byte-identical |
+| Strata 0.2.11 base with the DFlash2 drafter | `"drafting": "dflash2"` | Follow-ups +5%, 50K prompt reading +11%, thinking-on short answers and 50K level | Same model; sampled text differs per seed |
 
-  Answers stayed byte-identical at temperature 0. The thread and request settings were tuned for two 990 PROs, so `FAST-SETUP.bat` doesn't write any of the four. It's off unless you set it, and it's only tested on Windows with CUDA.
-- **Now built on Strata 0.2.11, and drafting with DFlash2.** The fork's engine changes are now on top of upstream v0.2.11 (engine 0.1.57) instead of 0.1.55. With the MTP drafter, 0.2.11 measured the same as the old base. Upstream's DFlash2 drafter now replaces the MTP layer. At skip 0 with everything above, 3 runs each against the MTP:
-  - It's right more often: 85% of its guesses are accepted, against 68%.
-  - It offers fewer guesses, so tokens per step don't change. Thinking-on short answers and generation after a 50K prompt are level (45.1 against 45.4, 36.6 against 35.8 tok/s).
-  - Follow-ups are faster: 41.8 against 39.9 tok/s (+5%, ranges apart). Thinking-off answers are 51.8 against 48.9 (+6%, ranges overlap).
-  - A 50K prompt is read faster: 1,728 against 1,561 tok/s (+11%, ranges apart), probably because the drafter takes 343 MiB less VRAM, leaving more room for experts.
+**Where it stands:** about 45 tok/s on short thinking-on answers, 37 after a 50K prompt, 42 on a follow-up and 52 with thinking off. A 50K prompt reads at about 1,700 tok/s. The speed tables below are still at skip 7.
 
-  `FAST-SETUP.bat` turns DFlash2 on when its drafter file is in `Strata-data\dflash2`. `strata launch --drafting dflash2` downloads it once (1.2 GB). The DFlash2 drafter has its own license, CC BY-NC-ND, so it's for non-commercial use. Coupled sampling for the MTP drafter (`STRATA_SPEC_COUPLED=1`) raised its acceptance 5-7 points but gave no measurable speed, so it stays off.
-- **Not carried over to 0.2.11:** PR #1's switches for 8 GB cards, and the off-by-default switches `STRATA_ROUTE_TAIL_SKIP_FILE`, `STRATA_SPEC_CUM_MIN`, `STRATA_PARK_TAIL_MAX`, `STRATA_TIER_*_MIB` and `STRATA_HEAD_ALIAS_NARROW`. None of them is in the setup we run. They're in the history before this update (commit `60af6a2a`).
-- **The setup we run now:** skip 0, `--pcie-frac 0`, K/V lending, `STRATA_DIRECT_BATCH=1`, the in-place prompt stager and DFlash2. About 45 tok/s on short thinking-on answers, about 37 after a 50K prompt, about 42 on a follow-up, and about 52 with thinking off. A 50K prompt is read at about 1,700 tok/s.
+- `FAST-SETUP.bat` writes `STRATA_ROUTE_TAIL_SKIP=0` and `STRATA_DIRECT_BATCH=1`, and DFlash2 when its drafter is in `Strata-data\dflash2` (`strata launch --drafting dflash2` downloads it once, 1.2 GB). Add the other switches by hand ([FORK.md](FORK.md)). The stager settings were tuned for two 990 PROs.
+- The DFlash2 drafter is licensed CC BY-NC-ND, so it's for non-commercial use.
+- The move to 0.2.11 left out a few off-by-default switches, including PR #1's for 8 GB cards. See [FORK.md](FORK.md).
 
 ## Speed
 
