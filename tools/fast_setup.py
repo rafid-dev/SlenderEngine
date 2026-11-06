@@ -299,8 +299,8 @@ def main():
         set_arg(args, k, v)
     env = {"STRATA_UNBUFFERED_LOAD": "1", "STRATA_RESIDENT_HEADROOM_GIB": "1.5", "STRATA_RAM_ADAPT": "1", "STRATA_COLD_OVERLAP": "1", "STRATA_COLD_KEPT_READERS": "1",
            "STRATA_PARTIAL_PIN": "1", "STRATA_RAM_ADAPT_PAR": "1", "STRATA_RAM_ADAPT_BG": "1",
-           # Each SSD read is handed over the moment it lands, not in batches of 16: +13% at 50K and +11% on follow-ups on the PC this was tuned on
-           # (with K/V lending on), about +6% on an RTX 4060 8 GB laptop. It changes only when a read is handed over, not the arithmetic.
+           # Each SSD read is handed over the moment it lands, not in batches of 16: about +9% after a 50K prompt on the PC this was tuned on
+           # (with K/V lending on), no gain on short prompts, about +6% on an RTX 4060 8 GB laptop. It changes only when a read is handed over, not the arithmetic.
            "STRATA_DIRECT_BATCH": "1"}
     # Read-through: +5-13% at 10 GiB on the PC this was tuned on. At 14 GiB there it lost 19%, so it stays off above 10 until that's explained.
     if budget <= 10:
