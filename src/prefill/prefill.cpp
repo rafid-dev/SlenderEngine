@@ -462,6 +462,34 @@ struct HandWorker {
 // and CUDA sm_80+ on chunks of 33+ tokens - there, with CUDA 13.3 on an RTX 5090, cuBLAS's up GEMM sums K in the fused
 // kernel's order and the read is the default pair's bits: gr_upmix_parity, STRATA_HC_UPMIX_CHECK);
 // STRATA_HC_UPMIX_CHECK=N also runs the default pair on the first N reads and reports the difference of `mixed`
+// Test build only, uncommitted: STRATA_ROUTE_DUMP=<path> writes each prompt-path router call, on both prompt paths:
+// {layer, T, N, NE, K, full} int32, p0 int64, T*K ids, T*K weights, and for layers below STRATA_ROUTE_DUMP_FULL
+// (default 12) the T*N router input and the T*NE router scores.  It reads only; the sync doesn't change any value.
+static void route_dump_tap(int64_t l, int64_t p0, int64_t T, int64_t n, int64_t ne, int64_t k, const float* mixed, const float* logits,
+                           const int32_t* ids, const float* w, cudaStream_t s) {
+    static std::FILE* f = [] { const char* e = std::getenv("STRATA_ROUTE_DUMP"); return e ? std::fopen(e, "wb") : nullptr; }();
+    if (f == nullptr) return;
+    static const int64_t full_below = [] { const char* e = std::getenv("STRATA_ROUTE_DUMP_FULL"); return e ? (int64_t) std::atoll(e) : (int64_t) 12; }();
+    cudaStreamSynchronize(s);
+    const bool full = l < full_below;
+    const int32_t h[6] = {(int32_t) l, (int32_t) T, (int32_t) n, (int32_t) ne, (int32_t) k, full ? 1 : 0};
+    std::fwrite(h, 4, 6, f);
+    std::fwrite(&p0, 8, 1, f);
+    std::vector<int32_t> hi((size_t) (T * k));
+    std::vector<float> hw((size_t) (T * k));
+    cudaMemcpy(hi.data(), ids, hi.size() * 4, cudaMemcpyDeviceToHost);
+    cudaMemcpy(hw.data(), w, hw.size() * 4, cudaMemcpyDeviceToHost);
+    std::fwrite(hi.data(), 4, hi.size(), f);
+    std::fwrite(hw.data(), 4, hw.size(), f);
+    if (full) {
+        std::vector<float> a((size_t) (T * n)), b((size_t) (T * ne));
+        cudaMemcpy(a.data(), mixed, a.size() * 4, cudaMemcpyDeviceToHost);
+        cudaMemcpy(b.data(), logits, b.size() * 4, cudaMemcpyDeviceToHost);
+        std::fwrite(a.data(), 4, a.size(), f);
+        std::fwrite(b.data(), 4, b.size(), f);
+    }
+    std::fflush(f);
+}
 static int64_t pf_switch_min_t() {   // S23: STRATA_PF_SWITCH_MIN_T=N - the rounding-level prompt switches only on chunks of
     // N or more tokens (shorter prompts keep the default numerics, and their outputs; the switches pay on long ones)
     static const int64_t v = [] { const char* e = std::getenv("STRATA_PF_SWITCH_MIN_T"); return e ? (int64_t) std::atoll(e) : (int64_t) 0; }();
@@ -4120,6 +4148,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     pt.mark(kPfRouter, cs);
                     if (!bf16_proj(m.gemm, wr, m.mixed_bf, m.logits, T, v.name("ffn_gate_inp.weight"), err, 0, m.mixed_bf_lo)) return false;
                     route(m.logits, m.ids, m.w, T, m.g->n_expert, m.cs);
+                    route_dump_tap(l, p0, T, N, m.g->n_expert, K, m.mixed, m.logits, m.ids, m.w, m.cs);   // test build only
                     // RESEARCH HOOK (141-research, opt-in, never on by default): STRATA_DBG_FEAT=<file> dumps, per MoE layer and chunk,
                     // the routed ids + weights (and for the layers in STRATA_DBG_FEAT_LAYERS the router-input hidden state, bf16);
                     // STRATA_DBG_ROUTE_OVERRIDE=<file> replaces the routing of the layers listed in that file with the file's ids + weights.
@@ -5693,7 +5722,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             cudaStreamSynchronize(m.cs);                                  // position (A/B quality of this path)
             if (std::FILE* f = std::fopen(dump, c0 == 0 ? "wb" : "ab")) {
                 std::vector<float> row((size_t) D);
-                for (int64_t t = (64 - p0 % 64) % 64; t < T; t += 64) {
+                static const int64_t dump_step = [] { const char* e = std::getenv("STRATA_PREFILL_DUMP_R_STEP"); const int64_t v = e ? (int64_t) std::atoll(e) : (int64_t) 64; return v > 0 ? v : (int64_t) 64; }();
+                for (int64_t t = (dump_step - p0 % dump_step) % dump_step; t < T; t += dump_step) {
                     cudaMemcpy(row.data(), m.R + t * D, (size_t) D * 4, cudaMemcpyDeviceToHost);
                     const int64_t pos = p0 + t;
                     std::fwrite(&pos, sizeof pos, 1, f);
@@ -6940,7 +6970,8 @@ bool Prefill::lm_run(const std::vector<Seg>& segs, int depth, const std::vector<
                         cudaStreamSynchronize(cs);
                         if (std::FILE* f = std::fopen(dump, c0 == 0 ? "wb" : "ab")) {
                             std::vector<float> row((size_t) D);
-                            for (int64_t t = (64 - p0 % 64) % 64; t < T; t += 64) {
+                            static const int64_t dump_step = [] { const char* e = std::getenv("STRATA_PREFILL_DUMP_R_STEP"); const int64_t v = e ? (int64_t) std::atoll(e) : (int64_t) 64; return v > 0 ? v : (int64_t) 64; }();
+                            for (int64_t t = (dump_step - p0 % dump_step) % dump_step; t < T; t += dump_step) {
                                 cudaMemcpy(row.data(), m.R + t * D, (size_t) D * 4, cudaMemcpyDeviceToHost);
                                 const int64_t pos = p0 + t;
                                 std::fwrite(&pos, sizeof pos, 1, f);
@@ -7219,6 +7250,7 @@ bool Prefill::lm_run(const std::vector<Seg>& segs, int depth, const std::vector<
                         pt.mark(kPfRouter, cs);
                         if (!bf16_proj(m.gemm, wr, m.mixed_bf, m.logits, T, v.name("ffn_gate_inp.weight"), err, 0, m.mixed_bf_lo)) return false;
                         route(m.logits, lb.ids + t0 * K, lb.w + t0 * K, T, m.g->n_expert, cs);
+                        route_dump_tap(l, p0, T, N, m.g->n_expert, K, m.mixed, m.logits, lb.ids + t0 * K, lb.w + t0 * K, cs);   // test build only
                         if (!native_proj(m.gemm, wsg, m.mixed_h, m.sgate, T, v.name("ffn_gate_shexp.weight"), err)) return false;
                         if (!native_proj(m.gemm, wsu, m.mixed_h, m.sup, T, v.name("ffn_up_shexp.weight"), err)) return false;
                         swiglu_pair(m.sgate, m.sup, m.sh_h, T, cs);

@@ -7825,13 +7825,19 @@ int main(int argc, char** argv) {
                           [] { const char* v = std::getenv("STRATA_FS_AHEAD"); return v == nullptr || std::atoi(v) != 0; }();
     // STRATA_LOOKAHEAD_STATS=1 (measurement only): run the predictor on any tier and score it against the real routing
     const bool la_stats = srcp != nullptr && [] { const char* v = std::getenv("STRATA_LOOKAHEAD_STATS"); return v != nullptr && std::atoi(v) != 0; }();
+    // STRATA_AHEAD_TRACE_SHADOW=1 with STRATA_AHEAD_TRACE (measurement only): run the predictor so its guesses are recorded; nothing is read ahead
+    const bool at_shadow = srcp != nullptr && [] {
+        const char* v = std::getenv("STRATA_AHEAD_TRACE_SHADOW");
+        const char* p = std::getenv("STRATA_AHEAD_TRACE");
+        return v != nullptr && v[0] == '1' && p != nullptr && *p != 0;
+    }();
     // Windows, an unbuffered experts.bin: the prediction reads ahead into the stage buffers (STRATA_DIRECT_AHEAD: threads,
     // default off: on an RTX 4070 Ti only about 28% of the blobs read were used, and text ran about 18% slower with it on)
     if (srcp == &src) {
         const char* v = std::getenv("STRATA_DIRECT_AHEAD");
         src.set_direct_ahead(v != nullptr ? std::atoi(v) : 0);
     }
-    if (srcp != nullptr && ((srcp == &src && src.warms()) || fs_ahead || la_stats) &&
+    if (srcp != nullptr && ((srcp == &src && src.warms()) || fs_ahead || la_stats || at_shadow) &&
         [] { const char* v = std::getenv("STRATA_LOOKAHEAD"); return v == nullptr || std::atoi(v) != 0; }()) {
         std::vector<std::vector<uint16_t>> routers((size_t) g.n_layers);
         bool ok = true;
@@ -7844,7 +7850,7 @@ int main(int argc, char** argv) {
             ok = cudaMemcpy(routers[(size_t) l].data(), w->data, (size_t) w->bytes, cudaMemcpyDeviceToHost) == cudaSuccess;
         }
         const char* kv = std::getenv("STRATA_LOOKAHEAD_K");
-        if (ok && lookahead.start(std::move(routers), g.n_embd, g.n_expert, kv ? std::atoi(kv) : 10, srcp, err, fs_ahead || la_stats)) {
+        if (ok && lookahead.start(std::move(routers), g.n_embd, g.n_expert, kv ? std::atoi(kv) : 10, srcp, err, fs_ahead || la_stats || at_shadow)) {
             drive.d.lookahead = &lookahead;
             if (la_stats) lookahead.enable_stats(g.n_layers);
             if (const char* dv = std::getenv("STRATA_IO_PREFETCH_DEPTH"); dv != nullptr && std::atoi(dv) > 0)

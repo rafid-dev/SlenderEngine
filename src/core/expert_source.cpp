@@ -77,6 +77,59 @@
 #endif
 #endif
 
+// STRATA_AHEAD_TRACE=<path> (measurement only, strata/core/ahead_trace.hpp): every g_atr test below is off when it's unset.  The hooks read
+// engine state and copy it out; nothing the engine decides reads anything back.  STRATA_AHEAD_TRACE_SHADOW=1: the predictor runs and
+// its guesses are recorded, nothing is read ahead (generate.cpp starts the predictor for it).
+#include "strata/core/ahead_trace.hpp"
+namespace atrace = strata::core::ahead_trace;
+namespace {
+atrace::Trace* const g_atr = atrace::Trace::open_from_env();
+const bool g_atr_shadow = g_atr != nullptr && [] { const char* v = std::getenv("STRATA_AHEAD_TRACE_SHADOW"); return v != nullptr && v[0] == '1'; }();
+thread_local uint64_t tl_atr_batch = 0;   // set around a tagged read_direct, so its records join its blobs'
+thread_local uint8_t tl_atr_origin = atrace::kOriginOther;
+
+template <class F>
+uint64_t atr_read_begin(const F* fills, size_t n, atrace::Origin origin, const uint8_t* host, uint64_t host_bytes, const std::vector<uint64_t>& blob_bytes) {
+    if (g_atr == nullptr) return 0;
+    const uint64_t batch = g_atr->next_batch();
+    tl_atr_batch = batch;
+    tl_atr_origin = origin;
+    const uint64_t t = g_atr->now_ns();
+    for (size_t i = 0; i < n; ++i) {
+        const F& f = fills[i];
+        const bool in_tier = host != nullptr && f.dst >= host && f.dst < host + host_bytes;
+        g_atr->emit_at(t, atrace::kReadStart, f.layer, f.e, batch, (uint32_t) blob_bytes[(size_t) f.layer], (uint16_t) (origin | (in_tier ? 16 : 0)));
+    }
+    return batch;
+}
+template <class F>
+void atr_read_done(const F& f, uint64_t batch, atrace::Origin origin, bool ok) {
+    if (g_atr != nullptr) g_atr->emit(atrace::kReadDone, f.layer, f.e, batch, 0, (uint16_t) (origin | (ok ? 16 : 0)));
+}
+inline void atr_read_clear() {
+    if (g_atr == nullptr) return;
+    tl_atr_batch = 0;
+    tl_atr_origin = atrace::kOriginOther;
+}
+// one read_direct: every SSD read goes through it, so its records count all the bytes, tagged or not
+struct AtrBatchScope {
+    uint64_t batch = 0;
+    bool sampled = false, ok = false;
+    AtrBatchScope(size_t n, bool decode_thread) {
+        if (g_atr == nullptr) return;
+        batch = tl_atr_batch != 0 ? tl_atr_batch : g_atr->next_batch();
+        const uint16_t origin = tl_atr_origin != atrace::kOriginOther ? tl_atr_origin : decode_thread ? atrace::kOriginDecodeSync : atrace::kOriginOther;
+        sampled = origin != atrace::kOriginOther && g_atr->sample_batch();
+        g_atr->emit(atrace::kBatchBegin, (int64_t) n, -1, batch, 0, (uint16_t) (origin | (sampled ? 16 : 0)));
+    }
+    ~AtrBatchScope() {
+        if (batch != 0) g_atr->emit(atrace::kBatchEnd, -1, -1, batch, 0, ok ? 1 : 0);
+    }
+    AtrBatchScope(const AtrBatchScope&) = delete;
+    AtrBatchScope& operator=(const AtrBatchScope&) = delete;
+};
+}  // namespace
+
 // The pid of this process and whether a pid still exists (the shared arena's reader election, both OSes)
 static uint64_t arena_this_pid() {
 #ifdef _WIN32
@@ -1948,7 +2001,11 @@ bool FileExpertSource::claim_stage(int64_t key, size_t& v, bool& fill, bool ahea
         }
     } else {
         stage_of_.erase(stage_key_[v]);
-        if (stage_pf_[v]) { stage_pf_[v] = 0; io_pf_unused_.fetch_add(1, std::memory_order_relaxed); }   // read ahead, never asked for
+        if (stage_pf_[v]) {   // read ahead, never asked for
+            stage_pf_[v] = 0;
+            io_pf_unused_.fetch_add(1, std::memory_order_relaxed);
+            if (g_atr != nullptr && stage_key_[v] >= 0) g_atr->emit(atrace::kEvictUnused, stage_key_[v] / n_expert_, stage_key_[v] % n_expert_);
+        }
         // #1237: a page-locked buffer is read by the DMA after the copy call returned: it is refilled only once the
         // last copy queued out of it (note_async_read) has finished.  Rare: the pool is sized so that a buffer asked
         // for has long been consumed; a wait here means the stream is more than a pool behind.
@@ -2259,6 +2316,12 @@ void FileExpertSource::claim_todo(int64_t layer, const int64_t* experts, int64_t
             }
             size_t v = 0;
             bool fill = false;
+            if (g_atr != nullptr) {   // measurement only: what this layer finds for a file miss, before claim_stage marks it used
+                const auto atr_it = stage_of_.find(layer * n_expert_ + e);
+                const bool found = atr_it != stage_of_.end();
+                const uint16_t st = !found ? atrace::kClaimNone : stage_busy_[atr_it->second] ? atrace::kClaimBusy : atrace::kClaimPublished;
+                g_atr->emit(atrace::kClaim, layer, e, g_atr->window(), 0, (uint16_t) (st | (found && stage_pf_[atr_it->second] ? atrace::kClaimReadAhead : 0)));
+            }
             if (!claim_stage(layer * n_expert_ + e, v, fill) && fill) {
                 todo.push_back(stage_fill(v, layer, e));
                 if (pending != nullptr) pending[i] = 1;
@@ -2334,6 +2397,7 @@ int64_t FileExpertSource::prefetch_begin(int64_t layer, const int64_t* experts, 
         if (direct) {
             for (size_t at; (at = async_next_.fetch_add(direct_batch)) < todo.size();) {
                 const size_t k = std::min<size_t>(direct_batch, todo.size() - at);
+                const uint64_t atr_b = atr_read_begin(todo.data() + at, k, atrace::kOriginDecode, complement_host_, complement_bytes_, layer_blob_bytes_);
                 const auto t0 = std::chrono::steady_clock::now();
                 const bool ok = read_direct(todo.data() + at, k);
                 const double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count();
@@ -2345,7 +2409,9 @@ int64_t FileExpertSource::prefetch_begin(int64_t layer, const int64_t* experts, 
                     } else if (fill_stage(f.v, f.layer, f.e, f.dst)) {
                         through_land(f.v);
                     }
+                    atr_read_done(f, atr_b, atrace::kOriginDecode, ok);
                 }
+                atr_read_clear();
             }
         } else {
             for (size_t i; (i = async_next_.fetch_add(1)) < todo.size();)
@@ -3042,6 +3108,7 @@ bool FileExpertSource::read_direct(const Fill* fills, size_t n) const {
     // maps the GGUF shards for the token embedding and the PLE table): measured on a PCIe 5 drive, 512 KiB reads at
     // queue depth 48 make 10.4 GB/s on a file nobody maps and 3.4 GB/s on a mapped one, 8 MiB reads 8.6 GB/s.  So
     // windows less than kGap apart (the same role of nearby experts) are merged into requests of up to kMerge bytes.
+    AtrBatchScope atr_scope(n, tl_decode);
     constexpr uint64_t kSector = 4096, kGap = 1ull << 20, kMerge = 32ull << 20;
     struct Window { int file; uint64_t a0, size, skip, n, at; uint8_t* dst; size_t req; uint64_t in_req; bool in_place; };
     struct Req { HANDLE h; uint64_t a0, size, pos; uint8_t* out; };   // out: the stage buffer it reads straight into (else the scratch at pos)
@@ -3171,6 +3238,11 @@ bool FileExpertSource::read_direct(const Fill* fills, size_t n) const {
         }
         ++issued;
     }
+    if (g_atr != nullptr) {   // measurement only: what the drives were asked for, sector rounding and merged gaps included
+        uint64_t bytes = 0;
+        for (size_t q = 0; q < issued; ++q) bytes += sc.io[q].size;
+        g_atr->emit(atrace::kBatchIssued, (int64_t) sc.req.size(), (int64_t) issued, atr_scope.batch, (uint32_t) (bytes >> 10));
+    }
     if (read_trace && ok && issued > 0) {
         // when each request ends, each blob could have been used, and the batch published it
         static std::atomic<uint64_t> tr_batches{0}, tr_blobs{0}, tr_issue_ns{0}, tr_first_ns{0}, tr_last_ns{0}, tr_gap_ns{0}, tr_gap_n{0};
@@ -3209,6 +3281,41 @@ bool FileExpertSource::read_direct(const Fill* fills, size_t n) const {
                          (double) tr_issue_ns.load() / 1e3 / (double) b, (double) tr_first_ns.load() / 1e3 / (double) b, (double) tr_last_ns.load() / 1e3 / (double) b,
                          (double) tr_gap_ns.load() / 1e3 / (double) std::max<uint64_t>(tr_gap_n.load(), 1));
     }
+    if (atr_scope.sampled && !read_trace && ok && issued == sc.io.size() && issued > 0 && issued <= MAXIMUM_WAIT_OBJECTS) {
+        // measurement only: when each I/O finished, not when the wait below reaches it.  The events are manual-reset, so they stay
+        // signalled and that wait and GetOverlappedResult run as ever.  This changes no read and no result, only how this thread sleeps.
+        HANDLE atr_h[MAXIMUM_WAIT_OBJECTS];
+        uint8_t atr_ix[MAXIMUM_WAIT_OBJECTS];
+        uint64_t atr_done[MAXIMUM_WAIT_OBJECTS] = {};
+        DWORD atr_left = (DWORD) issued;
+        for (size_t q = 0; q < issued; ++q) {
+            atr_h[q] = sc.ev[q];
+            atr_ix[q] = (uint8_t) q;
+        }
+        while (atr_left > 0) {
+            const DWORD r = WaitForMultipleObjects(atr_left, atr_h, FALSE, INFINITE);
+            if (r >= WAIT_OBJECT_0 + atr_left) break;   // a failed wait: the loop below still waits properly
+            atr_done[atr_ix[r - WAIT_OBJECT_0]] = g_atr->now_ns();
+            atr_h[r - WAIT_OBJECT_0] = atr_h[atr_left - 1];
+            atr_ix[r - WAIT_OBJECT_0] = atr_ix[atr_left - 1];
+            --atr_left;
+        }
+        for (size_t q = 0; q < issued; ++q)
+            if (atr_done[q] != 0)
+                g_atr->emit_at(atr_done[q], atrace::kIoDone, -1, (int64_t) q, atr_scope.batch, (uint32_t) (sc.io[q].size >> 10),
+                               sc.io[q].h == (HANDLE) direct_mirror_ ? 1 : 0);
+        if (role_ptr_.empty() && sc.win.size() == n)   // experts.bin: one window per fill, in the fills' order
+            for (size_t b = 0; b < n; ++b) {
+                uint64_t last = 0;
+                bool all = true;
+                for (size_t q = 0; q < issued; ++q)
+                    if (sc.io[q].req == sc.win[b].req) {
+                        all = all && atr_done[q] != 0;
+                        last = std::max(last, atr_done[q]);
+                    }
+                if (all && last != 0) g_atr->emit_at(last, atrace::kBlobIoDone, fills[b].layer, fills[b].e, atr_scope.batch);
+            }
+    }
     std::vector<DWORD>& got = sc.got;
     got.assign(sc.req.size(), 0);
     // STRATA_DIRECT_POLL=1 (opt-in): watch for the completion rather than sleep on its event, as a read is a few hundred microseconds
@@ -3232,6 +3339,7 @@ bool FileExpertSource::read_direct(const Fill* fills, size_t n) const {
         if ((uint64_t) got[x.req] < x.in_req + x.skip + x.n) return false;
         if (!x.in_place) std::memcpy(x.dst + x.at, sc.buf + sc.req[x.req].pos + x.in_req + x.skip, (size_t) x.n);
     }
+    atr_scope.ok = true;
     return true;
 #elif defined(__linux__)
     // Linux: O_DIRECT descriptors (open_direct) and the kernel's asynchronous reads - every window of the batch is
@@ -3426,21 +3534,28 @@ void FileExpertSource::direct_ahead_run() {
         {
             std::lock_guard<std::mutex> lk(stage_mu_);
             for (const AheadItem& it : items) {
+                auto atr_drop = [&](atrace::DropReason why) { if (g_atr != nullptr) g_atr->emit(atrace::kAheadDrop, it.layer, it.e, 0, 0, why); };
                 if (it.epoch + 1 < now) {   // the layer it was predicted for has passed
                     da_late_.fetch_add(1, std::memory_order_relaxed);
+                    atr_drop(atrace::kDropLayerPassed);
                     continue;
                 }
                 const size_t index = (size_t) it.layer * (size_t) n_expert_ + (size_t) it.e;
-                if (complement_ready_ && resident_blob(index) != nullptr) continue;   // in the RAM copy
-                if (!override_.empty() && override_[index] != nullptr) continue;
+                if (complement_ready_ && resident_blob(index) != nullptr) { atr_drop(atrace::kDropRamTier); continue; }   // in the RAM copy
+                if (!override_.empty() && override_[index] != nullptr) { atr_drop(atrace::kDropOverride); continue; }
                 size_t v = 0;
                 bool fill = false;
-                if (claim_stage(it.layer * n_expert_ + it.e, v, fill, /*ahead=*/true) || !fill) continue;   // staged or being read
+                const bool have = claim_stage(it.layer * n_expert_ + it.e, v, fill, /*ahead=*/true);
+                if (have || !fill) {   // staged or being read
+                    atr_drop(have ? atrace::kDropAlreadyStaged : atrace::kDropNoBuffer);
+                    continue;
+                }
                 stage_pf_[v] = 1;
                 todo.push_back(stage_fill(v, it.layer, it.e));
             }
         }
         if (todo.empty()) continue;
+        const uint64_t atr_b = atr_read_begin(todo.data(), todo.size(), atrace::kOriginAhead, nullptr, 0, layer_blob_bytes_);
         const auto t0 = std::chrono::steady_clock::now();
         const bool ok = read_direct(todo.data(), todo.size());
         const double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count();
@@ -3448,11 +3563,25 @@ void FileExpertSource::direct_ahead_run() {
         for (const Fill& f : todo) {
             if (ok) publish_stage(f.v, f.layer, true, us / (double) todo.size());
             else (void) fill_stage(f.v, f.layer, f.e, f.dst);
+            atr_read_done(f, atr_b, atrace::kOriginAhead, ok);
         }
+        atr_read_clear();
     }
 }
 
 void FileExpertSource::warm(int64_t layer, const int64_t* experts, int64_t n) {
+    if (g_atr_shadow && !direct_ahead_ && n > 0 && layer >= 0 && layer < n_layers_) {
+        // measurement only: which guesses a read-ahead would skip, by direct_ahead_run's own tests.  Nothing is claimed or read
+        std::lock_guard<std::mutex> lk(stage_mu_);
+        for (int64_t j = 0; j < n; ++j) {
+            const int64_t e = experts[j];
+            if (e < 0 || e >= n_expert_) continue;
+            const size_t index = (size_t) layer * (size_t) n_expert_ + (size_t) e;
+            if (complement_ready_ && resident_blob(index) != nullptr) g_atr->emit(atrace::kAheadDrop, layer, e, 0, 0, atrace::kDropRamTier);
+            else if (!override_.empty() && override_[index] != nullptr) g_atr->emit(atrace::kAheadDrop, layer, e, 0, 0, atrace::kDropOverride);
+            else if (stage_of_.find(layer * n_expert_ + e) != stage_of_.end()) g_atr->emit(atrace::kAheadDrop, layer, e, 0, 0, atrace::kDropAlreadyStaged);
+        }
+    }
     if (direct_ahead_) {
         if (n <= 0 || layer < 0 || layer >= n_layers_) return;
         constexpr size_t kMaxQueued = 64;
@@ -3462,6 +3591,7 @@ void FileExpertSource::warm(int64_t layer, const int64_t* experts, int64_t n) {
             for (int64_t j = 0; j < n; ++j)
                 if (experts[j] >= 0 && experts[j] < n_expert_) da_q_.push_back({layer, experts[j], epoch});
             while (da_q_.size() > kMaxQueued) {   // the oldest guesses are the likeliest to be late
+                if (g_atr != nullptr) g_atr->emit(atrace::kAheadDrop, da_q_.front().layer, da_q_.front().e, 0, 0, atrace::kDropQueueFull);
                 da_q_.pop_front();
                 da_late_.fetch_add(1, std::memory_order_relaxed);
             }
@@ -3559,7 +3689,11 @@ void RouterLookahead::submit(int64_t layer, const float* x, int64_t n_tok, const
     if (layer + 1 >= (int64_t) routers_.size() || n_tok <= 0 || x == nullptr) return;
     {
         std::lock_guard<std::mutex> lk(mu_);
-        if (busy_ || pending_) { skipped_.fetch_add(1, std::memory_order_relaxed); return; }
+        if (busy_ || pending_) {
+            skipped_.fetch_add(1, std::memory_order_relaxed);
+            if (g_atr != nullptr) g_atr->emit(atrace::kPredSkip, layer + 1, -1, g_atr->window());
+            return;
+        }
         n_tok_ = std::min<int64_t>(n_tok, 8);
         std::memcpy(x_.data(), x, (size_t) (n_tok_ * n_embd_) * sizeof(float));
         layer_ = layer + 1;
@@ -3567,6 +3701,7 @@ void RouterLookahead::submit(int64_t layer, const float* x, int64_t n_tok, const
         sub_gen_ = gen_.load(std::memory_order_relaxed);
         pending_ = true;
     }
+    if (g_atr != nullptr) g_atr->emit(atrace::kSubmit, layer + 1, n_tok, g_atr->window());
     cv_.notify_one();
 }
 
@@ -3670,6 +3805,7 @@ void RouterLookahead::run() {
     std::vector<int32_t> order((size_t) n_expert_);
     std::vector<int64_t> want;
     std::vector<float> wconf;   // 149-prefetch: per wanted expert, its best rank's confidence (warm_scored)
+    std::vector<uint8_t> atr_rank;   // STRATA_AHEAD_TRACE: per wanted expert, its best rank among the tokens
     for (;;) {
         int64_t layer, nt;
         const int32_t* host_res;
@@ -3694,6 +3830,7 @@ void RouterLookahead::run() {
         layer = layer0 + dj;
         want.clear();
         wconf.clear();
+        atr_rank.clear();
         const bool scored = src_->wants_scores();
         // The router dot is AVX2 (kq_avx2.cpp); a CPU without AVX2 (the experimental older-CPU builds) takes the AVX1
         // one (kq_avx1.cpp) or, without AVX, the same sums in plain C++.  From the Strata_Dirigo fork (rwkeyes): an
@@ -3748,6 +3885,11 @@ void RouterLookahead::run() {
                     const float c = (float) (k_ - j) / (float) k_ * (dj == 0 ? 1.0f : std::pow(0.5f, (float) dj));
                     if (it == want.end()) { want.push_back(e); wconf.push_back(c); }
                     else if (scored && c > wconf[(size_t) (it - want.begin())]) wconf[(size_t) (it - want.begin())] = c;
+                    if (g_atr != nullptr) {
+                        const size_t w = (size_t) (std::find(want.begin(), want.end(), e) - want.begin());
+                        if (w == atr_rank.size()) atr_rank.push_back((uint8_t) j);
+                        else if ((uint8_t) j < atr_rank[w]) atr_rank[w] = (uint8_t) j;
+                    }
                 }
                 if (stats_on_ && dj == 0)
                     for (int s = 0; s < 3; ++s)
@@ -3777,6 +3919,10 @@ void RouterLookahead::run() {
             for (int64_t i = 0; i < 3 * words_; ++i)
                 pmask_[(size_t) (layer * 3 * words_ + i)].store(sm[(size_t) i], std::memory_order_relaxed);
             pstamp_[(size_t) layer].store(sgen + 1, std::memory_order_release);
+        }
+        if (g_atr != nullptr) {
+            const uint64_t atr_t = g_atr->now_ns(), atr_w = g_atr->window();
+            for (size_t q = 0; q < want.size(); ++q) g_atr->emit_at(atr_t, atrace::kPredict, layer, want[q], atr_w, (uint32_t) dj, atr_rank[q]);
         }
         if (scored) src_->warm_scored(layer, want.data(), wconf.data(), (int64_t) want.size(), dj + 1);
         else src_->warm(layer, want.data(), (int64_t) want.size());
@@ -5452,6 +5598,13 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         d.fail_layer = d.layers;
         return;
     }
+    if (g_atr != nullptr) {   // the router has decided this layer
+        if (d.layers == 0 && g_atr->next_window() == 1) {
+            g_atr->emit(atrace::kMeta, -1, d.n_expert, 0, 0, atrace::kFormatVersion);
+            g_atr->request_pin(+[] { strata::aux_cpus::pin_current_thread(); });
+        }
+        g_atr->emit(atrace::kLayerBegin, d.layers, n_tok, g_atr->window(), 0, (uint16_t) k);
+    }
     if (d.lookahead != nullptr) {
         if (d.lookahead->stats_on()) {
             if (d.layers == 0) d.lookahead->stats_window_start();
@@ -5722,6 +5875,32 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     // claimed (busy, then young) until the dispatch has joined its reads and run every batch.
     static thread_local std::vector<int64_t> miss;
     static thread_local std::vector<uint8_t> mstate;   // per miss: 0 ready, 1 being read, 2 landed, 3 computed
+    if (g_atr != nullptr) {   // measurement only: what the router asked for outside VRAM, before read-through can move an expert's tier
+        static thread_local std::vector<int16_t> atr_first;
+        atr_first.assign((size_t) d.n_expert, -1);
+        uint8_t atr_best[kMaxWindowEntries];
+        uint16_t atr_entries[kMaxWindowEntries];
+        for (int64_t i = 0; i < n_tok * k; ++i) {
+            if (ids[i] < 0 || ids[i] >= d.n_expert) continue;
+            int16_t& f = atr_first[(size_t) ids[i]];
+            if (f < 0) {
+                f = (int16_t) i;
+                atr_best[i] = (uint8_t) (i % k);
+                atr_entries[i] = 1;
+            } else {
+                atr_best[f] = std::min(atr_best[f], (uint8_t) (i % k));
+                ++atr_entries[f];
+            }
+        }
+        for (int64_t i = 0; i < n_tok * k; ++i) {
+            if (ids[i] < 0 || ids[i] >= d.n_expert || atr_first[(size_t) ids[i]] != (int16_t) i) continue;
+            uint16_t tier = 0;
+            if (kind[i] == -1) tier = d.src->in_ram_tier(d.layers, ids[i]) ? atrace::kTierRam : atrace::kTierFile;
+            else if (kind[i] == -2) tier = atrace::kTierSkipped;
+            else if (kind[i] == 1) tier = atrace::kTierPcie;
+            if (tier != 0) g_atr->emit(atrace::kNeed, d.layers, ids[i], atr_best[i], atr_entries[i], tier);
+        }
+    }
     miss.clear();
     int64_t npend = 0;
     double cold_r_ms = 0;
@@ -5737,6 +5916,8 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
             const auto r0 = std::chrono::steady_clock::now();
             if (ram_through_env()) d.src->through_context(ids, n_tok * k, d.usage.empty() ? nullptr : d.usage.data() + (size_t) d.layers * (size_t) d.n_expert, n_tok);
             npend = d.src->prefetch_begin(d.layers, miss.data(), (int64_t) miss.size(), mstate.data());
+            if (g_atr != nullptr)
+                g_atr->emit(atrace::kIssue, d.layers, npend, (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - r0).count());
             if (npend > 0 && d.cold_mode == 2) {   // measure: every read first, as mode 0 does
                 d.src->prefetch_end();
                 for (uint8_t& s : mstate) if (s == 1) s = 2;
@@ -5866,12 +6047,16 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         if (std::none_of(mstate.begin(), mstate.end(), [](uint8_t s) { return s == 2; })) {
             const auto w0 = std::chrono::steady_clock::now();
             (void) d.src->wait_landed(d.layers, miss.data(), (int64_t) miss.size(), mstate.data());
-            d.ms_cold_wait += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - w0).count();
+            const auto atr_w1 = std::chrono::steady_clock::now();
+            d.ms_cold_wait += std::chrono::duration<double, std::milli>(atr_w1 - w0).count();
+            if (g_atr != nullptr) g_atr->emit(atrace::kWait, d.layers, -1, (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(atr_w1 - w0).count());
         }
     }
     }
     if (npend > 0) {
+        const auto atr_e0 = g_atr != nullptr ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         d.src->prefetch_end();
+        if (g_atr != nullptr) g_atr->emit(atrace::kEndWait, d.layers, -1, (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - atr_e0).count());
         const FileExpertSource* fs = dynamic_cast<const FileExpertSource*>(d.src);
         const double r_ms = d.cold_mode == 2 ? cold_r_ms : (fs != nullptr ? fs->async_fill_us() / 1e3 : 0.0);
         ++d.cold_layers;
@@ -5907,6 +6092,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         }
     }
     const auto c4 = std::chrono::steady_clock::now();
+    if (g_atr != nullptr) g_atr->emit(atrace::kLayerEnd, d.layers, npend, (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(c4 - c0).count());
     pt("ran");
     // STRATA_LAYER_TRACE=<path> (measurement only): one line per layer of a window, for offline scheduling models:
     // layer tokens experts start_us host_us cold_read_us cold_wait_us cold_landed_us, then per distinct expert id:kind:tier:entries:best_rank
