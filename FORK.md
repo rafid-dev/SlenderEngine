@@ -42,6 +42,7 @@ This has only been measured on the PC above. Other cards and CPUs may gain less 
 | **Kept reader threads:** read overlap no longer creates threads for every layer, which had used up its gain | `STRATA_COLD_KEPT_READERS=1`, `STRATA_COLD_READER_CPU=<first cpu>` | No | `src/core/expert_source.cpp` |
 | **Parallel RAM moves during the draft** | `STRATA_RAM_ADAPT_PAR=1`, `STRATA_RAM_ADAPT_BG=1` | No | `src/program/generate.cpp`, `src/core/expert_source.cpp` |
 | **Read-through RAM tier:** a missed expert's read lands straight in the RAM place of the layer's least used expert, instead of being copied there later. +5-13% at 10 GiB here, -19% at 14 GiB | `STRATA_RAM_THROUGH=1`, `STRATA_RAM_THROUGH_VERIFY=N` checks the tier against the file | No. `FAST-SETUP.bat` writes it at 10 GiB or below | `src/core/expert_source.cpp`, `src/program/generate.cpp` |
+| **K/V-tail lending:** the part of the pinned K/V copy that a request can't reach holds extra RAM-tier experts, so no new RAM is used. SSD misses -27%, short decode +11%, answers byte-identical at temperature 0 | `STRATA_KV_LEND=1` | No | `src/core/expert_source.cpp`, `src/program/generate.cpp` |
 
 ## Settings used for the result
 
@@ -61,6 +62,8 @@ set STRATA_COLD_READER_CPU=22
 set STRATA_PARTIAL_PIN=1
 set STRATA_RAM_ADAPT_PAR=1
 set STRATA_RAM_ADAPT_BG=1
+rem each SSD read is handed over as it lands, not in batches of 16
+set STRATA_DIRECT_BATCH=1
 ```
 
 Engine args: `--pool-workers 7 --spec 4 --spec-min-p 0.5 --adapt-swaps 24 --resident-budget-gib 10 --conversation-cache-mib 0 --max-context 262144 --kv int8`.

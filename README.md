@@ -6,6 +6,18 @@ This fork of [Strata](https://github.com/Niko1221/Strata) is tuned for Qwen3.8-F
 
 *Written by Qwen3.8-Flash-Next IQ3_S running locally on this fork, through OpenCode, on the PC below. Recorded frame by frame at 4K, so it plays smoother than the page runs live.*
 
+## Updates
+
+### 2026-11-06
+
+Measured on the PC under [Speed](#speed), with the model card's sampling. Speeds are text generation in tok/s, and each one says which expert skip it ran at.
+
+- **Skip 0 in the setup we run.** No missed expert is skipped, so skipping no longer changes answers. It costs about 22% against Strata's default skip 7 (35.9 against 45.9 tok/s). The tables further down are still at skip 7, and `FAST-SETUP.bat` still leaves the engine's skip 7. Add `set STRATA_ROUTE_TAIL_SKIP=0` for skip 0.
+- **`--pcie-frac 0`.** The CPU computes every expert held in RAM, so the GPU no longer pulls them over PCIe in the middle of its work. At skip 0 each step took 7% less time: 29.1 to 33.9 tok/s after a 50K prompt, and 29.1 to 32.7 on a follow-up, 3 runs each. Only rounding changes, because the CPU and GPU round differently. `FAST-SETUP.bat` doesn't write it yet, so add it to the engine args.
+- **K/V lending, new (`STRATA_KV_LEND=1`).** The part of the pinned K/V memory a request can't reach holds extra experts, so it uses no new RAM. At skip 0, 6 runs each: 27% fewer SSD reads, 9.7% less time a step, and 37.9 to 42.2 tok/s on short answers (+11%). Answers stayed byte-identical at temperature 0, up to a 178K prompt. Less memory is free to lend as the context grows: 3.06 GiB on short requests, 2.45 GiB at 50K. It's off unless you set it.
+- **`STRATA_DIRECT_BATCH=1`.** Each SSD read is handed over as soon as it lands, instead of in groups of 16, so nothing waits on the rest of its group (5.4 ms of waiting a step down to 0.15). At skip 0 with K/V lending, 8 runs at 16 against 3 at 1: 34.1 to 38.9 tok/s after a 50K prompt (+13%; ranges 31.2-37.4 and 37.9-40.2), 35.2 to 39.3 on a follow-up (+11%), and about +4% on short answers, which is within noise. Each read takes a little longer on its own, but less time is spent waiting. It only changes when a read is used, never the arithmetic. A friend's RTX 4060 8 GB laptop with 32 GB measured about +6%. `FAST-SETUP.bat` now writes it.
+- **The setup we run now:** skip 0, `--pcie-frac 0`, K/V lending and `STRATA_DIRECT_BATCH=1`. About 44-45 tok/s on short answers and 38-40 after a 50K prompt.
+
 ## Speed
 
 The speed and memory tables come from one PC: i7-14700KF, 32 GB DDR5-6000, RTX 4070 Ti 12 GB, two 990 PRO 1 TB, Windows 11 26H2. Your numbers will differ.
