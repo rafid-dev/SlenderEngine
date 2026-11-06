@@ -3,6 +3,7 @@
 #include "strata/core/expert_nibble.hpp"
 #include "strata/core/foresight_swap.hpp"
 #include "strata/core/on_device.hpp"
+#include "strata/core/ple_residency.hpp"
 #include "strata/platform/aux_cpus.hpp"
 #include "strata/platform/thread_name.hpp"
 #include "strata/core/remote_experts.hpp"
@@ -3213,14 +3214,8 @@ bool FileExpertSource::read_direct(const Fill* fills, size_t n) const {
         const Req& r = sc.req[q];
         uint8_t* to = r.out != nullptr ? r.out : sc.buf + r.pos;
         constexpr uint64_t kSplitMin = 256ull << 10;
-        // STRATA_EXPERTS_MIRROR_SHARE (default 0.5): the mirror's part of each read.  Two unequal drives finish together
-        // when it matches the mirror's share of their combined speed (a 7.1 + 3.5 GB/s pair: 0.33); at 0.5 the slower one paces both.
-        static const double mirror_share = [] {
-            const char* e = std::getenv("STRATA_EXPERTS_MIRROR_SHARE");
-            return e != nullptr ? std::clamp(std::atof(e), 0.05, 0.95) : 0.5;
-        }();
         if (direct_mirror_ != nullptr && r.size >= kSplitMin) {
-            const uint64_t half = (uint64_t) ((double) r.size * (1.0 - mirror_share)) / kSector * kSector;
+            const uint64_t half = r.size / 2 / kSector * kSector;
             sc.io.push_back({r.h, r.a0, half, to, q});
             sc.io.push_back({(HANDLE) direct_mirror_, r.a0 + half, r.size - half, to + half, q});
         } else {
@@ -4767,6 +4762,14 @@ bool FileExpertSource::pin_cache_complement(
             }
 #endif
             const int64_t done = layers_done.fetch_add(1) + 1;
+#if defined(_WIN32)
+            // R5070: the copy reads through the mapped view, and Windows counts those file pages in this process's working
+            // set, not as available: on the owner's 64 GB PC (8 GiB headroom asked for) available RAM fell to 0.9 GiB for
+            // ~10 s during the copy.  Every 4 layers the mapped pages go to the standby list (VirtualUnlock on pages that
+            // are not locked does exactly that; the same call runs once after the copy below).  No data changes.
+            if (done % 4 == 0 && direct_.empty() && maps_.empty() && !unmapped_) (void) VirtualUnlock((LPVOID) base_, (SIZE_T) mapped_bytes_);
+            if (done % 4 == 0 && direct_.empty()) for (const Map& m : maps_) if (!m.closed) (void) VirtualUnlock((LPVOID) m.base, (SIZE_T) m.bytes);
+#endif
             if (done % 8 == 0 || done == n_layers_)
                 std::fprintf(stderr, "FileExpertSource: copied cache complement through layer %lld/%lld (%.2f GiB, %.0f s)\n",
                              (long long) done, (long long) n_layers_, (double) copied.load() / 1073741824.0,
@@ -5229,71 +5232,6 @@ bool FileExpertSource::replace_resident(int64_t layer, int64_t in, int64_t out) 
                        std::memory_order_relaxed);
     file_read_bytes_.fetch_add(bytes, std::memory_order_relaxed);
     return install_resident(layer, in, out, ram_adapt_buf_.data());
-}
-
-void FileExpertSource::balance_resident(uint64_t low, uint64_t high, uint64_t step) {
-#if defined(_WIN32)
-    if (!complement_ready_ || complement_host_ == nullptr || exchange_storage_.active() || !staged_.empty() ||
-        complement_locked_ == 0 || step == 0) return;
-    if (tier_end_ == 0) tier_end_ = complement_bytes_;
-    uint64_t avail = 0;
-    if (!available_memory_bytes(avail)) return;
-    const uint64_t floor = complement_lock_off_;
-    constexpr uint64_t kPage = 4096;
-    uint8_t* host = (uint8_t*) complement_host_;
-    const uint64_t start_end = tier_end_;
-    while (avail < low && tier_end_ > floor) {
-        const uint64_t target = tier_end_ - std::min<uint64_t>(step, tier_end_ - floor);
-        uint64_t start = tier_end_;
-        for (size_t i = 0; i < complement_offsets_.size(); ++i) {
-            const uint64_t at = complement_offsets_[i];
-            if (at == kNoComplement || at < floor || at >= tier_end_ || at + layer_blob_bytes_[i / (size_t) n_expert_] <= target) continue;
-            tier_released_.emplace_back(i, at);
-            complement_offsets_[i] = kNoComplement;
-            start = std::min(start, at);
-        }
-        const uint64_t a = ((uint64_t) (uintptr_t) (host + start) + kPage - 1) / kPage * kPage;
-        const uint64_t b = (uint64_t) (uintptr_t) (host + tier_end_) / kPage * kPage;
-        if (b > a) {
-            (void) VirtualUnlock((LPVOID) (uintptr_t) a, (SIZE_T) (b - a));   // FALSE / ERROR_NOT_LOCKED also trims
-            using Discard = DWORD(WINAPI*)(PVOID, SIZE_T);
-            static const Discard discard = (Discard) (void*) GetProcAddress(GetModuleHandleA("kernel32.dll"), "DiscardVirtualMemory");
-            if (discard == nullptr || discard((PVOID) (uintptr_t) a, (SIZE_T) (b - a)) != ERROR_SUCCESS)
-                (void) VirtualAlloc((LPVOID) (uintptr_t) a, (SIZE_T) (b - a), MEM_RESET, PAGE_READWRITE);
-        }
-        tier_end_ = start;
-        tier_last_release_ = std::chrono::steady_clock::now();
-        if (!available_memory_bytes(avail)) break;
-    }
-    if (tier_end_ != start_end) {
-        std::fprintf(stderr, "strata serve: RAM tier: released %.2f GiB, now %.2f GiB (%.2f GiB available, wanted %.2f)\n",
-                     (double) (start_end - tier_end_) / 1073741824.0, (double) tier_end_ / 1073741824.0,
-                     (double) avail / 1073741824.0, (double) low / 1073741824.0);
-        return;
-    }
-    if (tier_released_.empty() || avail < high ||
-        std::chrono::steady_clock::now() - tier_last_release_ < std::chrono::seconds(60)) return;
-    std::sort(tier_released_.begin(), tier_released_.end(), [](const auto& x, const auto& y) { return x.second < y.second; });
-    uint64_t back = 0;
-    size_t done = 0;
-    for (; done < tier_released_.size() && back < step; ++done) {
-        const auto [i, at] = tier_released_[done];
-        const uint64_t bytes = layer_blob_bytes_[i / (size_t) n_expert_];
-        // this expert may have come back another way (a RAM move): its old place then stays empty for now
-        if (complement_offsets_[i] == kNoComplement) {
-            if (!copy_from_files((int64_t) (i / (size_t) n_expert_), (int64_t) (i % (size_t) n_expert_), host + at)) break;
-            complement_offsets_[i] = at;
-        }
-        back += bytes;
-        tier_end_ = std::max(tier_end_, at + bytes);
-    }
-    tier_released_.erase(tier_released_.begin(), tier_released_.begin() + (std::ptrdiff_t) done);
-    if (done > 0)
-        std::fprintf(stderr, "strata serve: RAM tier: brought back %.2f GiB, now %.2f GiB (%.2f GiB available)\n",
-                     (double) back / 1073741824.0, (double) tier_end_ / 1073741824.0, (double) avail / 1073741824.0);
-#else
-    (void) low; (void) high; (void) step;
-#endif
 }
 
 bool FileExpertSource::replace_resident_staged(int64_t layer, int64_t in, int64_t out) {
@@ -5911,15 +5849,6 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         // only at rank >= R (the smallest weights of the top-10) is neither copied nor computed; its contribution is
         // zero, without renormalisation (the others keep the weight the router gave them).  Less PCIe and CPU work.
         const int tail_rank = tail_skip_rank();
-        // STRATA_ROUTE_TAIL_SKIP_FILE=R (opt-in, 1-9, changes the output): the same skip from rank R up, but only for an expert that
-        // would be read from the file.  One in the RAM tier keeps the STRATA_ROUTE_TAIL_SKIP rank.  Needs that skip on.
-        static const int tail_file_rank = [] {
-            const char* v = std::getenv("STRATA_ROUTE_TAIL_SKIP_FILE");
-            const int r = v != nullptr ? std::atoi(v) : 0;
-            if (r > 0 && r < 10) std::fprintf(stderr, "strata serve: STRATA_ROUTE_TAIL_SKIP_FILE=%d is on: a file read routed at rank %d or lower by every token of a window is skipped\n", r, r);
-            return r > 0 && r < 10 ? r : 0;
-        }();
-        const int tail_low = tail_file_rank > 0 && tail_file_rank < tail_rank ? tail_file_rank : tail_rank;
         bool skip_d[kMaxWindowEntries];
         for (int q = 0; q < nd; ++q) skip_d[q] = false;
         if (tail_rank > 0 && d.peer == nullptr && d.remote_count == 0) {
@@ -5932,9 +5861,8 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
             }
             for (int q = 0; q < nd; ++q) {
                 const int32_t e = ids[distinct[q]];
-                if (e < 0 || e >= d.n_expert || minr[q] < tail_low) continue;
+                if (e < 0 || e >= d.n_expert || minr[q] < tail_rank) continue;
                 if (d.host_res[(size_t) d.layers * (size_t) d.n_expert + (size_t) e] >= 0) continue;   // resident
-                if (minr[q] < tail_rank && d.src->in_ram_tier(d.layers, e)) continue;   // STRATA_ROUTE_TAIL_SKIP_FILE: in RAM, so kept
                 skip_d[q] = true;
                 --nmiss;
                 ++d.tail_experts;
@@ -6915,12 +6843,26 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
     // certain to end that way: refused, with the numbers.  Less RAM available than the arena (another program, an
     // engine still exiting) is only a warning - the OS may make room - per the recommend-not-force rule.
     ram_warning_.clear();
+    ram_short_ = false;
     // (a shared arena, --shared-expert-arena, may already be in RAM for another engine: not checked)
     if (detail::HostMemory hm; shared_arena_file.empty() && detail::host_available_memory(hm)) {
-        const uint64_t need = want + (uint64_t) blob;
+        // --ram-keep-gib W: the arena is chosen only if W GiB stay free after it, so its need here is the arena plus W
+        const uint64_t need = arena_need_with_keep(want + (uint64_t) blob, ram_keep_bytes);
+        // under a hard limit the arena also needs the headroom (the engine's own memory comes on top of it, and the arena is never given back)
+        const uint64_t limit_need = arena_hard_limit_need(want + (uint64_t) blob, ram_keep_bytes, hard_limit_headroom_bytes, fall_back_when_ram_short);
         const double gib = 1073741824.0;
         char buf[512];
-        if (hm.cgroup_limit < need) {
+        char keep_note[96] = "";
+        if (ram_keep_bytes > 0)
+            std::snprintf(keep_note, sizeof keep_note, ", with the %.2f GiB --ram-keep-gib asks to leave free", (double) ram_keep_bytes / gib);
+        if (arena_ram_verdict(limit_need, ~uint64_t{0}, hm.cgroup_limit, fall_back_when_ram_short) != ArenaRamVerdict::Load) {
+            if (fall_back_when_ram_short) {   // #4846: the caller reads the experts from the file instead of refusing
+                std::snprintf(buf, sizeof buf, "it needs %.2f GiB (with the %.2f GiB the engine's own memory and the RAM to keep take on top of it) and this process's memory limit is %.2f GiB",
+                              (double) limit_need / gib, (double) (limit_need - (want + (uint64_t) blob)) / gib, (double) hm.cgroup_limit / gib);
+                err = buf;
+                ram_short_ = true;
+                return false;
+            }
             std::snprintf(buf, sizeof buf,
                           "ArenaExpertSource: the expert arena needs %.2f GiB of RAM but this process's memory limit "
                           "(cgroup memory.max / memory.limit_in_bytes) is %.2f GiB: it would be killed while loading. "
@@ -6933,7 +6875,8 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
         if (hm.available < need) {
             // #4051: the shortfall is often an engine that was still exiting (the code's own example), a few seconds
             // from giving its RAM back: wait for it, not for ever, and say so.  STRATA_ARENA_RAM_WAIT_S changes the
-            // seconds (0 loads at once, as before this wait).  The load then goes on either way - it only warns.
+            // seconds (0 loads at once, as before this wait).  Still short after it (and after the give-back below): the caller's
+            // --mmap-experts fallback (#4846) when it asked for one, otherwise the load goes on and only warns.
             double wait_s = 20.0;
             if (const char* w = std::getenv("STRATA_ARENA_RAM_WAIT_S"); w != nullptr && w[0] != '\0') {
                 char* end = nullptr;
@@ -6948,16 +6891,41 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
                     [](uint64_t& a) { detail::HostMemory h; if (!detail::host_available_memory(h)) return false; a = h.available; return true; },
                     [](double s) { std::this_thread::sleep_for(std::chrono::duration<double>(s)); },
                     [&](double w, uint64_t a) {
-                        std::fprintf(stderr, "strata generate: the expert arena needs %.2f GiB of RAM and %.2f GiB is "
+                        std::fprintf(stderr, "strata generate: the expert arena needs %.2f GiB of RAM%s and %.2f GiB is "
                                              "available; waiting up to %.0f s for it (another engine still exiting?) - "
                                              "%.0f s so far (STRATA_ARENA_RAM_WAIT_S changes this)\n",
-                                     (double) need / gib, (double) a / gib, wait_s, w);
+                                     (double) need / gib, keep_note, (double) a / gib, wait_s, w);
                     },
                     waited, avail);
                 if (came)
                     std::fprintf(stderr, "strata generate: %.2f GiB of RAM is available now (after %.1f s): loading the "
                                          "expert arena\n", (double) avail / gib, waited);
                 hm.available = avail;
+            }
+            if (hm.available < need && give_back_ram) {
+                // #4846: the shortfall survived the wait.  A lock the engine took by itself (the PLE table's residency lock) is
+                // given back before the registration starts: its pages stay cached, the OS may take them for the arena.
+                const uint64_t freed = give_back_ram();
+                if (freed > 0) {
+                    detail::HostMemory h2;
+                    if (detail::host_available_memory(h2)) {
+                        std::fprintf(stderr, "strata generate: the expert arena needs %.2f GiB of RAM and %.2f GiB was available: "
+                                             "gave back %.2f GiB of locked RAM, %.2f GiB is available now\n",
+                                     (double) need / gib, (double) hm.available / gib, (double) freed / gib, (double) h2.available / gib);
+                        hm.available = h2.available;
+                    }
+                }
+            }
+            if (arena_ram_verdict(need, hm.available, ~uint64_t{0}, fall_back_when_ram_short) == ArenaRamVerdict::FallBack) {
+                // #4846 (owner 11-01): still short after the wait and the give-back.  Registering anyway can stall the whole host in
+                // reclaim until it is power-cycled: nothing is allocated, the caller takes the --mmap-experts source for this run.
+                std::snprintf(buf, sizeof buf,
+                              "it needs %.2f GiB%s and %.2f GiB is available (%.2f GiB short%s)",
+                              (double) need / gib, keep_note, (double) hm.available / gib, (double) (need - hm.available) / gib,
+                              waited > 0.0 ? ", after waiting" : "");
+                err = buf;
+                ram_short_ = true;
+                return false;
             }
             if (hm.available < need) {
                 std::snprintf(buf, sizeof buf,
