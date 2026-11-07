@@ -35,6 +35,7 @@ runs are not supported. Use the [package table](#ready-made-packages) to match y
 | RX 7800 XT / 7700 XT | gfx1101 | Validated by its owner |
 | RX 7600 XT | gfx1102 | Reported working, not validated |
 | RX 6800 / 6900 series, RX 6700 XT | gfx1030, gfx1031 | Has a package, not tested on a real card ([RDNA2](#rdna2-gfx1030)) |
+| RX 6600 / 6600 XT | gfx1032 | Built from source on Windows and tested on an RX 6600 ([gfx1032 on Windows](#gfx1032-rx-6600-on-windows)); no package |
 | Ryzen AI Max (Strix Halo) | gfx1151 | [STRIX_HALO.md](STRIX_HALO.md) |
 | Radeon 780M / 760M | gfx1103 | Linux, opt-in build: [RADEON_780M.md](RADEON_780M.md) |
 | Instinct MI50 / MI60, Radeon VII | gfx906 | Source build, community-tested ([gfx906](#gfx906-instinct-mi50--mi60-radeon-vii-wave64-built-from-source)) |
@@ -535,13 +536,34 @@ On a 16 GB card keep the defaults for `--pcie-frac` and `--adapt-every`; the 790
 
 The 16 GB card holds 6,310 expert slots at 16K context and 5,247 at 131,072.
 
+### gfx1032 (RX 6600) on Windows
+
+Built from source on Windows 11 with `tools\hipuild_windows.bat` (2026-11-07): `set STRATA_HIP_ARCHS=gfx1032` (and
+`set STRATA_NO_VISION=1` for a first build without the picture readers). AMD's TheRock wheel index has Windows device
+packages for gfx1032 (`rocm-sdk-device-gfx1032`), including one for the pinned 10.2.0a20260930, so no override is needed.
+hipBLASLt ships no gfx1032 table, so the plain hipBLAS path runs. The engine reports
+`AMD Radeon RX 6600, gfx1032 wave32 (compiled for gfx1032), 14 CUs` and a Windows budget of 7,379 of 8,176 MiB.
+
+- **Antivirus:** Bitdefender blocked the linker from writing `native_expert_parity.exe` (`lld-link: ... permission
+  denied`), so the 28 expert parity tests did not run. An exclusion for `build-hip-win` fixed it; all 28 pass.
+- **Unit tests:** 219 of 223 pass. `vmm_test` expects more than 8 GiB of mappable VRAM; `ple_parity` needs a Flash-Next
+  Q2_0 file; `conversation_copy_streams_test` measured 24 MB for the first copy stream against its 16 MB limit;
+  `hip_handoff` passes its kernel doorbell (what the engine uses, `doorbell_publish`) and times out on the copy fallback
+  (`cudaMemcpyAsync` into mapped memory, then the ring): on this driver those copies don't reach the host before the stream
+  is synchronized. Keep the publish kernel on (the default) on AMD under Windows.
+- **The 35B engine on 8 GB:** see [QWEN36.md](QWEN36.md#an-8-gb-card-with-32-gb-of-ram). On gfx103x it sets
+  `STRATA_DENSE_MMQ=1` by itself (pp4096 533 -> 917 tok/s on this card: rocBLAS's FP16-in / FP32-out GEMMs run generic
+  kernels here, see the RDNA2 section), and under 12 GiB `STRATA_Q8_PACKED=0`.
+- **Allocation order matters:** a 0.6 GiB buffer allocated last, near the process's budget, made every prompt kernel 2.4x
+  slower (likely placed in system memory by Windows). The 35B engine allocates its prompt buffers before the expert slots.
+
 Other gfx103x and RDNA2-adjacent cards (community reports):
 
 | Card | Report |
 | --- | --- |
 | gfx1031, RX 6700 XT 12 GB (#524, #1027) | Setup knows it (`gfx103X-all` wheels, unvalidated). IQ2_XS on ROCm 7.2.4: decode 30-32 tok/s, prompt about 300 tok/s, 6 of 6 needles. The default list of `build_windows.bat` includes it. |
 | RX 6800M 12 GB, Windows, self-built (#915, #1078) | Q2_0: decode 9-27 tok/s, prompt 50-114 tok/s; experts stream from disk with 31 GB RAM |
-| gfx1032, RX 6600 / 6600 XT | Unvalidated. Ran under Windows as the helper expert GPU of an RX 6800 ([SECOND_GPU.md](SECOND_GPU.md)): +8-18% decode over the 6800 alone. No report as a primary card. |
+| gfx1032, RX 6600 / 6600 XT | As the only card, Windows 11, 32 GB RAM, built from source with `STRATA_HIP_ARCHS=gfx1032` (2026-11-07): 219 of 223 unit tests pass (see [gfx1032 on Windows](#gfx1032-rx-6600-on-windows)); Qwen3.6-35B-A3B UD-Q4_K_M at 32K context decodes at 26-27 tok/s with thinking on and reads a 24K prompt at 420 tok/s ([QWEN36.md](QWEN36.md#an-8-gb-card-with-32-gb-of-ram)). Also ran under Windows as the helper expert GPU of an RX 6800 ([SECOND_GPU.md](SECOND_GPU.md)): +8-18% decode over the 6800 alone. |
 | gfx1150, Radeon 890M (#1217) | Builds and runs as an unvalidated target. MINISFORUM N5 PRO, 96 GB, TheRock ROCm 7.14.1, IQ3_XXS: decode 15-19 tok/s, prompts 125-130 tok/s on plain hipBLAS and 1.5-1.7x faster with `gfx1150-hipblaslt-100401.txt`. Setup does not install for it: build with `-DCMAKE_HIP_ARCHITECTURES=gfx1150` and point `STRATA_HIPBLASLT_TUNING` at the table. [Report](../bench/results/2026-10-07-community-gfx1150/README.md). |
 | gfx1152, Radeon 860M / 840M (#1625) | Builds with a warning; portable kernels; no report; setup does not install for it |
 

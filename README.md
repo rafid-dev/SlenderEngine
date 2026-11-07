@@ -18,7 +18,7 @@ Run **Qwen3.8-Flash-Next IQ3_S locally on a Windows PC with 32 GB of RAM**. Slen
 
 Install [Git for Windows](https://git-scm.com/download/win) and your NVIDIA graphics driver first. Setup can install Python, CMake and Ninja, and offers to install Visual Studio 2022 Build Tools and the CUDA toolkit if they are missing. Installing build tools may ask for Windows administrator permission.
 
-This guide builds the fork from source. For AMD, Mac, Linux or the upstream desktop app, use the [original Strata guides](https://github.com/Niko1221/Strata).
+This guide builds the fork from source. For an AMD RX 6600 (8 GB, gfx1032) with 32 GB of RAM on Windows, see [AMD_HIP.md](docs/AMD_HIP.md) for the HIP build and [QWEN36.md](docs/QWEN36.md#an-8-gb-card-with-32-gb-of-ram) for Qwen3.6-35B-A3B on that card. For other AMD cards, Mac, Linux or the upstream desktop app, use the [original Strata guides](https://github.com/Niko1221/Strata).
 
 ## Easy setup
 
