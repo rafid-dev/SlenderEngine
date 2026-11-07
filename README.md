@@ -8,6 +8,19 @@ This fork of [Strata](https://github.com/Niko1221/Strata) is tuned for Qwen3.8-F
 
 ## Updates
 
+**Where it stands (2026-11-07, 7 runs at skip 0):** about 46 tok/s on short thinking-on answers, 39 after a 50K prompt and 39 on a follow-up. A 50K prompt reads at about 1,970 tok/s. These runs had about 4 GB of RAM free; with 1.6 GB free, the same engine fell to 22 tok/s. The speed tables below are still at skip 7.
+
+### 2026-11-07
+
+Same method as 2026-11-06.
+
+| Change | Switch | Result | Answers |
+|---|---|---|---|
+| Prompts in fewer passes | `STRATA_DENSE_ARENA=1`, `--prefill auto:16384`, a prompt lend cap of 90% | A 50K prompt takes 6 passes over the experts instead of 7: 1,741 → 1,879 tok/s (+7.9%). Prompts whose pass count doesn't drop (29K) read about 2.6% slower | Rounding only: first-token KL 0.0001-0.0024, same top choice |
+
+- The engine now runs the fork's settings by default: skip 0 everywhere, and the switches in both tables except `--pcie-frac 0` on Windows with an NVIDIA card and an IQ pack. `STRATA_FORK_DEFAULTS=0` gives upstream's defaults. See [FORK.md](FORK.md#defaults).
+- `FAST-SETUP.bat` asks how much RAM to use, whether to skip experts (no by default) and which second SSD to use, and picks DFlash2 when its drafter is in `Strata-data\dflash2` (`strata launch --drafting dflash2` downloads it once, 1.2 GB). The stager settings were tuned for two 990 PROs.
+
 ### 2026-11-06
 
 **Method:** the PC under [Speed](#speed), Qwen3.8-Flash-Next IQ3_S at skip 0 (no expert skipped), the model card's sampling. Fresh engine per run, the two settings in mixed order, 3-6 runs each. A change counts when every run of one beats every run of the other. Details are in [FORK.md](FORK.md) and the [worklog](docs/fork/WORKLOG.md).
@@ -20,11 +33,8 @@ This fork of [Strata](https://github.com/Niko1221/Strata) is tuned for Qwen3.8-F
 | Each SSD read used as it lands | `STRATA_DIRECT_BATCH=1` | +9% after a 50K prompt, short answers unchanged | Unchanged (same arithmetic) |
 | In-place prompt stager | `STRATA_STAGER_IN_PLACE=1` and 3 stager settings | Prompt reading +8.5% at 50K up to +21% on short prompts, CPU 87% → 10% busy | Byte-identical |
 | Strata 0.2.11 base with the DFlash2 drafter | `"drafting": "dflash2"` | Follow-ups +5%, 50K prompt reading +11%, thinking-on short answers and 50K level | Same model; sampled text differs per seed |
+| Two 0.2.11 prompt rules off | `STRATA_PREFILL_CPU_SHARE_MAX=1024`, `STRATA_PF_SMALL=0` | ~3K prompts read +5.8% (569 → 602 tok/s), 29K and 50K level | The old fork's arithmetic (the CPU share rule moved answers, KL about 0.011) |
 
-**Where it stands:** about 45 tok/s on short thinking-on answers, 37 after a 50K prompt, 42 on a follow-up and 52 with thinking off. A 50K prompt reads at about 1,700 tok/s. The speed tables below are still at skip 7.
-
-- Since 2026-11-07 the engine runs these settings by default: skip 0 everywhere, and the table's switches except `--pcie-frac 0` on Windows with an NVIDIA card and an IQ pack. `STRATA_FORK_DEFAULTS=0` gives upstream's defaults. See [FORK.md](FORK.md#defaults).
-- `FAST-SETUP.bat` asks how much RAM to use, whether to skip experts (no by default) and which second SSD to use, and picks DFlash2 when its drafter is in `Strata-data\dflash2` (`strata launch --drafting dflash2` downloads it once, 1.2 GB). The stager settings were tuned for two 990 PROs.
 - The DFlash2 drafter is licensed CC BY-NC-ND, so it's for non-commercial use.
 - The fork's off-by-default switches, including PR #1's for 8 GB cards, are all in the 0.2.11 base. See [FORK.md](FORK.md).
 
