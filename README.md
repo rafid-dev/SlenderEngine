@@ -48,7 +48,7 @@ With the same `--spec`, workers and one SSD, Strata ran 24.9 tok/s against this 
 
 Both engines use Strata's default expert skip, which leaves out some low-ranked experts that aren't in VRAM. Turning it off took this fork from 45.9 to 35.9 tok/s. The skip also changes answers. On a fixed set of text, the model's top choice stayed the same at 90.7% of positions, from 84% on docs to 97% on code. That shows how far answers move, not whether they get worse.
 
-The fork's columns include read-through, which puts SSD reads straight into the RAM cache. Setup turns it on at a 10 GiB cache or below. It lost about 19% at 14 GiB on this PC, so it stays off above that.
+The fork's columns include read-through, which puts SSD reads straight into the RAM cache. The engine turns it on with any RAM cache. It lost about 19% at 14 GiB on this PC because that size left too little RAM for the driver to lock the cache, not because of the size itself.
 
 Answer quality wasn't measured, and `--spec 4` changes the wording of answers. [FORK.md](FORK.md) explains the changes, settings and measurements. [The worklog](docs/fork/WORKLOG.md) records every test, including the ones that failed.
 

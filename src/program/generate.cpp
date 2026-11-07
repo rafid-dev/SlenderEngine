@@ -3336,8 +3336,9 @@ static void exit_if_gpu_fatal(const std::string& err) {
 //    on the PC this was tuned on), and v0.2.11's prompt arithmetic changes off (the CPU share stays below 1,024-token chunks,
 //    the small-card unfused prompt path off).
 //  - Windows, NVIDIA, an IQ pack (--pack): the lossless speed switches measured there (answers byte-identical), each of
-//    which steps aside by itself where it doesn't apply.  STRATA_RAM_THROUGH only with --resident-budget-gib 10 or less
-//    (it lost 19% at 14), and 16,384-token prompt chunks (STRATA_PREFILL_AUTO_MAX) only with a RAM budget on a PC of
+//    which steps aside by itself where it doesn't apply.  STRATA_RAM_THROUGH with a RAM tier (--resident-budget-gib) of any
+//    size: its 19% loss at 14 GiB on a 32 GB PC came from memory pressure (the driver could not page-lock the tier, so reads
+//    landed in ordinary memory), not from the tier's size; an RTX 4060 laptop gained 8-13% at 16 GiB.  16,384-token prompt chunks (STRATA_PREFILL_AUTO_MAX) only with a RAM budget on a PC of
 //    28 GB or more: an explicit ceiling skips the #2090 RAM guard, which was measured for the full --resident-experts copy.
 static void apply_fork_defaults(int argc, char** argv) {
     if (!strata::platform::fork_defaults_on()) {
@@ -3372,7 +3373,7 @@ static void apply_fork_defaults(int argc, char** argv) {
                               "STRATA_STAGER_IN_PLACE", "STRATA_DENSE_ARENA"})
             def(n, "1");
         def("STRATA_STAGER_RING", "128");
-        if (budget > 0.0 && budget <= 10.0) def("STRATA_RAM_THROUGH", "1");
+        if (budget > 0.0) def("STRATA_RAM_THROUGH", "1");
         MEMORYSTATUSEX ms{};
         ms.dwLength = sizeof ms;
         if (budget > 0.0 && GlobalMemoryStatusEx(&ms) && ms.ullTotalPhys >= 28ull * 1000 * 1000 * 1000) def("STRATA_PREFILL_AUTO_MAX", "16384");

@@ -318,7 +318,7 @@ def main():
     for k, v in (("--spec", "4"), ("--spec-min-p", "0.5"), ("--resident-budget-gib", f"{budget:g}"), ("--adapt-every", "4"), ("--adapt-swaps", "24"),
                  ("--adapt-async", "1"), ("--kv-resident", "32768"), ("--conversation-cache-mib", "0")):
         set_arg(args, k, v)
-    # The fork's lossless switches (K/V lending, the stager, read-through at 10 GiB or less, one VRAM arena, 16K prompt chunks
+    # The fork's lossless switches (K/V lending, the stager, read-through, one VRAM arena, 16K prompt chunks
     # with a RAM budget ...) and skip 0 are the engine's own defaults now (FORK.md, "Defaults"), so only this PC's settings go here.
     env = {"STRATA_RESIDENT_HEADROOM_GIB": "1.5"}
     if skip != 0:
