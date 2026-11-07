@@ -7,6 +7,7 @@ Setup's files are not changed. Nothing is written with --dry-run. FAST-SETUP.bat
   --dry-run           show what would happen and stop
   --yes               no questions: the settings, and the best second drive unless --no-mirror
   --ram-gib N         GiB of RAM for the experts, without asking (default on a 32 GB PC: 10)
+  --skip N            the expert skip, without asking: 0 (the default, every expert computed) or 7 (faster, answers change)
   --mirror-dir PATH  the folder for the copy of experts.bin (it must be on another physical drive)
   --no-mirror         one drive only
   --verify            compare an existing copy with the original by hash, too
@@ -28,7 +29,7 @@ from pathlib import Path
 HOME = Path(__file__).resolve().parent.parent
 GIB = 1024 ** 3
 MIRROR_SPARE = 5 * GIB
-PATCHED_MARK = b"STRATA_COLD_KEPT_READERS"   # only this fork's engine holds this name
+PATCHED_MARK = b"STRATA_FORK_DEFAULTS"   # only this fork's engine holds this name, from the build that applies its defaults itself
 SETUP_ARGS = "--family qwen --model IQ3_S --build --context 262144 --kv int8 --vision gpu --no-start"
 
 
@@ -229,6 +230,24 @@ def choose_ram(a, ram):
     return pick
 
 
+def choose_skip(a):
+    """The route tail skip: 0 (the fork's default, which the engine applies by itself) or what the person picks."""
+    if a.skip is not None:
+        pick = a.skip
+    elif a.yes:
+        pick = 0
+    else:
+        say("Expert skip: should a missed expert that every token ranks low be skipped (neither read nor computed)?")
+        say("  No (recommended): every expert is computed, so the answers are the full model's.")
+        say("  Yes: about 22% faster text on the PC this was tuned on (45.9 against 35.9 tok/s), but the answers change")
+        say("  (KL 0.081 against no skip, the top choice the same at 90.7% of positions).")
+        ans = input("Skip experts? y/N: ").strip().lower()
+        pick = 7 if ans in ("y", "yes") else 0
+    if not 0 <= pick <= 8:
+        sys.exit("--skip must be between 0 and 8 (0 is off, 7 is upstream's default).")
+    return pick
+
+
 def set_arg(args, name, value):
     if name in args:
         args[args.index(name) + 1] = value
@@ -251,6 +270,7 @@ def main():
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--yes", action="store_true")
     ap.add_argument("--ram-gib", type=float)
+    ap.add_argument("--skip", type=int)
     ap.add_argument("--mirror-dir")
     ap.add_argument("--no-mirror", action="store_true")
     ap.add_argument("--verify", action="store_true")
@@ -270,7 +290,7 @@ def main():
     if not exe.exists():
         sys.exit(f"The engine {exe} is missing. Run: START-HERE.bat {SETUP_ARGS}")
     if PATCHED_MARK not in exe.read_bytes():
-        sys.exit(f"{exe} is a stock engine without this fork's changes. Build this one with: START-HERE.bat {SETUP_ARGS}")
+        sys.exit(f"{exe} is a stock engine, or this fork's from before it applied its own defaults. Build this one with: START-HERE.bat {SETUP_ARGS}")
 
     src = Path(args[args.index("--pack") + 1]) / "experts.bin"
     if not src.exists():
@@ -291,23 +311,18 @@ def main():
     if "RTX 40" not in gpu and "RTX 4" not in gpu:
         say("The RTX 40 kernel table will not apply to this card: other cards may gain less.")
 
+    skip = choose_skip(a)
     vols = volumes()
     mirror = choose_mirror(a, src, vols)
 
     for k, v in (("--spec", "4"), ("--spec-min-p", "0.5"), ("--resident-budget-gib", f"{budget:g}"), ("--adapt-every", "4"), ("--adapt-swaps", "24"),
                  ("--adapt-async", "1"), ("--kv-resident", "32768"), ("--conversation-cache-mib", "0")):
         set_arg(args, k, v)
-    env = {"STRATA_UNBUFFERED_LOAD": "1", "STRATA_RESIDENT_HEADROOM_GIB": "1.5", "STRATA_RAM_ADAPT": "1", "STRATA_COLD_OVERLAP": "1", "STRATA_COLD_KEPT_READERS": "1",
-           "STRATA_PARTIAL_PIN": "1", "STRATA_RAM_ADAPT_PAR": "1", "STRATA_RAM_ADAPT_BG": "1",
-           # Each SSD read is handed over the moment it lands, not in batches of 16: about +9% after a 50K prompt on the PC this was tuned on
-           # (with K/V lending on), no gain on short prompts, about +6% on an RTX 4060 8 GB laptop. It changes only when a read is handed over, not the arithmetic.
-           "STRATA_DIRECT_BATCH": "1",
-           # Skip 0: no missed expert is skipped, so answers aren't changed by it. The engine's default skip 7 was about 22% faster on the PC this
-           # was tuned on (45.9 against 35.9 tok/s), but moved answers by KL 0.081 against skip 0 (top choice the same at 90.7% of positions).
-           "STRATA_ROUTE_TAIL_SKIP": "0"}
-    # Read-through: +5-13% at 10 GiB on the PC this was tuned on. At 14 GiB there it lost 19%, so it stays off above 10 until that's explained.
-    if budget <= 10:
-        env["STRATA_RAM_THROUGH"] = "1"
+    # The fork's lossless switches (K/V lending, the stager, read-through at 10 GiB or less, one VRAM arena, 16K prompt chunks
+    # with a RAM budget ...) and skip 0 are the engine's own defaults now (FORK.md, "Defaults"), so only this PC's settings go here.
+    env = {"STRATA_RESIDENT_HEADROOM_GIB": "1.5"}
+    if skip != 0:
+        env["STRATA_ROUTE_TAIL_SKIP"] = str(skip)
     if cpu["hybrid"]:
         set_arg(args, "--pool-workers", str(len(cpu["workers"])))
         env["STRATA_POOL_CORES"] = ",".join(map(str, cpu["workers"]))
@@ -332,6 +347,8 @@ def main():
     say("Settings:")
     for k, v in env.items():
         say(f"  {k}={v}")
+    say(f"  Expert skip {skip}" + (" (none: every expert computed)" if skip == 0 else " (answers change)"))
+    say("  Plus the fork's defaults, which the engine applies by itself (FORK.md, \"Defaults\"; STRATA_FORK_DEFAULTS=0 turns them off)")
     say(("  DFlash2 drafter" if df2_packs else "  MTP drafter, " + " ".join(args[args.index("--spec"):args.index("--spec") + 2])) +
         f", {budget:g} GiB of experts in RAM, conversations not saved in RAM")
     if a.dry_run:

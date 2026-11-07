@@ -20,6 +20,7 @@
 #include "strata/core/progress.hpp"
 #include "strata/core/on_device.hpp"
 #include "strata/platform/aux_cpus.hpp"
+#include "strata/platform/fork_defaults.hpp"
 
 #include "strata/core/layout.hpp"
 #include "strata/kernels/cpu/expert.hpp"
@@ -1856,7 +1857,9 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
                 std::fprintf(stderr, "prefill: the GGUF experts are %.0f%% in the page cache; the stager takes the RAM profile\n", warm * 100.0);
             }
         }
-        const int threads = stv ? std::clamp(std::atoi(stv), 1, 32) : files ? 32 : std::max(2, std::min(4, hw / 4));
+        // fork default (an IQ pack on Windows, PF-STAGE): 3 copy threads, not 4 - with the in-place reads the drives stay in their fast mode
+        const int threads = stv ? std::clamp(std::atoi(stv), 1, 32) : files ? 32
+                          : std::max(2, std::min(strata::platform::g_fork_pack_defaults ? 3 : 4, hw / 4));
         if (files && std::getenv("STRATA_STAGER_RING") == nullptr) m.stager->kRing = 4 * threads;
         // pp-opt: with files, each thread claims runs of neighbouring blobs and reads them as one request (copy_blobs);
         // STRATA_STAGER_BATCH=1 is the A/B arm (one blob per request, as before)

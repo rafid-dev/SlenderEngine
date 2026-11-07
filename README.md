@@ -23,7 +23,8 @@ This fork of [Strata](https://github.com/Niko1221/Strata) is tuned for Qwen3.8-F
 
 **Where it stands:** about 45 tok/s on short thinking-on answers, 37 after a 50K prompt, 42 on a follow-up and 52 with thinking off. A 50K prompt reads at about 1,700 tok/s. The speed tables below are still at skip 7.
 
-- `FAST-SETUP.bat` writes `STRATA_ROUTE_TAIL_SKIP=0` and `STRATA_DIRECT_BATCH=1`, and DFlash2 when its drafter is in `Strata-data\dflash2` (`strata launch --drafting dflash2` downloads it once, 1.2 GB). Add the other switches by hand ([FORK.md](FORK.md)). The stager settings were tuned for two 990 PROs.
+- Since 2026-11-07 the engine runs these settings by default: skip 0 everywhere, and the table's switches except `--pcie-frac 0` on Windows with an NVIDIA card and an IQ pack. `STRATA_FORK_DEFAULTS=0` gives upstream's defaults. See [FORK.md](FORK.md#defaults).
+- `FAST-SETUP.bat` asks how much RAM to use, whether to skip experts (no by default) and which second SSD to use, and picks DFlash2 when its drafter is in `Strata-data\dflash2` (`strata launch --drafting dflash2` downloads it once, 1.2 GB). The stager settings were tuned for two 990 PROs.
 - The DFlash2 drafter is licensed CC BY-NC-ND, so it's for non-commercial use.
 - The fork's off-by-default switches, including PR #1's for 8 GB cards, are all in the 0.2.11 base. See [FORK.md](FORK.md).
 

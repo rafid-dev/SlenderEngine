@@ -17,6 +17,7 @@
 
 #include "strata/platform/memory.hpp"
 #include "strata/platform/io_priority.hpp"
+#include "strata/platform/fork_defaults.hpp"
 #include "strata/core/adapt_async_default.hpp"
 #include "strata/core/arch_defaults.hpp"
 #include "strata/core/gfx12_chunk.hpp"
@@ -3329,6 +3330,61 @@ static void exit_if_gpu_fatal(const std::string& err) {
     }
 }
 
+// The speed-fork's defaults (include/strata/platform/fork_defaults.hpp, FORK.md "Defaults"): what the fork's own launcher
+// sets, as the engine's defaults.  Each is set only when the caller left it unset; STRATA_FORK_DEFAULTS=0 keeps upstream's.
+//  - Everywhere: the answer-preserving three.  No expert skipped (STRATA_ROUTE_TAIL_SKIP=0: skip 7 moved answers by KL 0.081
+//    on the PC this was tuned on), and v0.2.11's prompt arithmetic changes off (the CPU share stays below 1,024-token chunks,
+//    the small-card unfused prompt path off).
+//  - Windows, NVIDIA, an IQ pack (--pack): the lossless speed switches measured there (answers byte-identical), each of
+//    which steps aside by itself where it doesn't apply.  STRATA_RAM_THROUGH only with --resident-budget-gib 10 or less
+//    (it lost 19% at 14), and 16,384-token prompt chunks (STRATA_PREFILL_AUTO_MAX) only with a RAM budget on a PC of
+//    28 GB or more: an explicit ceiling skips the #2090 RAM guard, which was measured for the full --resident-experts copy.
+static void apply_fork_defaults(int argc, char** argv) {
+    if (!strata::platform::fork_defaults_on()) {
+        std::fprintf(stderr, "strata: STRATA_FORK_DEFAULTS=0: upstream's defaults\n");
+        return;
+    }
+    std::string applied;
+    auto def = [&](const char* name, const char* value) {
+        if (std::getenv(name) != nullptr) return;
+#if defined(_WIN32)
+        _putenv_s(name, value);
+#else
+        setenv(name, value, 0);
+#endif
+        applied += applied.empty() ? "" : " ";
+        applied += std::string(name + 7) + "=" + value;   // without the STRATA_ prefix
+    };
+    def("STRATA_ROUTE_TAIL_SKIP", "0");
+    def("STRATA_PREFILL_CPU_SHARE_MAX", "1024");
+    def("STRATA_PF_SMALL", "0");
+#if defined(_WIN32) && !defined(STRATA_USE_HIP) && !defined(STRATA_GPU_METAL)
+    bool pack = false;
+    double budget = 0.0;
+    for (int i = 1; i + 1 < argc; ++i) {
+        if (std::strcmp(argv[i], "--pack") == 0) pack = true;
+        if (std::strcmp(argv[i], "--resident-budget-gib") == 0) budget = std::atof(argv[i + 1]);
+    }
+    if (pack) {
+        strata::platform::g_fork_pack_defaults = true;
+        for (const char* n : {"STRATA_UNBUFFERED_LOAD", "STRATA_RAM_ADAPT", "STRATA_COLD_OVERLAP", "STRATA_COLD_KEPT_READERS",
+                              "STRATA_PARTIAL_PIN", "STRATA_RAM_ADAPT_PAR", "STRATA_RAM_ADAPT_BG", "STRATA_KV_LEND", "STRATA_DIRECT_BATCH",
+                              "STRATA_STAGER_IN_PLACE", "STRATA_DENSE_ARENA"})
+            def(n, "1");
+        def("STRATA_STAGER_RING", "128");
+        if (budget > 0.0 && budget <= 10.0) def("STRATA_RAM_THROUGH", "1");
+        MEMORYSTATUSEX ms{};
+        ms.dwLength = sizeof ms;
+        if (budget > 0.0 && GlobalMemoryStatusEx(&ms) && ms.ullTotalPhys >= 28ull * 1000 * 1000 * 1000) def("STRATA_PREFILL_AUTO_MAX", "16384");
+    }
+#else
+    (void) argc;
+    (void) argv;
+#endif
+    std::fprintf(stderr, "strata: fork defaults%s%s (STRATA_FORK_DEFAULTS=0 keeps upstream's; a variable set by hand wins)\n",
+                 applied.empty() ? ": all set by hand" : ": ", applied.c_str());
+}
+
 #if defined(STRATA_USE_HIP) && defined(_WIN32)
 static int engine_main(int argc, char** argv) {   // main() is at the end of this file (#3431)
 #else
@@ -3402,6 +3458,7 @@ int main(int argc, char** argv) {
         setenv("CUDA_MODULE_LOADING", "EAGER", 0);
 #endif
     }
+    apply_fork_defaults(argc, argv);   // before anything below reads the environment
     if (launch_blocking())
         std::fprintf(stderr, "warning: CUDA_LAUNCH_BLOCKING=1: the verify windows cannot run with blocking launches, so "
                              "the first one after a prompt hangs until the watchdog ends the engine (#1341). Unset it; "
@@ -6205,7 +6262,7 @@ int main(int argc, char** argv) {
             const char* v = std::getenv("STRATA_PREFILL_LEND_PCT");
             return v ? (int64_t) std::atoi(v)
                      : g_lend_keep != 128 ? (int64_t) 100   // a card too short for the usual loan (see the cache sizing) lends what it must: the cap is for cards with room
-                     : (int64_t) (strata::prefill::Prefill::pinned_share() >= 0.9 ? 90 : 85);
+                     : (int64_t) (strata::prefill::Prefill::pinned_share() >= 0.9 || strata::platform::g_fork_pack_defaults ? 90 : 85);   // fork default: 90 (SIXPASS)
         }();
         auto predict = [&](const std::vector<int64_t>& at, double& held_mass, int64_t& held) -> double {
             // THE CARVE, PRICED: a placement gives stage i the layers [lb, le), and that range's session is a
@@ -8755,7 +8812,7 @@ int main(int argc, char** argv) {
             const char* v = std::getenv("STRATA_PREFILL_LEND_PCT");
             return v ? (int64_t) std::atoi(v)
                      : g_lend_keep != 128 ? (int64_t) 100   // a card too short for the usual loan (see the cache sizing) lends what it must: the cap is for cards with room
-                     : (int64_t) (strata::prefill::Prefill::pinned_share() >= 0.9 ? 90 : 85);
+                     : (int64_t) (strata::prefill::Prefill::pinned_share() >= 0.9 || strata::platform::g_fork_pack_defaults ? 90 : 85);   // fork default: 90 (SIXPASS)
         }();
         const int64_t c = 512;
         bool probe_ok = true;
@@ -9750,7 +9807,7 @@ int main(int argc, char** argv) {
         const char* v = std::getenv("STRATA_PREFILL_LEND_PCT");
         return v ? (int64_t) std::atoi(v)
                  : g_lend_keep != 128 ? (int64_t) 100   // a card too short for the usual loan (see the cache sizing) lends what it must: the cap is for cards with room
-                 : (int64_t) (strata::prefill::Prefill::pinned_share() >= 0.9 ? 90 : 85);
+                 : (int64_t) (strata::prefill::Prefill::pinned_share() >= 0.9 || strata::platform::g_fork_pack_defaults ? 90 : 85);   // fork default: 90 (SIXPASS)
     }();
     // The largest chunk --prefill auto may pick: the operator's ceiling (--prefill auto:N) and never past the
     // context, but a bare `auto` always reaches 8192.  32768 and 16384 stay opt-in (#282): a 32K prompt with

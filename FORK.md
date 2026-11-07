@@ -8,6 +8,21 @@ generate faster on one PC by changing software only: same model, quant, context 
 **See every changed line:** [compare with upstream](https://github.com/Niko1221/Strata/compare/main...rafid-dev:Strata-32GB:speed-fork).
 **See every test, including what failed:** [docs/fork/WORKLOG.md](docs/fork/WORKLOG.md).
 
+## Defaults
+
+Since 2026-11-07 the engine applies the fork's own settings by itself, so a plain start runs what the fork's launcher ran. A variable you set yourself, or one in a config's `"env"`, always wins. `STRATA_FORK_DEFAULTS=0` turns all of them off and gives upstream's defaults. The engine names what it set in one line at start (`strata: fork defaults: ...`).
+
+| Where | Set when unset | Why |
+|---|---|---|
+| Every build | `STRATA_ROUTE_TAIL_SKIP=0`, `STRATA_PREFILL_CPU_SHARE_MAX=1024`, `STRATA_PF_SMALL=0` | No expert skipped, and 0.2.11's two prompt rules that change answers turned off. Answers are the full model's |
+| Windows, NVIDIA, an IQ pack (`--pack`) | `STRATA_UNBUFFERED_LOAD`, `STRATA_RAM_ADAPT`, `STRATA_COLD_OVERLAP`, `STRATA_COLD_KEPT_READERS`, `STRATA_PARTIAL_PIN`, `STRATA_RAM_ADAPT_PAR`, `STRATA_RAM_ADAPT_BG`, `STRATA_KV_LEND`, `STRATA_DIRECT_BATCH`, `STRATA_STAGER_IN_PLACE`, `STRATA_DENSE_ARENA` (all `=1`), `STRATA_STAGER_RING=128`; 3 stager threads; a prompt lend cap of 90% | Measured lossless on the PC under Result. Each switch steps aside by itself where it doesn't apply (for example K/V lending without streamed int8 K/V, the arena when one allocation fails) |
+| The same, with `--resident-budget-gib` 10 or less | `STRATA_RAM_THROUGH=1` | It lost 19% at 14 GiB |
+| The same, with `--resident-budget-gib` on a PC with 28 GB of RAM or more | `STRATA_PREFILL_AUTO_MAX=16384` | 50K prompts in 6 expert passes instead of 7 (+7.9%). An explicit ceiling skips the #2090 RAM guard, which was measured with the full `--resident-experts` copy, so smaller PCs keep the guard |
+
+Per-PC settings stay in `FAST-SETUP.bat`: the RAM tier and headroom, worker and reader cores, and the second SSD. Linux, AMD and GGUF files get only the first row.
+
+`FAST-SETUP.bat` asks whether to skip experts. No (the default) keeps skip 0. Yes writes `STRATA_ROUTE_TAIL_SKIP=7` to its launcher: about 22% faster on the PC under Result, but answers change (KL 0.081). `--skip N` answers without asking.
+
 ## Result
 
 Measured 2026-11-05 on Windows 11 26H2. Model card sampling, thinking on, a fresh engine per run, 3 runs a setting. i7-14700KF, 32 GB DDR5-6000, RTX 4070 Ti 12 GB, two 990 PRO 1 TB. IQ3_S, `--kv int8`, 262K context, 10 GiB tier, checkpoints off. 27 runs, 0 failed. Mean text tok/s (low-high).
