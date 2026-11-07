@@ -24,6 +24,58 @@ Text ranges do not overlap. Same model, quant, context, 14 GiB RAM tier and VRAM
 
 This table is the 14 GiB setting. Daily since 2026-11-04: `--resident-budget-gib 10 --conversation-cache-mib 0`, coding answers 48.2 tok/s, see the sections below.
 
+## AMD RX 6600: Qwen3.6-35B-A3B on 8 GB VRAM + 32 GB RAM (2026-11-07, branch `amd-rdna2-q36`)
+
+Another PC: RX 6600 8 GB (gfx1032, HIP from the TheRock wheels, ROCm 10.2.0a20260930), 6 cores / 12 threads, 32 GB RAM,
+Windows 11. Qwen3.6-35B-A3B UD-Q4_K_M. Server tests with `scripts/strata_bench.py` (the owner's tree): two "how to pass A
+level" questions and "lalaland" (600 tokens each), a 24,167-token prompt (300 tokens), a follow-up; thinking on,
+temperature 1.0, top-k 20, top-p 0.95; free RAM sampled every second. Engine tests with `--bench-pp` / `--bench-tg`.
+llama.cpp on the same PC (Vulkan, its own hybrid expert cache, 262K context, KV in RAM): decode 25-28 tok/s, ~500 tok/s on
+the 24K prompt, ~23 tok/s after it, 5+ GB free.
+
+**Build:** `STRATA_HIP_ARCHS=gfx1032`, `STRATA_NO_VISION=1`, `tools\hipuild_windows.bat tests`: 546 targets. 219 of 223
+unit tests pass (AMD_HIP.md, gfx1032 on Windows). The antivirus blocked one test binary until `build-hip-win` was excluded.
+
+**Start (engine 0.1.57 as merged):** `--max-context 32768` refused (0.42 GiB free, 1.0 GiB needed). At 8K: 3.78 GiB of
+weights in VRAM, 2 of 256 experts per layer, decode 17.0-17.9 tok/s, a 4.4K prompt at 110 tok/s, the engine at 24 GB of
+RAM (a private 18.7 GiB copy of the expert blobs) and 485 MB free.
+
+**Steps, each measured on the server test unless it says otherwise:**
+
+| Step | Result |
+|---|---|
+| `STRATA_Q8_PACKED=0` (env) | 2 -> 19 slots per layer at 8K; decode 18.3 / 22.2 / 18.2; free RAM 2 MB at the low point |
+| Expert blob cache (`<model>.q36blobs`, mapped) | written in 51.6 s once; free RAM 3.7 GB (from 2 MB); decode 17.1 / 20.8 / 17.5 |
+| `--pool-workers 11` / `8` | 11: decode 3.7-6.2 (the pool starves the GPU's thread); 8: 18.5 / 22.4 / 18.5, kept |
+| f16 KV, 32K context | runs (13 slots per layer); decode 18.2 / 21.4 / 17.6; 24K prompt 94 tok/s; 13.8 after it |
+| Prompt chunk 2048 / 4096 | 2048: 219 tok/s, 4 slots, decode 15.5-16.9; 4096: did not fit |
+| Engine profile, pp4096, chunk 2048 | 7.4 s per chunk, 4.56 s of it inside `stream_kick` on the host (pageable copies, ~3.9 GB/s) |
+| Copier thread + pinned ring | pp4096 275 -> 531 tok/s (engine); greedy text identical with `STRATA_Q36_RING=0` |
+| Ring: 6 threads / 32 MiB / 64 MiB chunks / 2 DMA streams | 513 / 511 / 511 / 467 tok/s against 515: not kept |
+| Sampled speculative decoding | decode 20.8 / 23.4 / 23.3 (from 18.2 / 21.4 / 17.6); 64% of drafts accepted; 24K prompt 135 tok/s |
+| Swap budget 80 / 160 per 32 tokens (one budget for all layers) | 23.5 / 26.1 / 23.9 and 23.2 / 25.2 / 23.7: the old budget of 8 reached the first layers only |
+| Per-layer rebalance (2 each) + 492 extra slots in staging | 28.6 / 27.5 / 26.3; after the long prompt 16.7; follow-up 28.0 |
+| Coalesced K reads in decode attention | after the 24K prompt 18.5 -> 22.5 tok/s (chunk 1024) |
+| Token embeddings in pinned host memory | chunk 2048 with 10 main slots (was 4): decode 27.1-28.6, 24K prompt 363, 20.6 after |
+| Stage profile, pp4096 chunk 4096 (`STRATA_Q36_PROF=2`) | delta-net layers 3.74 s, attention layers 1.83 s, experts 1.29 s, shared 0.56 s, router 0.11 s of 7.55 s |
+| `STRATA_HIP_PROMPT_F16=1` | 532 against 534 tok/s: not the cause |
+| `STRATA_DENSE_MMQ=1` | pp4096 533 -> 917 tok/s (engine); server 24K prompt 534 at chunk 4096, 417 at 2048 |
+| Shared mixer / MMQ buffers | identical greedy text (placement pinned); chunk 4096 fits beside the slots |
+| Chunk-sized buffers after the slots (to hold extra slots) | every prompt kernel ~2.4x slower (pp4096 298 against 718-972): likely in system memory. Allocated before the slots instead |
+| Final, chunk 2048, defaults only | decode 26.0 / 26.9 / 26.7, 24K prompt 420, 21.1 after it, follow-up 25.3, lowest free RAM 3.5 GB |
+| Final, chunk 4096 | decode 23.6 / 24.8 / 24.4, 24K prompt 539, 18.0 after it |
+
+**Exactness:** greedy text bit-identical on/off for the ring, the shared buffers and the two buffer sets, with the
+expert placement pinned (`--expert-slots 4`, `STRATA_Q36_FIXED_SLOTS=1`, `STRATA_Q36_XSLOTS=0`); unpinned the slot counts
+differ and the GPU / CPU split changes the rounding. Teacher-forced KL, 3,000 prompt tokens + 512 forced
+(`tools/qwen35/q36_config_kl.py`), reference fp32 KV + FP16 GEMMs at chunk 2048: chunk 1024 (the floor) 0.0098 mean,
+0.089 p99, 96.3% same top-1; f16 KV 0.0144 / 0.086 / 96.9%; dense MMQ 0.0129 / 0.085 / 96.1%; both 0.0081 / 0.100 /
+95.7%. The single changes' means come from one near-tie each (largest KL 4.5 and 2.8 of 513 steps). The sampled
+speculative path draws once per emitted token in the same order as without drafts.
+
+**Open:** context beyond 32K (KV in RAM with a VRAM window, or q8 KV); the server shows the first token about 2 s after the
+engine has it (15-token prompts: engine 0.4 s, client 2.5 s); chunk 4096 together with chunk 2048's decode slots.
+
 ## Read-through before a default: the three checks (agreed 2026-11-05, before the fair comparison below)
 
 All on `strata\build`, Windows 26H2, model card sampling, thinking on, fresh engine per run, read-through off against on.

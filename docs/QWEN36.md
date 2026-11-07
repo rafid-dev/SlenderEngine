@@ -67,12 +67,17 @@ when it is alone again, and gives the same text either way.
 `STRATA_Q36_READ_WINDOWS=4` lets the decoding slots produce more tokens during a long prompt read, at the cost of a
 slower read. The default is one decode window per chunk.
 
-**MTP drafts.** A request that has the engine to itself keeps its MTP drafts. With several requests the batch window has
-no drafts unless `--batch-mtp` is in the config's `args` (opt-in). Each slot's window then also carries the proposal its
+**MTP drafts.** A request that has the engine to itself keeps its MTP drafts, greedy or sampled. A sampled request
+(temperature above 0) draws each verify row's token with its own sampler and keeps the drafts while they match
+(sample-and-match): every token still comes from the model's distribution given the tokens before it, and the draws use
+the random stream in the same order as without drafts. `STRATA_Q36_SPEC_SAMPLED=0` gives sampled requests one token at a
+time, as before 2026-11-07. With several requests the batch window has no drafts unless `--batch-mtp` is in the config's
+`args` (opt-in). Each slot's window then also carries the proposal its
 MTP block made, one per slot, up to the rows to spare in the 8-row window.
 
-**What a slot costs.** Each slot keeps its own cache in VRAM: 1.5 GB at a context of 32K (fp32 keys and values of the 10
-attention layers and the MTP block, 45 KB per token) and 0.07 GB of recurrent state. Setup writes the context for one
+**What a slot costs.** Each slot keeps its own cache in VRAM: 0.74 GB at a context of 32K (f16 keys and values of the 10
+attention layers and the MTP block, 22.5 KB per token; `STRATA_Q36_KV_F16=0` keeps fp32, 1.5 GB) and 0.07 GB of
+recurrent state. Setup writes the context for one
 conversation, so N slots take N times that from the room the experts would have. On a card that does not hold every
 expert (12 and 16 GB, the hybrid mode) the expert slots lose that room, and a batch reads more distinct experts from RAM.
 
@@ -112,9 +117,61 @@ for bit. The chunk size changes the GEMM tiles the BLAS picks and with them the 
 the size of the llama.cpp CPU-against-HIP difference on the same file, not a quality loss. A prompt shorter than the
 chunk (every chat turn after the first) is one chunk either way.
 
+## An 8 GB card with 32 GB of RAM
+
+Measured 2026-11-07 on an AMD RX 6600 8 GB (gfx1032, HIP, Windows 11), Ryzen with 6 cores / 12 threads, 32 GB of RAM,
+UD-Q4_K_M (the same expert formats as UD-Q4_K_XL), thinking on, temperature 1.0, top-k 20, top-p 0.95. Config `args`:
+`--max-context 32768 --prefill 2048 --mtp 2 --pool-workers 8`. llama.cpp is the same file with Vulkan on the same PC
+(its own hybrid expert cache, 262K context with the KV cache in RAM).
+
+| | Before 2026-11-07 | Now | llama.cpp (Vulkan) |
+| --- | ---: | ---: | ---: |
+| Decode, short questions | 17.0-17.9 tok/s | 26.0-26.9 | 25-28 |
+| Prompt of 24K tokens | 8K context at most | 420 tok/s (540 with `--prefill 4096`) | about 500 |
+| Decode after that prompt | - | 21.1 tok/s | about 23 |
+| Context | 8K | 32K | 262K |
+| Lowest free RAM | 0.5 GB | 3.5 GB | 5 GB and more |
+
+What the engine does on such a card by itself:
+
+- **The experts' host copy is a file.** When the 18.7 GiB of expert blobs can't be pinned (32 GB of RAM), they were a
+  private copy that only the page file could take back. They are now written once to `<model>.q36blobs` beside the model
+  (18.7 GiB, about 50 s on the first start; checked against the model file's size and date at every start) and mapped
+  read-only, so Windows can move cold experts to the standby list and read them back from the SSD.
+  `STRATA_Q36_BLOB_CACHE=<path>` puts the file elsewhere, `=0` keeps the private copy.
+- **Card defaults** (a variable you set wins): under 12 GiB of VRAM `STRATA_Q8_PACKED=0` (the packed Q8_0 decode copy
+  costs 0.9 GiB, worth 17 more expert slots per layer here); on RDNA2 (gfx103x) `STRATA_DENSE_MMQ=1` (the prompt's dense
+  projections on MMQ; rocBLAS has tuned kernels there only for FP16-in / FP16-out, and pp4096 went from 533 to 917 tok/s).
+  The engine names them in one line at start.
+- **Token embeddings in pinned host memory** under 12 GiB (`STRATA_Q36_EMBD_HOST`): 0.5 GiB more VRAM for experts.
+- **Prompt expert stream through a pinned ring:** from a pageable arena a copy blocked the engine thread (4.5 s of a 7.4 s
+  chunk); a copier thread now fills a ring of pinned chunks (`STRATA_Q36_RING`, `_MIB` 16, `_THREADS` 3,
+  `_STREAMS` 1; two DMA streams measured slower).
+- **Extra decode slots:** between prompts the two staging buffers (a whole layer's experts each) hold 12-14 more experts
+  per layer; a streamed prompt drops them first and the decode-side rebalance takes them back (`STRATA_Q36_XSLOTS=0`
+  leaves them out).
+- **Slot rebalance per layer:** at every 32nd position each layer may evict 2 experts (`STRATA_Q36_SWAPS`,
+  `STRATA_Q36_REBAL_EVERY`); empty slots fill freely. Before, one budget of 8 went to the first layers in order, so the
+  later layers never followed the routing.
+- **Two buffer sets:** decode and short prompts use a 128-row set, prompt chunks the chunk-sized one, allocated before the
+  slots (`STRATA_Q36_SPLIT_BUFS`). Within a set the delta-net, attention and MMQ buffers share one region.
+
+The prompt chunk trades prompt speed for decode slots: 2048 reads a 24K prompt at 420 tok/s and decodes at 26-27 tok/s,
+4096 at 540 and 24-25. `STRATA_Q36_PROF=1` prints each streamed chunk's copy and stage times, `=2` exact per-stage
+times (the host waits at each stage); the decode step summary is printed at exit.
+
 ## Speed and exactness
 
-Every change on the decode path gives the old kernels' bits. `STRATA_Q36_VERIFY=1 strata ... --no-graph` runs the old
+Every change on the decode path gives the old kernels' bits, except two from 2026-11-07: the f16 KV cache
+(`STRATA_Q36_KV_F16=1`, the default) rounds keys and values, and on HIP the decode attention sums each score's products in
+a different order (coalesced reads, one 32-lane group per cell). Teacher-forced over 3,000 prompt tokens and 512 forced
+tokens on UD-Q4_K_M, against fp32 KV and FP16 GEMMs, the mean KL is 0.0081 for f16 KV with dense MMQ, 0.0144 for f16 KV
+alone, 0.0129 for dense MMQ alone; regrouping the same prompt into 1024-token chunks, which changes nothing but the order
+of sums, gives 0.0098 (`tools/qwen35/q36_config_kl.py`). The memory changes (blob cache, ring, shared
+buffers, two sets) give the same greedy text bit for bit with the expert placement pinned (`--expert-slots 4`,
+`STRATA_Q36_FIXED_SLOTS=1`, `STRATA_Q36_XSLOTS=0`).
+
+The other decode-path changes keep the old kernels' bits. `STRATA_Q36_VERIFY=1 strata ... --no-graph` runs the old
 kernel beside each new one on the real activations and compares them bit for bit. `STRATA_Q36_OLD_KERNELS=1` switches
 the new kernels off. Gate/up for Q4_K experts uses the V2K kernels (`STRATA_EXPERT_V2K`, the default on gfx12).
 

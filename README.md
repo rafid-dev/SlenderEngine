@@ -8,6 +8,10 @@ This fork of [Strata](https://github.com/Niko1221/Strata) is tuned for Qwen3.8-F
 
 ## Updates
 
+### 2026-11-07
+
+- **AMD RX 6600 (8 GB) with 32 GB of RAM: Qwen3.6-35B-A3B now runs well on it.** Built from source with HIP on Windows for gfx1032 (219 of 223 unit tests pass). The 35B engine went from 8K context, 17-18 tok/s decode and 0.5 GB of free RAM to 32K context, 26-27 tok/s decode and 3.5 GB free, with a 24K prompt read at 420 tok/s (540 with `--prefill 4096`), thinking on, temperature 1.0. llama.cpp (Vulkan) on the same PC: 25-28 tok/s and about 500 tok/s. Main changes: the experts' host copy is a mapped file instead of private memory, speculative decoding works for sampled requests too, the KV cache is f16, the prompt's expert stream goes through a pinned ring, and RDNA2 / small-card defaults (`STRATA_DENSE_MMQ=1`, `STRATA_Q8_PACKED=0`). [QWEN36.md](docs/QWEN36.md#an-8-gb-card-with-32-gb-of-ram) explains them, and [the worklog](docs/fork/WORKLOG.md) has every measurement. Branch `amd-rdna2-q36`.
+
 ### 2026-11-06
 
 **Method:** the PC under [Speed](#speed), Qwen3.8-Flash-Next IQ3_S at skip 0 (no expert skipped), the model card's sampling. Fresh engine per run, the two settings in mixed order, 3-6 runs each. A change counts when every run of one beats every run of the other. Details are in [FORK.md](FORK.md) and the [worklog](docs/fork/WORKLOG.md).

@@ -19,6 +19,16 @@ Since 2026-11-07 the engine applies the fork's own settings by itself, so a plai
 | The same, with `--resident-budget-gib` (any size) | `STRATA_RAM_THROUGH=1` | Read-through needs the RAM tier. Its loss at 14 GiB here came from memory pressure, not the size (see Read-through) |
 | The same, with `--resident-budget-gib` on a PC with 28 GB of RAM or more | `STRATA_PREFILL_AUTO_MAX=16384` | 50K prompts in 6 expert passes instead of 7 (+7.9%). An explicit ceiling skips the #2090 RAM guard, which was measured with the full `--resident-experts` copy, so smaller PCs keep the guard |
 
+The Qwen3.6-35B-A3B engine (`strata-q36`) sets its own card defaults since 2026-11-07, named in its first lines:
+
+| Where | Set when unset | Why |
+|---|---|---|
+| A card under 12 GiB of VRAM | `STRATA_Q8_PACKED=0` | The packed Q8_0 decode copy (0.9 GiB for UD-Q4_K_M) holds more expert slots instead: 2 -> 19 per layer on an RX 6600 |
+| AMD RDNA2 (gfx103x) | `STRATA_DENSE_MMQ=1` | The prompt's dense projections on MMQ; rocBLAS's FP16-in / FP32-out GEMMs run generic kernels there. pp4096 533 -> 917 tok/s on an RX 6600, KL within the chunk-regrouping floor |
+
+The rest of the 35B work is on by default for every card where it applies (the expert blob cache only where the expert
+arena can't be pinned): see [AMD: Qwen3.6-35B-A3B on an 8 GB card](#amd-qwen36-35b-a3b-on-an-8-gb-card).
+
 Per-PC settings stay in `FAST-SETUP.bat`: the RAM tier and headroom, worker and reader cores, and the second SSD. Linux, AMD and GGUF files get only the first row.
 
 `FAST-SETUP.bat` asks whether to skip experts. No (the default) keeps skip 0. Yes writes `STRATA_ROUTE_TAIL_SKIP=7` to its launcher: about 22% faster on the PC under Result, but answers change (KL 0.081). `--skip N` answers without asking.
@@ -166,6 +176,31 @@ PCIe path and the RAM moves did not run in that check. In normal use answers can
 | `STRATA_PARK_TAIL_MAX` | Skips saving a conversation when only its last tokens were rewritten | Saved nothing: the RAM floor already refused those saves |
 | `STRATA_TIER_LOW_MIB`, `_HIGH_MIB`, `_STEP_MIB` | Resizes the RAM tier while running | Not used, no result recorded |
 | `STRATA_ROUTE_TAIL_SKIP_FILE=R` | The route tail skip from rank R, only for experts that would be read from the file. Changes answers | 10 GiB, 2 runs: about +12% at short context, +21% at 50K. Quality not measured |
+
+## AMD: Qwen3.6-35B-A3B on an 8 GB card
+
+Branch `amd-rdna2-q36` (2026-11-07). The 35B engine ran on an RX 6600 8 GB with 32 GB of RAM at 8K context at most, with
+2 of 256 experts per layer in VRAM and 0.5 GB of RAM left free. All changes are in `src/qwen35/q36_engine.cu`;
+[QWEN36.md](docs/QWEN36.md#an-8-gb-card-with-32-gb-of-ram) explains them and their switches, and the worklog has every
+measurement.
+
+Thinking on, temperature 1.0, `--max-context 32768 --prefill 2048 --mtp 2 --pool-workers 8`, UD-Q4_K_M:
+
+| | Before | Now | llama.cpp (Vulkan, same PC) |
+|---|---:|---:|---:|
+| Decode, short questions | 17.0-17.9 tok/s | 26.0-26.9 | 25-28 |
+| 24K prompt | not possible | 420 tok/s (540 at `--prefill 4096`) | about 500 |
+| Decode after it | - | 21.1 tok/s | about 23 |
+| Context | 8K | 32K | 262K |
+| Lowest free RAM | 0.5 GB | 3.5 GB | 5 GB and more |
+
+The biggest steps: the experts' host copy as a mapped file instead of private memory (RAM), the two RDNA2 card defaults
+above (prompt speed and slots), speculative decoding for sampled requests (decode +15-25%), the f16 KV cache (32K
+context), a copier thread with a pinned ring for the prompt's expert stream (pp4096 275 -> 531 before dense MMQ), extra
+decode slots in the staging buffers, a per-layer slot rebalance, and coalesced K reads in decode attention on HIP.
+
+Exactness: the memory changes give the same greedy text bit for bit with the expert placement pinned; f16 KV and dense MMQ
+stay within the KL of regrouping the prompt's chunks (`tools/qwen35/q36_config_kl.py`).
 
 ## Limits
 
