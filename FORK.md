@@ -7,6 +7,7 @@ generate faster on one PC by changing software only: same model, quant, context 
 
 **See every changed line:** [compare with upstream](https://github.com/Niko1221/Strata/compare/main...rafid-dev:Strata-32GB:speed-fork).
 **See every test, including what failed:** [docs/fork/WORKLOG.md](docs/fork/WORKLOG.md).
+**How long prompts read in fewer passes (the prompt room):** [docs/fork/PROMPT-ROOM.md](docs/fork/PROMPT-ROOM.md).
 
 ## Defaults
 
@@ -18,6 +19,9 @@ Since 2026-11-07 the engine applies the fork's own settings by itself, so a plai
 | Windows, NVIDIA, an IQ pack (`--pack`) | `STRATA_UNBUFFERED_LOAD`, `STRATA_RAM_ADAPT`, `STRATA_COLD_OVERLAP`, `STRATA_COLD_KEPT_READERS`, `STRATA_PARTIAL_PIN`, `STRATA_RAM_ADAPT_PAR`, `STRATA_RAM_ADAPT_BG`, `STRATA_KV_LEND`, `STRATA_DIRECT_BATCH`, `STRATA_STAGER_IN_PLACE`, `STRATA_DENSE_ARENA` (all `=1`), `STRATA_STAGER_RING=128`, `STRATA_STAGER_THREADS=3`, `STRATA_STAGER_BATCH=1`; a prompt lend cap of 90% | Measured lossless on the PC under Result. Each switch steps aside by itself where it doesn't apply (for example K/V lending without streamed int8 K/V, the arena when one allocation fails) |
 | The same, with `--resident-budget-gib` (any size) | `STRATA_RAM_THROUGH=1` | Read-through needs the RAM tier. Its loss at 14 GiB here came from memory pressure, not the size (see Read-through) |
 | The same, with `--resident-budget-gib` on a PC with 28 GB of RAM or more | `STRATA_PREFILL_AUTO_MAX=16384` | 50K prompts in 6 expert passes instead of 7 (+7.9%). An explicit ceiling skips the #2090 RAM guard, which was measured with the full `--resident-experts` copy, so smaller PCs keep the guard |
+| Windows, NVIDIA, an IQ pack (`--pack`) | `STRATA_HC_UPMIX=1` | The prompt path's hyper-connection up GEMM and mix as one kernel (sm_80+): 50K +4.3%, logits byte-identical. See [the prompt room page](docs/fork/PROMPT-ROOM.md#also-on-by-default-since-2026-11-09-the-fused-hyper-connection-read) |
+| The same, with `--serve` and `--draft dflash2` | `STRATA_DF2_ROOM_MIN=4096`, `STRATA_DF2_ROOM_CHUNK=1`, `STRATA_DF2_ROOM_HEAD=1` | A prompt of 4,096+ new tokens borrows the drafter's weights and the output head for its buffers and reads in larger chunks: 50K +10-11%, 29K +14%. First-token KL 0.0003-0.0022. See [the prompt room page](docs/fork/PROMPT-ROOM.md) |
+| The same, with `--serve` and `--mtp` (no `--batch`) | `STRATA_MTP_ROOM_MIN=4096`, `STRATA_MTP_ROOM_CHUNK=1`, `STRATA_MTP_ROOM_HEAD=1` | The same with the MTP drafter's experts: 50K +10-19.5%. A room that can't apply is left out with a note |
 
 Per-PC settings stay in `FAST-SETUP.bat`: the RAM tier and headroom, worker and reader cores, and the second SSD. Linux, AMD and GGUF files get only the first row.
 
@@ -168,8 +172,7 @@ PCIe path and the RAM moves did not run in that check. In normal use answers can
 | `STRATA_PARK_TAIL_MAX` | Skips saving a conversation when only its last tokens were rewritten | Saved nothing: the RAM floor already refused those saves |
 | `STRATA_TIER_LOW_MIB`, `_HIGH_MIB`, `_STEP_MIB` | Resizes the RAM tier while running | Not used, no result recorded |
 | `STRATA_ROUTE_TAIL_SKIP_FILE=R` | The route tail skip from rank R, only for experts that would be read from the file. Changes answers | 10 GiB, 2 runs: about +12% at short context, +21% at 50K. Quality not measured |
-| `STRATA_DF2_ROOM_MIN=N`, `STRATA_DF2_ROOM_CHUNK=1`, `STRATA_DF2_ROOM_HEAD=1` | DFlash2 drafting: a prompt reading N+ tokens borrows the drafter's pack, its draft head and the output head (none of them is read while the prompt is read) for its chunk buffers, so it reads in larger chunks. The pack and draft head come back from a RAM copy, the output head is read from the model file again into the same address, all before the first token. `STRATA_DF2_ROOM_VERIFY=1` checks the head's bytes | 12 GB card, 50K prompt: chunk 8,448 → 10,240 (6 passes → 5), 2,006 → 2,231 tok/s (+11%); 29K +14%; short prompts unchanged. Head byte-identical. First-token KL 0.0022 at 29K, 0.0003 at 50K |
-| `STRATA_MTP_ROOM_CHUNK=1`, `STRATA_MTP_ROOM_HEAD=1` | The same with MTP drafting, on top of `STRATA_MTP_ROOM_MIN=N` (the MTP drafter's 708 MiB of experts) | 50K prompt: chunk 7,680 → 10,240, 1,828 → 2,185 tok/s (+19.5%). Head byte-identical |
+| `STRATA_DF2_ROOM_VERIFY=1` | Checks the output head's bytes after every reload by the prompt room (the room is on by default, see Defaults; this check is off) | Matched in every run |
 | `STRATA_DF2_PARK=N` | From the RX 6600 branch: parks the DFlash2 drafter in RAM while a long prompt's super-chunks read (layer-major, HIP) | Not measured on CUDA |
 
 ## Limits

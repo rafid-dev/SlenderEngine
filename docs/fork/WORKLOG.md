@@ -1282,6 +1282,27 @@ Ranges don't overlap on text. It fired: skip 0's log has no banner or skip count
 - **Figures now read:** LK losses up to 8-10% longer acceptance, which is about +3% here by the 13 ms a window + 8 ms a token fit, not +5%. Delayed tree: about 5% with a neural selector, on other verification methods. DALI: its prefetch added only 9%; its greedy assignment matches what `assign_sim.py` put at about +1% here, and its cache gain comes from workload across a batch, while the batch here is 1. MoEpic: half an expert over PCIe is about 42 us against about 50 us on the CPU pool, serialized on one link, so about break-even by arithmetic. FluxMoE: 32% smaller by coding BF16 exponents, decoded on the GPU at about 400 GB/s on an H20. This pack's experts aren't BF16, so it needs the sample. KV exact-cell window (PR #4068) refuses `--kv-resident`, so it doesn't fit this setup.
 - **Route prior (`STRATA_ROUTE_PRIOR`, 0.2.7-0.2.8):** rerouting, excluded, and upstream turned it off for repeated text in long sessions.
 
+## Prompt room (2026-11-08/09, branch `df2-park`, default since 2026-11-09)
+
+Method and results in [PROMPT-ROOM.md](PROMPT-ROOM.md). The runs, in order (single runs unless noted, 50K prompt, `pf_probe.py`):
+
+| Step | Setup | Chunk | Prompt tok/s |
+|---|---|---:|---:|
+| Today | ring 192, lend 95% | 8,448 | 1,936-2,045 |
+| Room as ring slots (`STRATA_DF2_ROOM_MIN` + ring 16) | K/V 32K / 16K / 8K | 8,960 / 9,472 / 9,728 | 1,942 / 1,910 / 1,851 |
+| Room for buffers (`..._CHUNK=1`) | K/V 32K ring 192 | 8,960 | 1,986 |
+| | K/V 8K ring 96 | **10,240 (5 passes)** | 2,022 (host staging 17.6 → 13.3 s, wait copy 2.6 → 4.3 s) |
+| Room + heads (`..._HEAD=1`), after the window fix | K/V 32K ring 192, 3 runs | 10,240 | **2,253 / 2,214 / 2,225** (today 2,045 / 1,963 / 2,010) |
+| | K/V 16K | 10,752 | no faster than 32K |
+| MTP, no room / room + heads | ring 192, 2 runs | 7,680 / 10,240 | 1,842, 1,813 / 2,197, 2,173 |
+| Fork defaults only (ring 96, lend 90%) | DFlash2 off / on | 8,448 / 10,240 | 1,910, 1,889 / 2,145, 2,064 |
+| | MTP off / on | 7,936 / 9,984 | 1,706 / 1,880 |
+
+- The first head runs hit non-finite scores in the first verify window (the room closed after it); caught and retried by the engine, fixed in `3349aaca`.
+- Checks: `STRATA_DF2_ROOM_VERIFY=1` matched every time (DFlash2 and MTP). First-token KL (PF_SAME, 3K / 29K / 50K): 0 / 0.0022 / 0.0003, same top token; no-room runs 0 against each other.
+- `STRATA_HC_UPMIX=1`: 2,183 / 2,182 → 2,258 / 2,296; 96 of 96 checked reads exact; logits byte-identical (same hash) at 3K / 29K / 50K.
+- Decode on the same setup (thinking-on): short 49.5, after 50K 41.3, follow-up 41.8 tok/s; nothing in this work changes decode.
+
 ## Test queue and what remains (living list, started 2026-11-04)
 
 Update this as tests finish: move results to their own sections and keep only what's still open here. Nothing below is measured unless it says so.

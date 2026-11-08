@@ -143,6 +143,7 @@ Written by Qwen3.8-Flash-Next IQ3_S through OpenCode on the PC described above. 
 
 - [FORK.md](FORK.md): engine changes, switches and measurements.
 - [Worklog](docs/fork/WORKLOG.md): recorded tests, including failed experiments.
+- [The prompt room](docs/fork/PROMPT-ROOM.md): how long prompts read in fewer passes, and how it was found and checked.
 - [RTX 4060 8 GB laptop report](docs/fork/LAPTOP-RTX4060.md): optional switches contributed by [Gamination](https://github.com/Gamination).
 
 Built on the work of [Niko1221 and the Strata contributors](https://github.com/Niko1221/Strata). Code is [MIT licensed](LICENSE); model weights and optional components have their own licenses.

@@ -13,6 +13,8 @@ Same method as 2026-11-06.
 | Change | Switch | Result | Answers |
 |---|---|---|---|
 | Prompts in fewer passes | `STRATA_DENSE_ARENA=1`, `--prefill auto:16384`, a prompt lend cap of 90% | A 50K prompt takes 6 passes over the experts instead of 7: 1,741 → 1,879 tok/s (+7.9%). Prompts whose pass count doesn't drop (29K) read about 2.6% slower | Rounding only: first-token KL 0.0001-0.0024, same top choice |
+| Prompt room (2026-11-09, default) | `STRATA_DF2_ROOM_*` / `STRATA_MTP_ROOM_*` (set by the fork's defaults) | A prompt of 4,096+ new tokens also uses the drafter's weights and the output head, idle while it is read, for its buffers: 50K in 5 passes instead of 6. DFlash2 50K +10-11% (2,006 → 2,231 tok/s with ring 192), 29K +14%; MTP 50K +10-19.5%. [How it works](PROMPT-ROOM.md) | Rounding only: first-token KL 0.0003-0.0022, same top choice; the head comes back byte-identical |
+| Fused hyper-connection read (2026-11-09, default) | `STRATA_HC_UPMIX=1` | Prompt reading +4.3% at 50K (2,183 → 2,277 tok/s) | Byte-identical |
 
 - The engine now runs the fork's settings by default: skip 0 everywhere, and the switches in both tables except `--pcie-frac 0` on Windows with an NVIDIA card and an IQ pack. `STRATA_FORK_DEFAULTS=0` gives upstream's defaults. See [FORK.md](../../FORK.md#defaults).
 - `FAST-SETUP.bat` asks how much RAM to use, whether to skip experts (no by default) and which second SSD to use, and picks DFlash2 when its drafter is in `Strata-data\dflash2` (`strata launch --drafting dflash2` downloads it once, 1.2 GB). The stager settings were tuned for two 990 PROs.
