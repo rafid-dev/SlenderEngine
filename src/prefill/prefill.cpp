@@ -653,6 +653,9 @@ struct Alloc {
     bool count_only = false;
     bool spill = false, spilled = false;
     std::vector<void*>* owned = nullptr;
+    // STRATA_DF2_ROOM_CHUNK: a second region the takes continue in once `base` is full (a lender's bytes, for one prompt)
+    uint8_t* base2 = nullptr;
+    uint64_t cap2 = 0, used2 = 0;
     template <typename T> T* take(size_t n, bool& ok) {
         uint64_t bytes = ((uint64_t) n * sizeof(T) + 256 + 255) & ~255ull;
         if (count_only) {
@@ -663,6 +666,11 @@ struct Alloc {
         if (base != nullptr && !spilled && used + bytes <= cap) {
             T* p = (T*) (base + used);
             used += bytes;
+            return p;
+        }
+        if (base2 != nullptr && used2 + bytes <= cap2) {
+            T* p = (T*) (base2 + used2);
+            used2 += bytes;
             return p;
         }
         if (base != nullptr && !spill) { ok = false; failed_bytes = bytes; return nullptr; }
@@ -1800,8 +1808,10 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
     }
     // the CPU share's staged-chunk limit, before the ring is sized below (a caller that sizes loans first armed it)
     arm_cpu_share(cpu_pool_ != nullptr);
+    // STRATA_DF2_ROOM_CHUNK: the host side (and m.T_max) is sized for the largest chunk a roomed relayout asks for
+    const int64_t tmax = std::max<int64_t>(chunk, max_chunk_hint_);
     for (int b = 0; next_ != nullptr && b < 2; ++b)
-        if (!m.hand[b] && cudaHostAlloc((void**) &m.hand[b], (size_t) chunk * D * 4, cudaHostAllocPortable) != cudaSuccess) {
+        if (!m.hand[b] && cudaHostAlloc((void**) &m.hand[b], (size_t) tmax * D * 4, cudaHostAllocPortable) != cudaSuccess) {
             err = "prefill: the layer split's hand-off buffers";
             return false;
         }
@@ -1816,17 +1826,17 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
         m.hand_pieces = handoff_pipe_pieces();
     }
     if (m.tok_dev == nullptr) {
-        if (const cudaError_t e = cudaMalloc((void**) &m.tok_dev, (size_t) chunk * sizeof(int32_t)); e != cudaSuccess) {
+        if (const cudaError_t e = cudaMalloc((void**) &m.tok_dev, (size_t) tmax * sizeof(int32_t)); e != cudaSuccess) {
             err = std::string("prefill: the token id buffer (") + cudaGetErrorString(e) + ")";
             return false;
         }
         m.owned.push_back(m.tok_dev);
-        m.tok_host.resize((size_t) chunk);
-        m.tok_up.init((size_t) chunk);
+        m.tok_host.resize((size_t) tmax);
+        m.tok_up.init((size_t) tmax);
     }
     if (cudaStreamCreateWithFlags(&m.copy, cudaStreamNonBlocking) != cudaSuccess) { err = "prefill: copy stream"; return false; }
-    const size_t T = (size_t) chunk;
-    m.T_max = chunk;
+    const size_t T = (size_t) tmax;   // the host buffers below: the largest chunk (the device layout is `chunk`'s, carved at the end)
+    m.T_max = tmax;
     m.borrowed = borrow != nullptr;
     m.borrow_spill = m.borrowed && borrow_spill;
     bool ok = true;
@@ -1971,7 +1981,7 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
         static const bool xn_env = [] { const char* e = std::getenv("STRATA_XN_F16"); return e == nullptr || e[0] != '0'; }();
         m.xn_f16 = xn_env && !m.f16_io && m.gemm.bf16_converts_x();
     }
-    if (!carve(T, &o)) {
+    if (!carve((size_t) chunk, &o)) {
         size_t fb = 0, tb = 0;
         cudaMemGetInfo(&fb, &tb);
         (void) cudaGetLastError();
@@ -2145,6 +2155,10 @@ bool Prefill::carve(size_t T, void* alloc) {
 }
 
 bool Prefill::relayout(int64_t chunk, void* borrow, uint64_t borrow_bytes, std::string& err) {
+    return relayout(chunk, borrow, borrow_bytes, err, nullptr, 0);
+}
+
+bool Prefill::relayout(int64_t chunk, void* borrow, uint64_t borrow_bytes, std::string& err, void* room, uint64_t room_bytes) {
     Impl& m = *impl_;
     if (m.borrow_spill) {
         err = "prefill: a hybrid borrowed/owned layout cannot be changed between requests";
@@ -2164,6 +2178,8 @@ bool Prefill::relayout(int64_t chunk, void* borrow, uint64_t borrow_bytes, std::
     o.base = (uint8_t*) borrow;
     o.cap = borrow_bytes;
     o.owned = &m.owned;
+    o.base2 = (uint8_t*) room;    // STRATA_DF2_ROOM_CHUNK: what the loan cannot hold continues in the lender's bytes
+    o.cap2 = room != nullptr ? room_bytes : 0;
     uint16_t* gs = o.take<uint16_t>((size_t) GEMM_SCRATCH, ok);
     void* ws = o.take<uint8_t>(GEMM_WS, ok);
     uint16_t* gs2 = gemm_dequant_side() ? o.take<uint16_t>((size_t) GEMM_SCRATCH, ok) : nullptr;   // STRATA_DEQUANT_SIDE

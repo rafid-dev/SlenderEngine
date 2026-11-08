@@ -84,6 +84,12 @@ public:
     /// With borrowed buffers: lay them out again for chunks of `chunk` tokens (at most `init`'s) in `borrow` - a
     /// request lends only the slots its prompt needs.  The stream must be idle (between prompts).
     bool relayout(int64_t chunk, void* borrow, uint64_t borrow_bytes, std::string& err);
+    /// STRATA_DF2_ROOM_CHUNK (fork): the same, with a second region the buffers continue in once `borrow` is full - a lender's bytes
+    /// (the DFlash2 pack) for one prompt.  Nothing is written at layout time, so the lender's contents are intact until the prompt runs.
+    bool relayout(int64_t chunk, void* borrow, uint64_t borrow_bytes, std::string& err, void* room, uint64_t room_bytes);
+    /// STRATA_DF2_ROOM_CHUNK: before `init`, the largest chunk a later `relayout` may ask for (the host buffers and the token buffer
+    /// are sized for it; the device layout `init` carves is still `init`'s chunk).
+    void set_max_chunk(int64_t t) { max_chunk_hint_ = t > 0 ? t : 0; }
     int64_t chunk() const;
     /// STRATA_LOAN_TRACE: what the last layout really took, and whether it spilled past the loan into its own allocations
     uint64_t workspace_used() const;
@@ -342,6 +348,7 @@ private:
     void* ring_room_base_ = nullptr;                 ///< set_ring_room_base: the bytes the room's slots are
     uint64_t ring_room_bytes_ = 0;
     bool ring_room_active_ = false;                  ///< the room is this prompt's (survives `reset` with it)
+    int64_t max_chunk_hint_ = 0;                     ///< set_max_chunk (STRATA_DF2_ROOM_CHUNK)
     // Stage-1 pipeline: intermediate stages return after handing their chunk to
     // the direct successor. The public run() drains the chain once at prompt end.
     bool run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::string& err);
