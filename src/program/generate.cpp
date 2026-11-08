@@ -17451,8 +17451,8 @@ int main(int argc, char** argv) {
                         // the start-up sum is an estimate (a buffer cannot straddle regions): a chunk that does not fit steps down
                         while (!p.sp->relayout(want_r, p.cache->device_slot(first), part_bytes(p, first), e, rooms, room_b, nr)) {
                             if (want_r - 256 <= o.prefill_chunk) return false;
-                            std::fprintf(stderr, "strata serve: STRATA_DF2_ROOM_CHUNK: a chunk of %lld does not fit the room (%s): trying %lld\n",
-                                         (long long) want_r, e.c_str(), (long long) (want_r - 256));
+                            std::fprintf(stderr, "strata serve: STRATA_%s_ROOM_CHUNK: a chunk of %lld does not fit the room (%s): trying %lld\n",
+                                         pr_mtp ? "MTP" : "DF2", (long long) want_r, e.c_str(), (long long) (want_r - 256));
                             want_r -= 256;
                             e.clear();
                         }
@@ -17468,8 +17468,9 @@ int main(int argc, char** argv) {
                                 }
                             }
                         p.lent_chunk = want_r;
-                        std::fprintf(stderr, "strata serve: STRATA_DF2_ROOM_CHUNK: this prompt reads in chunks of %lld tokens, its buffers in "
-                                             "the loan and the %s%s\n", (long long) want_r, pr_mtp ? "MTP drafter's experts" : "DFlash2 pack",
+                        std::fprintf(stderr, "strata serve: STRATA_%s_ROOM_CHUNK: this prompt reads in chunks of %lld tokens, its buffers in "
+                                             "the loan and the %s%s\n", pr_mtp ? "MTP" : "DF2", (long long) want_r,
+                                     pr_mtp ? "MTP drafter's experts" : "DFlash2 pack",
                                      nr > 1 ? (pr_mtp ? " and the output head" : " and the heads") : "");
                         continue;
                     }
