@@ -118,6 +118,30 @@ The first five rows ran with a 10 GiB tier and `--prefill 256` (base 106.6 ms a 
 | `STRATA_UNBUFFERED_LOAD=0` | 168.9 | 96.6 | 11.3 GB/h to the page file, 36 MB free: the read pages stay in the working set |
 | `STRATA_HIP_PROMPT_F16=1` (prompt) | | +5% on a 4K prompt; changes numerics; one crash, under VRAM paging |
 
+## Pending Optimization Tests
+
+**Neither switch below has been benchmarked or verified on the RX 6600.** Both come from reading the code and comparing
+this config with the fork's RTX 4070 Ti setup (2026-11-08). That is unconfirmed static analysis, not a measurement.
+They are **not** in [the config](#the-config) above and should not be added to it until they are tested.
+
+| Switch | What this config does today | Why it is promising |
+|---|---|---|
+| `STRATA_CPU_IQ_ALL_EXACT1=1` | Off. The engine turns it on by itself only on NVIDIA sm_86 and sm_89 cards (`src/core/nv_defaults.cpp`), never on a HIP build. A lone token's IQ3_S gate/up rows run on ggml-cpu's single-token dot | Strata's own AVX2 rows for one token, in ggml's float order (`src/kernels/cpu/native_expert.cpp`). They are meant to give the same bits as ggml's AVX2 dot. The i5-10400 meets the gate (ggml built for AVX2, no AVX-512). CPU experts are about 82 ms of the ~167 ms step above, so a faster CPU path counts here. On other PCs: -11% to -60% time per CPU expert, +0.6% (RTX 3060) and +3.3% (RTX A4000) end to end. What it gives here is unknown |
+| `STRATA_STAGER_BATCH=1` | Unset. With the pack's file tier the prompt stager takes 8 experts per claim (`src/prefill/prefill.cpp`, `Prefill::init`). With `STRATA_STAGER_IN_PLACE=1` a stager thread reads those 8 one after another and marks none ready until the last one lands | One expert per claim: each one goes to the GPU as soon as it lands. On the RTX 4070 Ti PC, the in-place stager's gain (prompts +8.5% to +13.9%, short prompts about 21% less time, answers byte-identical) was measured with this switch at 1, next to the 3 threads and 128-deep ring this config already uses. The same bytes go to the same places in the same order, so answers should not change. Layer-major reads use the same stager, but how much it helps them is unknown |
+
+Before either goes into the config:
+
+1. **Same answers:** identical-output settings at temperature 0, before and after. The answers must match byte for byte.
+   First run the "before" arm twice: without `STRATA_IQ_MT_MIN=1`, temperature 0 was not repeatable on the RTX 4070 Ti
+   PC.
+2. **Speed, one switch at a time:** `STRATA_CPU_IQ_ALL_EXACT1` on the decode questions above (ms a token);
+   `STRATA_STAGER_BATCH` on the 4K and 24K prompts. At least 2 runs per arm, in alternating order (this page sees
+   about 5% between runs of the same settings).
+3. **Check it took effect:** the log prints `strata ab: GATE=STRATA_CPU_IQ_ALL_EXACT1 active=1` once.
+   `STRATA_STAGER_BATCH` prints nothing.
+
+Keep a switch only if the answers are identical and it is not slower.
+
 ## Limits
 
 - One PC, one card, one run per arm for most rows; decode moves about 5% between runs of the same settings.
