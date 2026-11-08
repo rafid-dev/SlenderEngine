@@ -210,9 +210,34 @@ decode slots in the staging buffers, a per-layer slot rebalance, and coalesced K
 Exactness: the memory changes give the same greedy text bit for bit with the expert placement pinned; f16 KV and dense MMQ
 stay within the KL of regrouping the prompt's chunks (`tools/qwen35/q36_config_kl.py`).
 
+An opt-in 8-bit KV cache (`STRATA_Q36_KV=q8_0` or `int8`) halves each session's cache (0.69 -> 0.37 GiB at 32K) and
+scores decode attention with the int8 dot product; its KL is within the same spread (0.0068 for q8_0). The default stays
+f16. [QWEN36.md](docs/QWEN36.md#speed-and-exactness) has the table.
+
+## AMD: Qwen3.8-Flash-Next on an 8 GB card
+
+Branch `amd-rdna2-flashnext` (2026-11-08). Settings only: the engine is unchanged, built for gfx1032; setup now knows the
+RX 6600 (gfx1032). [docs/fork/RX6600-FLASHNEXT.md](docs/fork/RX6600-FLASHNEXT.md) has the config, every measurement and
+what didn't help.
+
+RX 6600 8 GB, i5-10400, 32 GB DDR4-2666, two NVMe SSDs, IQ3_S, DFlash2, thinking on:
+
+| | Setup's config | Tuned |
+|---|---:|---:|
+| Decode, short questions | 5.3 tok/s | 9.5-10.5 |
+| 24K prompt | about 7.5 tok/s | 142 |
+| Written to the page file | | 0.02 GB/h |
+
+The biggest steps: a small fixed GPU expert cache (the automatic one filled the card until Windows paged GPU memory and
+the prompt's GEMMs ran 10-17x slower), a 12 GiB RAM tier instead of mapped files, layer-major prompt reads on HIP (opt-in:
+`STRATA_LM_HIP=1`), the fork's Windows switches set in the config (the engine applies them only on NVIDIA builds), and
+the second SSD with a read share for drives of unequal speed. The prompt changes stay within the KL of an equally valid
+rounding (`tools/prompt_path_kl.py`). Decode is bound by the CPU (AVX2, ~131 us an expert) and the SSD reads here.
+
 ## Limits
 
-- Only the CUDA build on Windows was built and run. The HIP, SYCL and Metal builds were not built, on either base.
+- The fork's NVIDIA results come from the CUDA build on Windows. The HIP build was built and run for gfx1032 only (the
+  AMD sections above); SYCL and Metal were not built, on either base.
 - On the 0.2.11 base, the all-switches-off byte-identical check hasn't been repeated. K/V lending and the in-place stager were checked byte-identical on the 0.1.55 base.
 - `nv_defaults_test` covers the `sm_89` table. Run it after building.
 - Tokens per step moves about 8% between runs of the same settings, so a small gain needs many runs. Numbers before 2026-11-05 in the worklog mostly use temperature 0.6.

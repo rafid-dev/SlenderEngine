@@ -556,6 +556,12 @@ hipBLASLt ships no gfx1032 table, so the plain hipBLAS path runs. The engine rep
   kernels here, see the RDNA2 section), and under 12 GiB `STRATA_Q8_PACKED=0`.
 - **Allocation order matters:** a 0.6 GiB buffer allocated last, near the process's budget, made every prompt kernel 2.4x
   slower (likely placed in system memory by Windows). The 35B engine allocates its prompt buffers before the expert slots.
+- **Qwen3.8-Flash-Next on 8 GB:** setup recognizes the card (PCI 73FF, `gfx103X-all` wheels). Its automatic sizing fills
+  the card: with `--expert-cache auto` (357 slots) 270-390 MiB stayed free, Windows paged GPU memory and the prompt's
+  dense GEMMs ran 10-17x slower. `--expert-cache 60 --kv-resident 8192 --prefill 512` with layer-major prompts
+  (`STRATA_LM_HIP=1`, opt-in on AMD) took a 24K prompt from about 7.5 to 142 tok/s and decode from 5.3 to 9.5-10.5 tok/s.
+  The fork's Windows speed switches are applied by the engine only on NVIDIA builds; set them in the config's `"env"`.
+  Full config and measurements: [fork/RX6600-FLASHNEXT.md](fork/RX6600-FLASHNEXT.md).
 
 Other gfx103x and RDNA2-adjacent cards (community reports):
 
@@ -563,7 +569,7 @@ Other gfx103x and RDNA2-adjacent cards (community reports):
 | --- | --- |
 | gfx1031, RX 6700 XT 12 GB (#524, #1027) | Setup knows it (`gfx103X-all` wheels, unvalidated). IQ2_XS on ROCm 7.2.4: decode 30-32 tok/s, prompt about 300 tok/s, 6 of 6 needles. The default list of `build_windows.bat` includes it. |
 | RX 6800M 12 GB, Windows, self-built (#915, #1078) | Q2_0: decode 9-27 tok/s, prompt 50-114 tok/s; experts stream from disk with 31 GB RAM |
-| gfx1032, RX 6600 / 6600 XT | As the only card, Windows 11, 32 GB RAM, built from source with `STRATA_HIP_ARCHS=gfx1032` (2026-11-07): 219 of 223 unit tests pass (see [gfx1032 on Windows](#gfx1032-rx-6600-on-windows)); Qwen3.6-35B-A3B UD-Q4_K_M at 32K context decodes at 26-27 tok/s with thinking on and reads a 24K prompt at 420 tok/s ([QWEN36.md](QWEN36.md#an-8-gb-card-with-32-gb-of-ram)). Also ran under Windows as the helper expert GPU of an RX 6800 ([SECOND_GPU.md](SECOND_GPU.md)): +8-18% decode over the 6800 alone. |
+| gfx1032, RX 6600 / 6600 XT | As the only card, Windows 11, 32 GB RAM, built from source with `STRATA_HIP_ARCHS=gfx1032` (2026-11-07): 219 of 223 unit tests pass (see [gfx1032 on Windows](#gfx1032-rx-6600-on-windows)); Qwen3.6-35B-A3B UD-Q4_K_M at 32K context decodes at 26-27 tok/s with thinking on and reads a 24K prompt at 420 tok/s ([QWEN36.md](QWEN36.md#an-8-gb-card-with-32-gb-of-ram)); Qwen3.8-Flash-Next IQ3_S with a 12 GiB RAM tier and two SSDs decodes at 9.5-10.5 tok/s and reads a 24K prompt at 142 tok/s ([fork/RX6600-FLASHNEXT.md](fork/RX6600-FLASHNEXT.md)). Also ran under Windows as the helper expert GPU of an RX 6800 ([SECOND_GPU.md](SECOND_GPU.md)): +8-18% decode over the 6800 alone. |
 | gfx1150, Radeon 890M (#1217) | Builds and runs as an unvalidated target. MINISFORUM N5 PRO, 96 GB, TheRock ROCm 7.14.1, IQ3_XXS: decode 15-19 tok/s, prompts 125-130 tok/s on plain hipBLAS and 1.5-1.7x faster with `gfx1150-hipblaslt-100401.txt`. Setup does not install for it: build with `-DCMAKE_HIP_ARCHITECTURES=gfx1150` and point `STRATA_HIPBLASLT_TUNING` at the table. [Report](../bench/results/2026-10-07-community-gfx1150/README.md). |
 | gfx1152, Radeon 860M / 840M (#1625) | Builds with a warning; portable kernels; no report; setup does not install for it |
 
