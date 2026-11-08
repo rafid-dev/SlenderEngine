@@ -168,6 +168,9 @@ PCIe path and the RAM moves did not run in that check. In normal use answers can
 | `STRATA_PARK_TAIL_MAX` | Skips saving a conversation when only its last tokens were rewritten | Saved nothing: the RAM floor already refused those saves |
 | `STRATA_TIER_LOW_MIB`, `_HIGH_MIB`, `_STEP_MIB` | Resizes the RAM tier while running | Not used, no result recorded |
 | `STRATA_ROUTE_TAIL_SKIP_FILE=R` | The route tail skip from rank R, only for experts that would be read from the file. Changes answers | 10 GiB, 2 runs: about +12% at short context, +21% at 50K. Quality not measured |
+| `STRATA_DF2_ROOM_MIN=N`, `STRATA_DF2_ROOM_CHUNK=1`, `STRATA_DF2_ROOM_HEAD=1` | DFlash2 drafting: a prompt reading N+ tokens borrows the drafter's pack, its draft head and the output head (none of them is read while the prompt is read) for its chunk buffers, so it reads in larger chunks. The pack and draft head come back from a RAM copy, the output head is read from the model file again into the same address, all before the first token. `STRATA_DF2_ROOM_VERIFY=1` checks the head's bytes | 12 GB card, 50K prompt: chunk 8,448 → 10,240 (6 passes → 5), 2,006 → 2,231 tok/s (+11%); 29K +14%; short prompts unchanged. Head byte-identical. First-token KL 0.0022 at 29K, 0.0003 at 50K |
+| `STRATA_MTP_ROOM_CHUNK=1`, `STRATA_MTP_ROOM_HEAD=1` | The same with MTP drafting, on top of `STRATA_MTP_ROOM_MIN=N` (the MTP drafter's 708 MiB of experts) | 50K prompt: chunk 7,680 → 10,240, 1,828 → 2,185 tok/s (+19.5%). Head byte-identical |
+| `STRATA_DF2_PARK=N` | From the RX 6600 branch: parks the DFlash2 drafter in RAM while a long prompt's super-chunks read (layer-major, HIP) | Not measured on CUDA |
 
 ## Limits
 
