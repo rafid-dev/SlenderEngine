@@ -24,6 +24,24 @@ Text ranges do not overlap. Same model, quant, context, 14 GiB RAM tier and VRAM
 
 This table is the 14 GiB setting. Daily since 2026-11-04: `--resident-budget-gib 10 --conversation-cache-mib 0`, coding answers 48.2 tok/s, see the sections below.
 
+## AMD RX 6600: Qwen3.8-Flash-Next IQ3_S (2026-11-07 to 11-08, branch `amd-rdna2-flashnext`)
+
+The same RX 6600 PC (i5-10400, 32 GB DDR4-2666) with a second NVMe SSD. The config, every measurement, the quality checks
+and what didn't help are in [RX6600-FLASHNEXT.md](RX6600-FLASHNEXT.md). In short, thinking on: decode 5.3 -> 9.5-10.5
+tok/s, a 24K prompt about 7.5 -> 142 tok/s, 0.02 GB/h to the page file. No engine change; setup learned gfx1032.
+
+- **The cause of the slow start:** the automatic GPU expert cache left 270-390 MiB inside Windows' budget for the
+  process, Windows paged GPU memory, and the prompt's dense GEMMs ran 10-17x slower. A fixed `--expert-cache 60` fixed it
+  and also made decode faster.
+- **Layer-major prompts on HIP** (`STRATA_LM_HIP=1`): a 4K prompt is one super-chunk; it needs a fixed `--prefill`, or
+  the automatic chunk takes the VRAM it needs.
+- **Prompt-path KL** (`tools/prompt_path_kl.py`, new): layer-major + dense MMQ 0.0647, an FP32 SGEMM run (more exact
+  than the reference) 0.0623; regrouping the chunks 0.0000. Counted within the rounding spread.
+- **Expert skip 7** (not in the config): decode +33%, decode-window KL 0.094 against a kernel-grouping floor of 0.030.
+- **The 35B's 8-bit KV cache** (`STRATA_Q36_KV=q8_0|int8`, `src/qwen35/q36_engine.cu`, opt-in): 0.69 -> 0.37 GiB a
+  session at 32K, KL 0.0068 (q8_0, int8 dot) against the floor 0.0098; decode the same or slightly faster in one run each
+  (QWEN36.md).
+
 ## AMD RX 6600: Qwen3.6-35B-A3B on 8 GB VRAM + 32 GB RAM (2026-11-07, branch `amd-rdna2-q36`)
 
 Another PC: RX 6600 8 GB (gfx1032, HIP from the TheRock wheels, ROCm 10.2.0a20260930), 6 cores / 12 threads, 32 GB RAM,
