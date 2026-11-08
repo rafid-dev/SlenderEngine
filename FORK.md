@@ -15,7 +15,7 @@ Since 2026-11-07 the engine applies the fork's own settings by itself, so a plai
 | Where | Set when unset | Why |
 |---|---|---|
 | Every build | `STRATA_ROUTE_TAIL_SKIP=0`, `STRATA_PREFILL_CPU_SHARE_MAX=1024`, `STRATA_PF_SMALL=0` | No expert skipped, and 0.2.11's two prompt rules that change answers turned off. Answers are the full model's |
-| Windows, NVIDIA, an IQ pack (`--pack`) | `STRATA_UNBUFFERED_LOAD`, `STRATA_RAM_ADAPT`, `STRATA_COLD_OVERLAP`, `STRATA_COLD_KEPT_READERS`, `STRATA_PARTIAL_PIN`, `STRATA_RAM_ADAPT_PAR`, `STRATA_RAM_ADAPT_BG`, `STRATA_KV_LEND`, `STRATA_DIRECT_BATCH`, `STRATA_STAGER_IN_PLACE`, `STRATA_DENSE_ARENA` (all `=1`), `STRATA_STAGER_RING=128`; 3 stager threads; a prompt lend cap of 90% | Measured lossless on the PC under Result. Each switch steps aside by itself where it doesn't apply (for example K/V lending without streamed int8 K/V, the arena when one allocation fails) |
+| Windows, NVIDIA, an IQ pack (`--pack`) | `STRATA_UNBUFFERED_LOAD`, `STRATA_RAM_ADAPT`, `STRATA_COLD_OVERLAP`, `STRATA_COLD_KEPT_READERS`, `STRATA_PARTIAL_PIN`, `STRATA_RAM_ADAPT_PAR`, `STRATA_RAM_ADAPT_BG`, `STRATA_KV_LEND`, `STRATA_DIRECT_BATCH`, `STRATA_STAGER_IN_PLACE`, `STRATA_DENSE_ARENA` (all `=1`), `STRATA_STAGER_RING=128`, `STRATA_STAGER_THREADS=3`, `STRATA_STAGER_BATCH=1`; a prompt lend cap of 90% | Measured lossless on the PC under Result. Each switch steps aside by itself where it doesn't apply (for example K/V lending without streamed int8 K/V, the arena when one allocation fails) |
 | The same, with `--resident-budget-gib` (any size) | `STRATA_RAM_THROUGH=1` | Read-through needs the RAM tier. Its loss at 14 GiB here came from memory pressure, not the size (see Read-through) |
 | The same, with `--resident-budget-gib` on a PC with 28 GB of RAM or more | `STRATA_PREFILL_AUTO_MAX=16384` | 50K prompts in 6 expert passes instead of 7 (+7.9%). An explicit ceiling skips the #2090 RAM guard, which was measured with the full `--resident-experts` copy, so smaller PCs keep the guard |
 
@@ -139,6 +139,8 @@ From an earlier stage of this fork, two 990 PRO, 4 runs each. With everything on
 | Answering about an image | 24.8 tok/s | 31.6 tok/s | +28% |
 
 Setup refuses a second partition of the same disk, hard disks and USB drives. To turn it off, run `FAST-SETUP.bat --no-mirror` and delete the `StrataMirror` folder.
+
+The copy is written with its whole size reserved first, so it lands in a few large pieces. A copy written as it goes on a well-used system drive came out in 68,990 pieces here, and about 880 experts (layers 27-36) read 3x slower from it: 820-1,048 µs against 283-304 µs one at a time, 2 GB/s against 7 with 3 threads. In the suite that showed no change in prompt reading, and decode after a 50K prompt was within noise (mean +14%). FAST-SETUP warns when an existing copy has more than 1,000 pieces; delete it and run setup again to rewrite it.
 
 ## Beside a large app
 

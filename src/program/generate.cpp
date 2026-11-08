@@ -3373,6 +3373,10 @@ static void apply_fork_defaults(int argc, char** argv) {
                               "STRATA_STAGER_IN_PLACE", "STRATA_DENSE_ARENA"})
             def(n, "1");
         def("STRATA_STAGER_RING", "128");
+        // PF-STAGE's 3 threads and one blob a request, as variables: a pack's file tier sends the prompt path's stager to the SSD
+        // profile (32 threads, batch 8) before the in-code 3 is reached, so a launcher that sets neither got that profile
+        def("STRATA_STAGER_THREADS", "3");
+        def("STRATA_STAGER_BATCH", "1");
         if (budget > 0.0) def("STRATA_RAM_THROUGH", "1");
         MEMORYSTATUSEX ms{};
         ms.dwLength = sizeof ms;

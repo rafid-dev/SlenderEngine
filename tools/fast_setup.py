@@ -140,11 +140,68 @@ def same_file(a, b):
     return got.get(str(a)) is not None and got.get(str(a)) == got.get(str(b))
 
 
+def file_extents(path):
+    """How many pieces the file is stored in (fsutil), or None if Windows won't say."""
+    r = subprocess.run(["fsutil", "file", "queryextents", str(path)], capture_output=True, text=True)
+    n = r.stdout.count("VCN:")
+    return n if r.returncode == 0 and n > 0 else None
+
+
+FRAGMENTED = 1000   # more pieces than this: some reads of the copy become many small disk requests (68,990 measured 3x slower)
+
+
 def copy_experts(src, dst):
-    """Unbuffered, so the copy does not push everything else out of RAM."""
+    """Unbuffered, so the copy does not push everything else out of RAM, and with the whole size reserved first, so the
+    copy lands in a few large pieces. A copy written as it goes (robocopy /J) took the free gaps of a well-used drive:
+    68,990 pieces, and about 880 experts read 3x slower from it."""
+    k = ctypes.WinDLL("kernel32", use_last_error=True)
+    k.CreateFileW.restype = ctypes.c_void_p
+    k.CreateFileW.argtypes = [ctypes.c_wchar_p, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_void_p]
+    k.ReadFile.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint32, ctypes.POINTER(ctypes.c_uint32), ctypes.c_void_p]
+    k.WriteFile.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint32, ctypes.POINTER(ctypes.c_uint32), ctypes.c_void_p]
+    k.SetFilePointerEx.argtypes = [ctypes.c_void_p, ctypes.c_longlong, ctypes.c_void_p, ctypes.c_uint32]
+    k.SetEndOfFile.argtypes = [ctypes.c_void_p]
+    k.CloseHandle.argtypes = [ctypes.c_void_p]
+    k.VirtualAlloc.restype = ctypes.c_void_p
+    k.VirtualAlloc.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_uint32, ctypes.c_uint32]
+    k.VirtualFree.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_uint32]
+    READ, WRITE, SHARE_RW, OPEN_EXISTING, CREATE_ALWAYS, NO_BUFFERING = 0x80000000, 0x40000000, 3, 3, 2, 0x20000000
+    invalid, chunk, size = ctypes.c_void_p(-1).value, 64 << 20, src.stat().st_size
     dst.parent.mkdir(parents=True, exist_ok=True)
-    r = subprocess.run(["robocopy", str(src.parent), str(dst.parent), src.name, "/J", "/R:1", "/W:1", "/NJH", "/NDL", "/NC"])
-    return r.returncode < 8 and dst.exists() and dst.stat().st_size == src.stat().st_size   # robocopy: below 8 is success
+    h = k.CreateFileW(str(dst), READ | WRITE, 1, None, CREATE_ALWAYS, NO_BUFFERING, None)
+    if h in (None, invalid):
+        return False
+    k.SetFilePointerEx(h, size, None, 0)   # reserve every cluster now, as contiguous as the free space allows
+    reserved = bool(k.SetEndOfFile(h))
+    k.CloseHandle(h)
+    if not reserved:
+        return False
+    n = file_extents(dst)
+    if n is not None:
+        say(f"  Space reserved in {n} piece{'s' if n != 1 else ''}.")
+    s = k.CreateFileW(str(src), READ, SHARE_RW, None, OPEN_EXISTING, NO_BUFFERING, None)
+    d = k.CreateFileW(str(dst), WRITE, 1, None, OPEN_EXISTING, NO_BUFFERING, None)
+    buf = k.VirtualAlloc(None, chunk, 0x3000, 0x04)
+    ok = s not in (None, invalid) and d not in (None, invalid) and bool(buf)
+    got, put, done = ctypes.c_uint32(0), ctypes.c_uint32(0), 0
+    while ok and done < size:
+        want = min(chunk, (size - done + 4095) // 4096 * 4096)   # unbuffered I/O moves whole sectors; the tail is cut below
+        ok = bool(k.ReadFile(s, buf, want, ctypes.byref(got), None)) and got.value > 0
+        if ok:
+            n_out = (got.value + 4095) // 4096 * 4096
+            ok = bool(k.WriteFile(d, buf, n_out, ctypes.byref(put), None)) and put.value == n_out
+            done += got.value
+            if done % (10 << 30) < chunk:
+                say(f"  {done / GIB:.0f} of {size / GIB:.0f} GB")
+    for x in (s, d):
+        if x not in (None, invalid):
+            k.CloseHandle(x)
+    if buf:
+        k.VirtualFree(buf, 0, 0x8000)
+    if ok and size % 4096:   # the last sector was written whole: cut the file back to the original's size
+        with open(dst, "r+b") as f:
+            f.truncate(size)
+    return ok and done == size and dst.stat().st_size == size
 
 
 def choose_mirror(a, src, vols):
@@ -180,6 +237,10 @@ def choose_mirror(a, src, vols):
         dst = Path(f"{pick['letter']}:\\StrataMirror") / src.name
     if dst.exists() and dst.stat().st_size == size:
         say(f"Dual SSD: {dst} is already there with the right size.")
+        n = file_extents(dst)
+        if n is not None and n > FRAGMENTED:
+            say(f"  It is stored in {n:,} pieces, so some of its reads are slow (measured: about 880 experts 3x slower at 68,990 pieces).")
+            say(f"  To fix it: delete {dst} and run FAST-SETUP.bat again; the new copy reserves its space first.")
         if a.verify and not a.dry_run and not same_file(src, dst):
             sys.exit(f"{dst} differs from {src}. Delete it and run this again.")
         return dst
