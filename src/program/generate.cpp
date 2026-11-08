@@ -11151,31 +11151,42 @@ int main(int argc, char** argv) {
         // roomed prompt is laid out for a LARGER chunk, in the auto chunk's loan and on into the pack (Prefill::relayout with a room), so a long
         // prompt is read in fewer passes over the experts.  Every other prompt keeps the loan-only layout (a layout that used the room is
         // always laid out again before one is read), so nothing outside a roomed prompt points into the pack.
-        bool df2_room_chunk = false;
-        int64_t df2_chunk_room = 0;
+        // STRATA_MTP_ROOM_CHUNK=1 / STRATA_MTP_ROOM_HEAD=1 (with STRATA_MTP_ROOM_MIN, fork): the same with the MTP drafter's 512 experts (708 MiB)
+        // as the room, lent and reclaimed as STRATA_MTP_ROOM_MIN does it; the room then closes before the first verify window as well.
+        bool pr_chunk_on = false;
+        int64_t pr_chunk_max = 0;
+        bool pr_mtp = false;            // the room is the MTP drafter's experts (else the DFlash2 pack)
+        void* pr_base = nullptr;        // the room's bytes after the loan
+        uint64_t pr_bytes = 0;
         // STRATA_DF2_ROOM_HEAD=1 (with STRATA_DF2_ROOM_CHUNK, fork): the room also takes the output head (re-read from the model file into the
         // same address after the prompt: NativeHead::room_reclaim) and the drafter's own draft head (written back from a RAM copy).  A prompt's
         // chunk passes read neither; decode, the verify windows and the drafter do, and the room closes before any of them.
-        bool df2_room_head = false;
-        if (df2_room_slots > 0) {
-            const char* cv = std::getenv("STRATA_DF2_ROOM_CHUNK");
+        bool pr_head_on = false;
+        if (df2_room_slots > 0 || mtp_room_slots > 0) {
+            pr_mtp = df2_room_slots == 0;
+            pr_base = pr_mtp ? mtp.experts_base() : df2_room_base;
+            pr_bytes = pr_mtp ? (uint64_t) mtp.experts_bytes() : df2_room_bytes;
+            const char* cv = std::getenv(pr_mtp ? "STRATA_MTP_ROOM_CHUNK" : "STRATA_DF2_ROOM_CHUNK");
             if (cv != nullptr && cv[0] == '1') {
-                if (pf_parts.size() != 1 || pf_parts[0].first < 0 || o.prefill_chunk <= 0 || o.prefill_head_alias) {
-                    std::fprintf(stderr, "strata serve: STRATA_DF2_ROOM_CHUNK is unavailable: it needs one prompt path with a loan "
-                                         "(no layer split, no --prefill-head-alias)\n");
+                if (pf_parts.size() != 1 || pf_parts[0].first < 0 || o.prefill_chunk <= 0 || o.prefill_head_alias ||
+                    (pr_mtp && (multi_gpu || mtp.device() != pf_parts[0].dev && pf_parts[0].dev >= 0))) {
+                    std::fprintf(stderr, "strata serve: STRATA_%s_ROOM_CHUNK is unavailable: it needs one prompt path with a loan on the "
+                                         "drafter's card (no layer split, no --prefill-head-alias)\n", pr_mtp ? "MTP" : "DF2");
                 } else {
                     const PfPart& p0 = pf_parts[0];
                     const uint64_t loan = part_bytes(p0, p0.first);
                     uint64_t heads = 0;   // STRATA_DF2_ROOM_HEAD: the output head and the draft head's rows (its file's token count)
-                    if (const char* hv = std::getenv("STRATA_DF2_ROOM_HEAD"); hv != nullptr && hv[0] == '1') {
+                    if (const char* hv = std::getenv(pr_mtp ? "STRATA_MTP_ROOM_HEAD" : "STRATA_DF2_ROOM_HEAD"); hv != nullptr && hv[0] == '1') {
                         if (native_head.room_base() == nullptr) {
-                            std::fprintf(stderr, "strata serve: STRATA_DF2_ROOM_HEAD is unavailable: it needs the native output head in VRAM, "
-                                                 "as read from the model file\n");
+                            std::fprintf(stderr, "strata serve: STRATA_%s_ROOM_HEAD is unavailable: it needs the native output head in VRAM, "
+                                                 "as read from the model file\n", pr_mtp ? "MTP" : "DF2");
                         } else {
-                            df2_room_head = true;
-                            df2.set_room_head(true);
+                            pr_head_on = true;
                             heads = native_head.weight_bytes();
-                            if (FILE* vf = std::fopen(df2_vocab_path().c_str(), "rb")) {
+#if defined(STRATA_HAVE_DFLASH2)
+                            if (!pr_mtp) df2.set_room_head(true);
+#endif
+                            if (FILE* vf = pr_mtp ? nullptr : std::fopen(df2_vocab_path().c_str(), "rb")) {   // the DFlash2 draft head's rows
                                 std::fseek(vf, 0, SEEK_END);
                                 const long vsz = std::ftell(vf);
                                 std::fclose(vf);
@@ -11183,29 +11194,32 @@ int main(int argc, char** argv) {
                             }
                         }
                     }
-                    const uint64_t margin = (df2_room_head ? 3ull : 1ull) * (64ull << 20);   // each region's tail can go unused
+                    const uint64_t margin = (pr_head_on ? 3ull : 1ull) * (64ull << 20);   // each region's tail can go unused
                     const int64_t cap = std::max<int64_t>(o.prefill_chunk, o.prefill_auto_max);
                     for (int64_t c = (o.prefill_chunk / 256 + 1) * 256; c <= cap; c += 256)
-                        if (strata::prefill::Prefill::bytes_needed(g, *p0.ses, c, srcp != nullptr) + margin <= loan + df2_room_bytes + heads)
-                            df2_chunk_room = c;
-                    if (df2_chunk_room > o.prefill_chunk) {
-                        df2_room_chunk = true;
-                        std::fprintf(stderr, "strata serve: STRATA_DF2_ROOM_CHUNK: a roomed prompt reads in chunks of up to %lld tokens "
-                                             "(%lld without the room): the loan's %.2f GiB and the pack's %.2f GiB%s%.2f GiB\n",
-                                     (long long) df2_chunk_room, (long long) o.prefill_chunk, (double) loan / 1073741824.0,
-                                     (double) df2_room_bytes / 1073741824.0, df2_room_head ? ", and the two heads' " : "",
-                                     df2_room_head ? (double) heads / 1073741824.0 : 0.0);
+                        if (strata::prefill::Prefill::bytes_needed(g, *p0.ses, c, srcp != nullptr) + margin <= loan + pr_bytes + heads)
+                            pr_chunk_max = c;
+                    if (pr_chunk_max > o.prefill_chunk) {
+                        pr_chunk_on = true;
+                        std::fprintf(stderr, "strata serve: STRATA_%s_ROOM_CHUNK: a roomed prompt reads in chunks of up to %lld tokens "
+                                             "(%lld without the room): the loan's %.2f GiB and the %s %.2f GiB%s%.2f GiB\n", pr_mtp ? "MTP" : "DF2",
+                                     (long long) pr_chunk_max, (long long) o.prefill_chunk, (double) loan / 1073741824.0,
+                                     pr_mtp ? "drafter's experts'" : "pack's", (double) pr_bytes / 1073741824.0,
+                                     pr_head_on ? (pr_mtp ? ", and the output head's " : ", and the two heads' ") : "",
+                                     pr_head_on ? (double) heads / 1073741824.0 : 0.0);
                     } else {
-                        df2_chunk_room = 0;
-                        df2_room_head = false;
-                        df2.set_room_head(false);
+                        pr_chunk_max = 0;
+                        pr_head_on = false;
+#if defined(STRATA_HAVE_DFLASH2)
+                        if (!pr_mtp) df2.set_room_head(false);
+#endif
                         std::fprintf(stderr, "strata serve: STRATA_DF2_ROOM_CHUNK: no chunk larger than %lld fits the loan and the pack: "
                                              "the room stays extra ring slots\n", (long long) o.prefill_chunk);
                     }
                 }
             }
         }
-        bool df2_layout_roomed = false;   // the prompt path's current layout continues into the pack (a roomed prompt's)
+        bool pr_layout_roomed = false;   // the prompt path's current layout continues into the pack (a roomed prompt's)
         bool any_loan = borrow != nullptr;
         for (size_t i = 1; i < pf_parts.size(); ++i) any_loan = any_loan || pf_parts[i].first >= 0;
         if (nib::any_on()) {
@@ -11312,13 +11326,14 @@ int main(int argc, char** argv) {
             cudaGetDevice(&cur_dev);   // the device this path is about to run on (dev -1: the current one)
             const bool room_here = mtp_room_slots > 0 && mtp.device() == cur_dev;
             const bool df2_room_here = df2_room_slots > 0;   // one GPU only (STRATA_DF2_ROOM_MIN above)
-            const bool df2_ring_room = df2_room_here && !df2_room_chunk;   // STRATA_DF2_ROOM_CHUNK: the room holds buffers, not ring slots
+            const bool df2_ring_room = df2_room_here && !pr_chunk_on;   // STRATA_*_ROOM_CHUNK: the room holds buffers, not ring slots
+            const bool mtp_ring_room = room_here && !pr_chunk_on;
             if (room_here || df2_room_here) room_path = &sp;
-            sp.set_ring_room(room_here ? mtp_room_slots : df2_ring_room ? df2_room_slots : 0);
-            sp.set_ring_room_base(room_here ? mtp.experts_base() : df2_ring_room ? df2_room_base : nullptr,
-                                  room_here ? mtp.experts_bytes() : df2_ring_room ? df2_room_bytes : 0);
-            if (df2_room_chunk) sp.set_max_chunk(df2_chunk_room);
-            df2_layout_roomed = false;   // init lays out the loan only
+            sp.set_ring_room(mtp_ring_room ? mtp_room_slots : df2_ring_room ? df2_room_slots : 0);
+            sp.set_ring_room_base(mtp_ring_room ? mtp.experts_base() : df2_ring_room ? df2_room_base : nullptr,
+                                  mtp_ring_room ? mtp.experts_bytes() : df2_ring_room ? df2_room_bytes : 0);
+            if (pr_chunk_on) sp.set_max_chunk(pr_chunk_max);
+            pr_layout_roomed = false;   // init lays out the loan only
             if (!sp.init(wt, g, ss, prefill_src, &xcache, host_res.data(), o.prefill_chunk, main_cs, err, borrow, borrow_bytes,
                          o.prefill_head_alias))
                 return err.find("do not fit") != std::string::npos ? 2 : 1;
@@ -16168,7 +16183,7 @@ int main(int argc, char** argv) {
             // nothing from the room).  Nothing is laid out again - the room's slots are the drafter's own bytes
             // (Prefill::set_ring_room_base) - and `room_close` below gives the decode its contents back before the
             // first window.  A room left open by an earlier request (a cancelled prompt) is closed first.
-            bool mtp_room_open = mtp_room_slots > 0 && room_path != nullptr && !mtp.experts_resident();
+            bool mtp_room_open = mtp_room_slots > 0 && room_path != nullptr && (!mtp.experts_resident() || (pr_mtp && native_head.room_lent()));
             auto head_restore = [&]() -> int {
                 if (!o.prefill_head_alias || native_head.loaded()) return 0;
                 sp.reset();
@@ -16188,19 +16203,26 @@ int main(int argc, char** argv) {
                              std::chrono::duration<double, std::milli>(Clock::now() - head_t0).count());
                 return 0;
             };
-            auto room_close = [&](const char* why) -> int {
+            auto mtp_room_finish = [&](const char* why, std::string& e) -> bool {
                 const auto t0 = Clock::now();
                 if (room_path != nullptr) {
                     // the ring goes back to the rule's count FIRST: nothing after this can stage into the lender's
                     // bytes, and the streams are idle before they are written over (a prompt pass reads them)
-                    if (!room_path->idle(err)) { std::printf("ERR %s\n", err.c_str()); return 1; }
+                    if (!room_path->idle(e)) return false;
                     room_path->set_ring_room_active(false);
                 }
-                if (!mtp.experts_reclaim(err)) { std::printf("ERR %s\n", err.c_str()); return 1; }
+                if (!mtp.experts_reclaim(e)) return false;
+                const double ms_exp = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
+                const bool head_back = pr_mtp && native_head.room_lent();   // STRATA_MTP_ROOM_HEAD: read from the model file again, same address
+                if (head_back && !native_head.room_reclaim(e)) return false;
                 mtp_room_open = false;
                 std::fprintf(stderr, "strata serve: prompt room (%s): the drafter's experts are the decode's again in "
-                                     "%.1f ms\n", why,
-                             std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
+                                     "%.1f ms%s\n", why, ms_exp,
+                             head_back ? (", the output head is back in " + std::to_string((int) (std::chrono::duration<double, std::milli>(Clock::now() - t0).count() - ms_exp + 0.5)) + " ms").c_str() : "");
+                return true;
+            };
+            auto room_close = [&](const char* why) -> int {
+                if (!mtp_room_finish(why, err)) { std::printf("ERR %s\n", err.c_str()); return 1; }
                 return 0;
             };
             if (mtp_room_open && room_close("left open") != 0) return 1;
@@ -16955,6 +16977,8 @@ int main(int argc, char** argv) {
                 } else {
                     room_path->set_ring_room_active(true);   // before the loan: a relayout re-carves with the room
                     mtp_room_open = true;
+                    if (pr_mtp && pr_head_on && !native_head.room_lend(err))   // STRATA_MTP_ROOM_HEAD: without it the roomed chunk steps down to what fits
+                        std::fprintf(stderr, "strata serve: prompt room: the output head stays: %s\n", err.c_str());
                     std::fprintf(stderr, "strata serve: prompt room: %lld tokens to read, the prompt path's ring is the "
                                          "drafter's %llu MiB (%d slots past its own, lent in %.1f ms)\n",
                                  (long long) (n - read_from),
@@ -16971,7 +16995,7 @@ int main(int argc, char** argv) {
                 } else {
                     room_path->set_ring_room_active(true);   // before the loan: a relayout re-carves with the room
                     df2_room_open = true;
-                    if (df2_room_head && !native_head.room_lend(err))   // STRATA_DF2_ROOM_HEAD: without it the roomed chunk steps down to what fits
+                    if (pr_head_on && !native_head.room_lend(err))   // STRATA_DF2_ROOM_HEAD: without it the roomed chunk steps down to what fits
                         std::fprintf(stderr, "strata serve: prompt room: the output head stays: %s\n", err.c_str());
                     room_saved_taps = sp.on_taps;
                     room_taps.clear();
@@ -17155,6 +17179,7 @@ int main(int argc, char** argv) {
             auto read_windows = [&](int64_t a, int64_t b, std::string& e) -> bool {
                 // STRATA_DF2_ROOM_MIN / _HEAD: the room closes before the first window runs (a window reads the output head; its rows follow the held ones)
                 if (df2_room_open && !df2_room_finish("windows", true, e)) return false;
+                if (mtp_room_open && pr_chunk_on && !mtp_room_finish("windows", e)) return false;   // STRATA_MTP_ROOM_CHUNK
                 // (STRATA_LOGPOS reads every window's logits: the serial loop)
                 // the pipelined prompt read stays two-stage (three or more stages read serially; only the decode overlaps)
                 if (pipe && n_stages == 2 && pl_pw >= 1 && std::getenv("STRATA_LOGPOS") == nullptr) return read_windows_pl(a, b, e);
@@ -17373,14 +17398,14 @@ int main(int argc, char** argv) {
                 bool any = false;
                 // STRATA_DF2_ROOM_CHUNK: a roomed prompt (the room open for this request) is laid out for the larger chunk, in the auto chunk's
                 // loan and on into the pack; any other read is laid out in the loan alone, again if the last layout used the pack
-                const bool roomed = df2_room_chunk && df2_room_open && pf_parts.size() == 1;
+                const bool roomed = pr_chunk_on && (pr_mtp ? mtp_room_open : df2_room_open) && pf_parts.size() == 1;
                 for (PfPart& p : pf_parts) {
                     if (p.first < 0) continue;
                     if (roomed) {
-                        int64_t want_r = exact > 0 ? std::min(exact, df2_chunk_room)
-                                                   : planned_chunk(tokens, df2_chunk_room, pf_plan_chunk);
+                        int64_t want_r = exact > 0 ? std::min(exact, pr_chunk_max)
+                                                   : planned_chunk(tokens, pr_chunk_max, pf_plan_chunk);
                         if (!p.lent.empty()) {
-                            if (df2_layout_roomed && want_r <= p.lent_chunk) continue;   // this request's roomed loan covers it
+                            if (pr_layout_roomed && want_r <= p.lent_chunk) continue;   // this request's roomed loan covers it
                             if (!refill_one(p, e)) return false;
                         }
                         const strata::core::OnDevice on(p.dev);
@@ -17390,8 +17415,10 @@ int main(int argc, char** argv) {
                         uint64_t room_b[3] = {};
                         int nr = 0;
                         if (native_head.room_lent()) { rooms[nr] = native_head.room_base(); room_b[nr++] = native_head.weight_bytes(); }
-                        rooms[nr] = df2_room_base; room_b[nr++] = df2_room_bytes;
-                        if (df2_room_head && df2.dhead_room_base() != nullptr) { rooms[nr] = df2.dhead_room_base(); room_b[nr++] = df2.dhead_room_bytes(); }
+                        rooms[nr] = pr_base; room_b[nr++] = pr_bytes;
+#if defined(STRATA_HAVE_DFLASH2)
+                        if (!pr_mtp && pr_head_on && df2.dhead_room_base() != nullptr) { rooms[nr] = df2.dhead_room_base(); room_b[nr++] = df2.dhead_room_bytes(); }
+#endif
                         // the start-up sum is an estimate (a buffer cannot straddle regions): a chunk that does not fit steps down
                         while (!p.sp->relayout(want_r, p.cache->device_slot(first), part_bytes(p, first), e, rooms, room_b, nr)) {
                             if (want_r - 256 <= o.prefill_chunk) return false;
@@ -17401,7 +17428,7 @@ int main(int argc, char** argv) {
                             e.clear();
                         }
                         p.first_now = first;
-                        df2_layout_roomed = true;
+                        pr_layout_roomed = true;
                         for (int64_t l = p.lb; l < p.le; ++l)
                             for (int64_t ex = 0; ex < g.n_expert; ++ex) {
                                 const size_t i = (size_t) (l * g.n_expert + ex);
@@ -17413,12 +17440,12 @@ int main(int argc, char** argv) {
                             }
                         p.lent_chunk = want_r;
                         std::fprintf(stderr, "strata serve: STRATA_DF2_ROOM_CHUNK: this prompt reads in chunks of %lld tokens, its buffers in "
-                                             "the loan and the DFlash2 pack%s\n", (long long) want_r,
-                                     nr > 1 ? " and the heads" : "");
+                                             "the loan and the %s%s\n", (long long) want_r, pr_mtp ? "MTP drafter's experts" : "DFlash2 pack",
+                                     nr > 1 ? (pr_mtp ? " and the output head" : " and the heads") : "");
                         continue;
                     }
                     if (!p.lent.empty()) {
-                        if (want <= p.lent_chunk && !df2_layout_roomed) continue;   // its current loan already covers this
+                        if (want <= p.lent_chunk && !pr_layout_roomed) continue;   // its current loan already covers this
                         // ONLY this participant's loan goes back: `refill` would return the other participants'
                         // loans too, and their buffers are still laid out in their caches - marking those slots
                         // resident again would hand the next window a prompt buffer in place of an expert
@@ -17455,10 +17482,10 @@ int main(int argc, char** argv) {
                                          (long long) need_p, (long long) (p.cache->slots() - p.first));
                         first = (int32_t) (p.cache->slots() - need_p);
                     }
-                    if (want_p != p.sp->chunk() || first != p.first_now || df2_layout_roomed) {
+                    if (want_p != p.sp->chunk() || first != p.first_now || pr_layout_roomed) {
                         if (!p.sp->relayout(want_p, p.cache->device_slot(first), part_bytes(p, first), e)) return false;
                         p.first_now = first;
-                        df2_layout_roomed = false;
+                        pr_layout_roomed = false;
                     }
                     for (int64_t l = p.lb; l < p.le; ++l)              // THIS participant's layers only
                         for (int64_t ex = 0; ex < g.n_expert; ++ex) {
