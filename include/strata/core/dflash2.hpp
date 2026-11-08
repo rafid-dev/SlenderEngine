@@ -171,6 +171,11 @@ public:
     bool room_lend(std::string& err);
     bool room_reclaim(std::string& err);
     bool room_lent() const { return room_lent_; }
+    /// STRATA_DF2_ROOM_HEAD: the owned draft head is lent with the pack (its host copy made once, written back by room_reclaim).
+    /// Before the first room_lend.  dhead_room_base(): nullptr when the head is shared or not the drafter's own.
+    void set_room_head(bool on) { room_head_ = on; }
+    uint8_t* dhead_room_base() const { return (head_is_dhead_ && !dhead_shared_ && dhead_ != nullptr && dhead_bytes_ > 0) ? dhead_ : nullptr; }
+    uint64_t dhead_room_bytes() const { return dhead_room_base() != nullptr ? dhead_bytes_ : 0; }
     double ms_room_reclaim = 0;
     int64_t n_room_lends = 0;
 
@@ -216,6 +221,7 @@ private:
     uint8_t* h_dhead_ = nullptr;
     bool parked_ = false, head_is_dhead_ = false;
     bool room_lent_ = false;        ///< room_lend: the pack's bytes are the prompt path's ring until room_reclaim
+    bool room_head_ = false;        ///< set_room_head: the owned draft head is lent too
     uint8_t* last_blob_ = nullptr;  ///< the addresses the round graphs were captured with (park: recapture only when they move)
     uint8_t* last_dhead_ = nullptr;
     float* landing_ = nullptr;

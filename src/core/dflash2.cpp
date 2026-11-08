@@ -782,6 +782,13 @@ bool Dflash2Drafter::room_lend(std::string& err) {
             std::free(h_blob_); h_blob_ = nullptr; err = "dflash2 room: the pack's copy to RAM failed"; return false;
         }
     }
+    if (room_head_ && dhead_room_base() != nullptr && h_dhead_ == nullptr) {   // STRATA_DF2_ROOM_HEAD: the owned draft head too, its copy once
+        h_dhead_ = (uint8_t*) std::malloc(dhead_bytes_);
+        if (h_dhead_ == nullptr) { err = "dflash2 room: no RAM for the draft head's copy"; return false; }
+        if (cudaMemcpy(h_dhead_, dhead_, dhead_bytes_, cudaMemcpyDeviceToHost) != cudaSuccess) {
+            std::free(h_dhead_); h_dhead_ = nullptr; err = "dflash2 room: the draft head's copy to RAM failed"; return false;
+        }
+    }
     room_lent_ = true;
     ++n_room_lends;
     return true;
@@ -794,6 +801,11 @@ bool Dflash2Drafter::room_reclaim(std::string& err) {
     // the same bytes to the same address: the round graphs captured with it read the weights again
     if (cudaMemcpy(blob_, h_blob_, blob_bytes_, cudaMemcpyHostToDevice) != cudaSuccess) {
         err = std::string("dflash2 room: the pack's copy back failed: ") + cudaGetErrorString(cudaGetLastError());
+        return false;
+    }
+    if (room_head_ && dhead_room_base() != nullptr && h_dhead_ != nullptr &&
+        cudaMemcpy(dhead_, h_dhead_, dhead_bytes_, cudaMemcpyHostToDevice) != cudaSuccess) {
+        err = std::string("dflash2 room: the draft head's copy back failed: ") + cudaGetErrorString(cudaGetLastError());
         return false;
     }
     room_lent_ = false;

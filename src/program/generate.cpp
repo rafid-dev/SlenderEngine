@@ -11153,6 +11153,10 @@ int main(int argc, char** argv) {
         // always laid out again before one is read), so nothing outside a roomed prompt points into the pack.
         bool df2_room_chunk = false;
         int64_t df2_chunk_room = 0;
+        // STRATA_DF2_ROOM_HEAD=1 (with STRATA_DF2_ROOM_CHUNK, fork): the room also takes the output head (re-read from the model file into the
+        // same address after the prompt: NativeHead::room_reclaim) and the drafter's own draft head (written back from a RAM copy).  A prompt's
+        // chunk passes read neither; decode, the verify windows and the drafter do, and the room closes before any of them.
+        bool df2_room_head = false;
         if (df2_room_slots > 0) {
             const char* cv = std::getenv("STRATA_DF2_ROOM_CHUNK");
             if (cv != nullptr && cv[0] == '1') {
@@ -11162,19 +11166,39 @@ int main(int argc, char** argv) {
                 } else {
                     const PfPart& p0 = pf_parts[0];
                     const uint64_t loan = part_bytes(p0, p0.first);
-                    const uint64_t margin = 64ull << 20;
+                    uint64_t heads = 0;   // STRATA_DF2_ROOM_HEAD: the output head and the draft head's rows (its file's token count)
+                    if (const char* hv = std::getenv("STRATA_DF2_ROOM_HEAD"); hv != nullptr && hv[0] == '1') {
+                        if (native_head.room_base() == nullptr) {
+                            std::fprintf(stderr, "strata serve: STRATA_DF2_ROOM_HEAD is unavailable: it needs the native output head in VRAM, "
+                                                 "as read from the model file\n");
+                        } else {
+                            df2_room_head = true;
+                            df2.set_room_head(true);
+                            heads = native_head.weight_bytes();
+                            if (FILE* vf = std::fopen(df2_vocab_path().c_str(), "rb")) {
+                                std::fseek(vf, 0, SEEK_END);
+                                const long vsz = std::ftell(vf);
+                                std::fclose(vf);
+                                if (vsz >= 4) heads += (uint64_t) (vsz / 4) * (uint64_t) native_head.row_bytes();
+                            }
+                        }
+                    }
+                    const uint64_t margin = (df2_room_head ? 3ull : 1ull) * (64ull << 20);   // each region's tail can go unused
                     const int64_t cap = std::max<int64_t>(o.prefill_chunk, o.prefill_auto_max);
                     for (int64_t c = (o.prefill_chunk / 256 + 1) * 256; c <= cap; c += 256)
-                        if (strata::prefill::Prefill::bytes_needed(g, *p0.ses, c, srcp != nullptr) + margin <= loan + df2_room_bytes)
+                        if (strata::prefill::Prefill::bytes_needed(g, *p0.ses, c, srcp != nullptr) + margin <= loan + df2_room_bytes + heads)
                             df2_chunk_room = c;
                     if (df2_chunk_room > o.prefill_chunk) {
                         df2_room_chunk = true;
                         std::fprintf(stderr, "strata serve: STRATA_DF2_ROOM_CHUNK: a roomed prompt reads in chunks of up to %lld tokens "
-                                             "(%lld without the room): the loan's %.2f GiB and the pack's %.2f GiB\n",
+                                             "(%lld without the room): the loan's %.2f GiB and the pack's %.2f GiB%s%.2f GiB\n",
                                      (long long) df2_chunk_room, (long long) o.prefill_chunk, (double) loan / 1073741824.0,
-                                     (double) df2_room_bytes / 1073741824.0);
+                                     (double) df2_room_bytes / 1073741824.0, df2_room_head ? ", and the two heads' " : "",
+                                     df2_room_head ? (double) heads / 1073741824.0 : 0.0);
                     } else {
                         df2_chunk_room = 0;
+                        df2_room_head = false;
+                        df2.set_room_head(false);
                         std::fprintf(stderr, "strata serve: STRATA_DF2_ROOM_CHUNK: no chunk larger than %lld fits the loan and the pack: "
                                              "the room stays extra ring slots\n", (long long) o.prefill_chunk);
                     }
@@ -16198,7 +16222,7 @@ int main(int argc, char** argv) {
             // that reads prompt tokens (it feeds the drafter itself), whichever comes first.  false: `e` says why.
             auto df2_room_finish = [&](const char* why, bool hand, std::string& e) -> bool {
 #if defined(STRATA_HAVE_DFLASH2)
-                if (!df2.room_lent()) { df2_room_open = false; return true; }
+                if (!df2.room_lent() && !native_head.room_lent()) { df2_room_open = false; return true; }
                 const auto t0 = Clock::now();
                 if (room_path != nullptr) {
                     // nothing stages into the pack after this, and the prompt path's streams are idle before it is written over
@@ -16207,6 +16231,10 @@ int main(int argc, char** argv) {
                 }
                 if (df2_room_open && room_saved_taps) sp.on_taps = room_saved_taps;
                 if (!df2.room_reclaim(e)) return false;
+                const double ms_pack = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
+                const bool head_back = native_head.room_lent();
+                if (head_back && !native_head.room_reclaim(e)) return false;   // STRATA_DF2_ROOM_HEAD: read from the model file again, same address
+                const double ms_head = std::chrono::duration<double, std::milli>(Clock::now() - t0).count() - ms_pack;
                 const bool was_open = df2_room_open;
                 df2_room_open = false;
                 const int64_t rows = room_rows;
@@ -16226,8 +16254,9 @@ int main(int argc, char** argv) {
                 room_taps.clear();
                 room_rows = 0;
                 room_pos0 = -1;
-                std::fprintf(stderr, "strata serve: prompt room (%s): the DFlash2 pack's weights are back in %.1f ms, %lld tap rows handed over\n",
-                             why, std::chrono::duration<double, std::milli>(Clock::now() - t0).count(), (long long) rows);
+                std::fprintf(stderr, "strata serve: prompt room (%s): the DFlash2 pack's weights are back in %.1f ms%s, %lld tap rows handed over (%.1f ms in all)\n",
+                             why, ms_pack, head_back ? (", the output head in " + std::to_string((int) (ms_head + 0.5)) + " ms").c_str() : "",
+                             (long long) rows, std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
 #else
                 (void) why; (void) hand; (void) e;
 #endif
@@ -16942,6 +16971,8 @@ int main(int argc, char** argv) {
                 } else {
                     room_path->set_ring_room_active(true);   // before the loan: a relayout re-carves with the room
                     df2_room_open = true;
+                    if (df2_room_head && !native_head.room_lend(err))   // STRATA_DF2_ROOM_HEAD: without it the roomed chunk steps down to what fits
+                        std::fprintf(stderr, "strata serve: prompt room: the output head stays: %s\n", err.c_str());
                     room_saved_taps = sp.on_taps;
                     room_taps.clear();
                     room_rows = 0;
@@ -17344,16 +17375,29 @@ int main(int argc, char** argv) {
                 for (PfPart& p : pf_parts) {
                     if (p.first < 0) continue;
                     if (roomed) {
-                        const int64_t want_r = exact > 0 ? std::min(exact, df2_chunk_room)
-                                                         : planned_chunk(tokens, df2_chunk_room, pf_plan_chunk);
+                        int64_t want_r = exact > 0 ? std::min(exact, df2_chunk_room)
+                                                   : planned_chunk(tokens, df2_chunk_room, pf_plan_chunk);
                         if (!p.lent.empty()) {
                             if (df2_layout_roomed && want_r <= p.lent_chunk) continue;   // this request's roomed loan covers it
                             if (!refill_one(p, e)) return false;
                         }
                         const strata::core::OnDevice on(p.dev);
                         const int32_t first = p.first;   // the auto chunk's loan: the largest the loan-only layouts take
-                        if (!p.sp->relayout(want_r, p.cache->device_slot(first), part_bytes(p, first), e, df2_room_base, df2_room_bytes))
-                            return false;
+                        // the lenders' regions, largest first: the output head (STRATA_DF2_ROOM_HEAD, when lent), the pack, the draft head
+                        void* rooms[3] = {};
+                        uint64_t room_b[3] = {};
+                        int nr = 0;
+                        if (native_head.room_lent()) { rooms[nr] = native_head.room_base(); room_b[nr++] = native_head.weight_bytes(); }
+                        rooms[nr] = df2_room_base; room_b[nr++] = df2_room_bytes;
+                        if (df2_room_head && df2.dhead_room_base() != nullptr) { rooms[nr] = df2.dhead_room_base(); room_b[nr++] = df2.dhead_room_bytes(); }
+                        // the start-up sum is an estimate (a buffer cannot straddle regions): a chunk that does not fit steps down
+                        while (!p.sp->relayout(want_r, p.cache->device_slot(first), part_bytes(p, first), e, rooms, room_b, nr)) {
+                            if (want_r - 256 <= o.prefill_chunk) return false;
+                            std::fprintf(stderr, "strata serve: STRATA_DF2_ROOM_CHUNK: a chunk of %lld does not fit the room (%s): trying %lld\n",
+                                         (long long) want_r, e.c_str(), (long long) (want_r - 256));
+                            want_r -= 256;
+                            e.clear();
+                        }
                         p.first_now = first;
                         df2_layout_roomed = true;
                         for (int64_t l = p.lb; l < p.le; ++l)
@@ -17367,7 +17411,8 @@ int main(int argc, char** argv) {
                             }
                         p.lent_chunk = want_r;
                         std::fprintf(stderr, "strata serve: STRATA_DF2_ROOM_CHUNK: this prompt reads in chunks of %lld tokens, its buffers in "
-                                             "the loan and the DFlash2 pack\n", (long long) want_r);
+                                             "the loan and the DFlash2 pack%s\n", (long long) want_r,
+                                     nr > 1 ? " and the heads" : "");
                         continue;
                     }
                     if (!p.lent.empty()) {

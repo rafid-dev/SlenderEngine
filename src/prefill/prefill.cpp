@@ -653,9 +653,10 @@ struct Alloc {
     bool count_only = false;
     bool spill = false, spilled = false;
     std::vector<void*>* owned = nullptr;
-    // STRATA_DF2_ROOM_CHUNK: a second region the takes continue in once `base` is full (a lender's bytes, for one prompt)
-    uint8_t* base2 = nullptr;
-    uint64_t cap2 = 0, used2 = 0;
+    // STRATA_DF2_ROOM_CHUNK / _HEAD: regions a take continues in when `base` cannot hold it (lenders' bytes, for one prompt), first fit
+    static constexpr int kRooms = 4;
+    uint8_t* rbase[kRooms] = {};
+    uint64_t rcap[kRooms] = {}, rused[kRooms] = {};
     template <typename T> T* take(size_t n, bool& ok) {
         uint64_t bytes = ((uint64_t) n * sizeof(T) + 256 + 255) & ~255ull;
         if (count_only) {
@@ -668,11 +669,12 @@ struct Alloc {
             used += bytes;
             return p;
         }
-        if (base2 != nullptr && used2 + bytes <= cap2) {
-            T* p = (T*) (base2 + used2);
-            used2 += bytes;
-            return p;
-        }
+        for (int r = 0; r < kRooms; ++r)
+            if (rbase[r] != nullptr && rused[r] + bytes <= rcap[r]) {
+                T* p = (T*) (rbase[r] + rused[r]);
+                rused[r] += bytes;
+                return p;
+            }
         if (base != nullptr && !spill) { ok = false; failed_bytes = bytes; return nullptr; }
         void* p = nullptr;
         if (cudaMalloc(&p, bytes) != cudaSuccess) { ok = false; failed_bytes = bytes; return nullptr; }
@@ -2159,6 +2161,12 @@ bool Prefill::relayout(int64_t chunk, void* borrow, uint64_t borrow_bytes, std::
 }
 
 bool Prefill::relayout(int64_t chunk, void* borrow, uint64_t borrow_bytes, std::string& err, void* room, uint64_t room_bytes) {
+    void* const rooms[1] = {room};
+    const uint64_t sizes[1] = {room != nullptr ? room_bytes : 0};
+    return relayout(chunk, borrow, borrow_bytes, err, rooms, sizes, room != nullptr ? 1 : 0);
+}
+
+bool Prefill::relayout(int64_t chunk, void* borrow, uint64_t borrow_bytes, std::string& err, void* const* rooms, const uint64_t* room_bytes, int n_rooms) {
     Impl& m = *impl_;
     if (m.borrow_spill) {
         err = "prefill: a hybrid borrowed/owned layout cannot be changed between requests";
@@ -2178,8 +2186,11 @@ bool Prefill::relayout(int64_t chunk, void* borrow, uint64_t borrow_bytes, std::
     o.base = (uint8_t*) borrow;
     o.cap = borrow_bytes;
     o.owned = &m.owned;
-    o.base2 = (uint8_t*) room;    // STRATA_DF2_ROOM_CHUNK: what the loan cannot hold continues in the lender's bytes
-    o.cap2 = room != nullptr ? room_bytes : 0;
+    if (n_rooms > Alloc::kRooms) { err = "prefill: relayout takes at most 4 rooms"; return false; }
+    for (int r = 0; r < n_rooms; ++r) {   // STRATA_DF2_ROOM_CHUNK / _HEAD: what the loan cannot hold continues in the lenders' bytes
+        o.rbase[r] = (uint8_t*) rooms[r];
+        o.rcap[r] = rooms[r] != nullptr ? room_bytes[r] : 0;
+    }
     uint16_t* gs = o.take<uint16_t>((size_t) GEMM_SCRATCH, ok);
     void* ws = o.take<uint8_t>(GEMM_WS, ok);
     uint16_t* gs2 = gemm_dequant_side() ? o.take<uint16_t>((size_t) GEMM_SCRATCH, ok) : nullptr;   // STRATA_DEQUANT_SIDE

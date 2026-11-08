@@ -227,6 +227,7 @@ bool NativeHead::load(const std::vector<std::string>& shards, int64_t n_in, int6
         }
         weights_ = weights;
         host_ = host;
+        shards_ = shards;
         { int d = -1; if (cudaGetDevice(&d) == cudaSuccess) device_ = d; }
         scratch_ = scratch;
         bytes_ = bytes;
@@ -266,9 +267,77 @@ bool NativeHead::to_host(std::string& err) {
     return true;
 }
 
+namespace {
+// STRATA_DF2_ROOM_VERIFY: a checksum of the head's VRAM bytes (one pass over a host copy; opt-in, a byte check of the reload)
+uint64_t device_sum(const void* d, uint64_t bytes) {
+    std::vector<uint64_t> h((size_t) (bytes / 8));
+    if (h.empty() || cudaMemcpy(h.data(), d, h.size() * 8, cudaMemcpyDeviceToHost) != cudaSuccess) { (void) cudaGetLastError(); return 0; }
+    uint64_t a = 1469598103934665603ull, b = 0;
+    for (size_t i = 0; i < h.size(); ++i) { a = (a ^ h[i]) * 1099511628211ull; b += h[i] * (2 * i + 1); }
+    return a ^ (b << 1);
+}
+bool room_verify() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_DF2_ROOM_VERIFY"); return v && v[0] == '1'; }();
+    return on;
+}
+}  // namespace
+
+uint8_t* NativeHead::room_base() const {
+    if (weights_ == nullptr || host_ != nullptr || shards_.empty()) return nullptr;
+    if ((type_ == 14 && strata::kernels::native_q6_k_packed_enabled()) || (type_ == 8 && std::getenv("STRATA_Q8_SM60") != nullptr)) return nullptr;   // repacked in place
+    return (uint8_t*) weights_;
+}
+
+bool NativeHead::room_lend(std::string& err) {
+    if (room_lent_) return true;
+    if (room_base() == nullptr) { err = "native head room: the head is not plain VRAM read from its file"; return false; }
+    // the head's last kernels (decode, a window) are done before a prompt writes a byte into it
+    if (cudaDeviceSynchronize() != cudaSuccess) { err = std::string("native head room: ") + cudaGetErrorString(cudaGetLastError()); return false; }
+    if (room_verify() && room_sum_ == 0) room_sum_ = device_sum(weights_, bytes_);
+    room_lent_ = true;
+    return true;
+}
+
+bool NativeHead::room_reclaim(std::string& err) {
+    if (!room_lent_) return true;
+    const auto t0 = std::chrono::steady_clock::now();
+    try {
+        const strata::GgufModel model(shards_);
+        size_t at = 0;
+        const strata::TensorInfo* tensor = model.find("output.weight", &at);
+        const strata::GgufFile& gguf = model.shard(at);
+        if (tensor == nullptr || (int) tensor->type != type_) { err = "native head room: output.weight changed in the model file"; return false; }
+        bool direct = false;
+#if defined(_WIN32)
+        direct = upload_direct(weights_, gguf.path(), gguf.data_start() + tensor->offset, bytes_);   // unbuffered: no page cache filled
+#endif
+        if (!direct && cudaMemcpy(weights_, gguf.tensor_data(*tensor), bytes_, cudaMemcpyHostToDevice) != cudaSuccess) {
+            err = std::string("native head room: the head's reload failed: ") + cudaGetErrorString(cudaGetLastError());
+            return false;
+        }
+    } catch (const std::exception& e) {
+        err = std::string("native head room: ") + e.what();
+        return false;
+    }
+    if (cudaDeviceSynchronize() != cudaSuccess) { err = std::string("native head room: ") + cudaGetErrorString(cudaGetLastError()); return false; }
+    room_lent_ = false;
+    ms_room_reclaim += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    if (room_verify()) {
+        const uint64_t now = device_sum(weights_, bytes_);
+        std::fprintf(stderr, "strata: native head room: STRATA_DF2_ROOM_VERIFY: the reloaded head %s the head as loaded (%016llx)\n",
+                     now == room_sum_ && now != 0 ? "matches" : "DOES NOT MATCH", (unsigned long long) now);
+        if (now != room_sum_ || now == 0) { err = "native head room: the reloaded head differs from the one loaded"; return false; }
+    }
+    return true;
+}
+
 bool NativeHead::run(const float* mixed, float* logits, void* stream, std::string& err) const {
     if (!loaded() || !mixed || !logits || !stream) {
         err = "native head requires loaded weights, device buffers and an explicit stream";
+        return false;
+    }
+    if (room_lent_) {
+        err = "native head: run() while the head is lent to a prompt (STRATA_DF2_ROOM_HEAD)";
         return false;
     }
     try {

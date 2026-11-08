@@ -36,6 +36,16 @@ public:
     /// Bytes of one vocabulary row.
     size_t row_bytes() const { return n_out_ > 0 ? (size_t) (bytes_ / (uint64_t) n_out_) : 0; }
 
+    /// STRATA_DF2_ROOM_HEAD (serve, opt-in, fork): the weights lent IN PLACE to a long prompt's buffers.  A prompt's chunk passes never read the
+    /// output head (decode, the verify windows and the drafters do, after the prompt), so room_lend() only marks the bytes as the prompt's
+    /// (run() refuses meanwhile) and room_reclaim() reads output.weight from the model file again into the same address: the captured graphs
+    /// that hold the pointer stay valid, and no RAM keeps a copy.  Not for a head on the host or a layout repacked in place.
+    uint8_t* room_base() const;
+    bool room_lend(std::string& err);
+    bool room_reclaim(std::string& err);
+    bool room_lent() const { return room_lent_; }
+    double ms_room_reclaim = 0;
+
 private:
     void* weights_ = nullptr;
     void* host_ = nullptr;   // the pinned host buffer weights_ aliases when the head did not fit in VRAM
@@ -44,6 +54,9 @@ private:
     int n_in_ = 0, n_out_ = 0;
     int type_ = -1;
     int device_ = -1;
+    std::vector<std::string> shards_;   ///< load's shards (room_reclaim reads the tensor again)
+    bool room_lent_ = false;
+    uint64_t room_sum_ = 0;             ///< STRATA_DF2_ROOM_VERIFY=1: the weights' checksum before the first lend
 };
 
 /// Plan v0.3 P6: `token_embd.weight` in its GGUF form (the IQ model files), in mapped pinned host memory: a row

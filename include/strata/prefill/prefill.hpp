@@ -87,6 +87,8 @@ public:
     /// STRATA_DF2_ROOM_CHUNK (fork): the same, with a second region the buffers continue in once `borrow` is full - a lender's bytes
     /// (the DFlash2 pack) for one prompt.  Nothing is written at layout time, so the lender's contents are intact until the prompt runs.
     bool relayout(int64_t chunk, void* borrow, uint64_t borrow_bytes, std::string& err, void* room, uint64_t room_bytes);
+    /// STRATA_DF2_ROOM_HEAD: the same with up to 4 lenders' regions, taken in order after the loan.
+    bool relayout(int64_t chunk, void* borrow, uint64_t borrow_bytes, std::string& err, void* const* rooms, const uint64_t* room_bytes, int n_rooms);
     /// STRATA_DF2_ROOM_CHUNK: before `init`, the largest chunk a later `relayout` may ask for (the host buffers and the token buffer
     /// are sized for it; the device layout `init` carves is still `init`'s chunk).
     void set_max_chunk(int64_t t) { max_chunk_hint_ = t > 0 ? t : 0; }
