@@ -22,11 +22,15 @@ import numpy as np
 V = 248320
 BASE = {"STRATA_Q36_FIXED_SLOTS": "1", "STRATA_Q36_XSLOTS": "0", "STRATA_Q8_PACKED": "0"}
 CONFIGS = [   # (name, env, prompt chunk); the first is the reference
-    ("ref: fp32 KV, FP16 GEMMs, chunk 2048", {"STRATA_Q36_KV_F16": "0", "STRATA_DENSE_MMQ": "0"}, 2048),
-    ("floor: the same, chunk 1024", {"STRATA_Q36_KV_F16": "0", "STRATA_DENSE_MMQ": "0"}, 1024),
-    ("f16 KV", {"STRATA_Q36_KV_F16": "1", "STRATA_DENSE_MMQ": "0"}, 2048),
-    ("dense MMQ", {"STRATA_Q36_KV_F16": "0", "STRATA_DENSE_MMQ": "1"}, 2048),
-    ("f16 KV + dense MMQ", {"STRATA_Q36_KV_F16": "1", "STRATA_DENSE_MMQ": "1"}, 2048),
+    ("ref: fp32 KV, FP16 GEMMs, chunk 2048", {"STRATA_Q36_KV": "f32", "STRATA_DENSE_MMQ": "0"}, 2048),
+    ("floor: the same, chunk 1024", {"STRATA_Q36_KV": "f32", "STRATA_DENSE_MMQ": "0"}, 1024),
+    ("f16 KV", {"STRATA_Q36_KV": "f16", "STRATA_DENSE_MMQ": "0"}, 2048),
+    ("dense MMQ", {"STRATA_Q36_KV": "f32", "STRATA_DENSE_MMQ": "1"}, 2048),
+    ("f16 KV + dense MMQ", {"STRATA_Q36_KV": "f16", "STRATA_DENSE_MMQ": "1"}, 2048),
+    ("q8_0 KV, int8 dot", {"STRATA_Q36_KV": "q8_0", "STRATA_DENSE_MMQ": "0"}, 2048),
+    ("q8_0 KV, float scores", {"STRATA_Q36_KV": "q8_0", "STRATA_Q36_KV_DOT8": "0", "STRATA_DENSE_MMQ": "0"}, 2048),
+    ("int8 KV (per row), int8 dot", {"STRATA_Q36_KV": "int8", "STRATA_DENSE_MMQ": "0"}, 2048),
+    ("int8 KV (per row), float scores", {"STRATA_Q36_KV": "int8", "STRATA_Q36_KV_DOT8": "0", "STRATA_DENSE_MMQ": "0"}, 2048),
 ]
 
 

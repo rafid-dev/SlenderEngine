@@ -76,7 +76,8 @@ time, as before 2026-11-07. With several requests the batch window has no drafts
 MTP block made, one per slot, up to the rows to spare in the 8-row window.
 
 **What a slot costs.** Each slot keeps its own cache in VRAM: 0.74 GB at a context of 32K (f16 keys and values of the 10
-attention layers and the MTP block, 22.5 KB per token; `STRATA_Q36_KV_F16=0` keeps fp32, 1.5 GB) and 0.07 GB of
+attention layers and the MTP block, 22.5 KB per token; `STRATA_Q36_KV=q8_0` or `int8` halves it, `f32` doubles it, see
+[Speed and exactness](#speed-and-exactness)) and 0.07 GB of
 recurrent state. Setup writes the context for one
 conversation, so N slots take N times that from the room the experts would have. On a card that does not hold every
 expert (12 and 16 GB, the hybrid mode) the expert slots lose that room, and a batch reads more distinct experts from RAM.
@@ -163,13 +164,32 @@ times (the host waits at each stage); the decode step summary is printed at exit
 ## Speed and exactness
 
 Every change on the decode path gives the old kernels' bits, except two from 2026-11-07: the f16 KV cache
-(`STRATA_Q36_KV_F16=1`, the default) rounds keys and values, and on HIP the decode attention sums each score's products in
+(`STRATA_Q36_KV=f16`, the default) rounds keys and values, and on HIP the decode attention sums each score's products in
 a different order (coalesced reads, one 32-lane group per cell). Teacher-forced over 3,000 prompt tokens and 512 forced
 tokens on UD-Q4_K_M, against fp32 KV and FP16 GEMMs, the mean KL is 0.0081 for f16 KV with dense MMQ, 0.0144 for f16 KV
 alone, 0.0129 for dense MMQ alone; regrouping the same prompt into 1024-token chunks, which changes nothing but the order
 of sums, gives 0.0098 (`tools/qwen35/q36_config_kl.py`). The memory changes (blob cache, ring, shared
 buffers, two sets) give the same greedy text bit for bit with the expert placement pinned (`--expert-slots 4`,
 `STRATA_Q36_FIXED_SLOTS=1`, `STRATA_Q36_XSLOTS=0`).
+
+**8-bit KV cache (opt-in, `STRATA_Q36_KV`).** `f16` (default), `f32`, `q8_0` (an int8 value and an f16 scale per 32
+values, as llama.cpp's q8_0) or `int8` (one scale per head row). Both 8-bit modes halve the cache: 0.69 GiB per session
+at 32K becomes 0.37 (q8_0) or 0.35 GiB (int8). Decode scores the query against the cache with the int8 dot product
+(`v_dot4_i32_i8` on RDNA2; the query quantized per 32 values); `STRATA_Q36_KV_DOT8=0` scores in float instead. The
+prompt path widens the 8-bit cache to f16 for its GEMMs. The same teacher-forced measurement as above (513 forced steps,
+against fp32 KV and FP16 GEMMs; the regrouping floor here is 0.0098):
+
+| KV cache | Mean KL | p99 | Same top-1 |
+| --- | ---: | ---: | ---: |
+| f16 (default) | 0.0144 | 0.086 | 96.9% |
+| q8_0, int8 dot | 0.0068 | 0.082 | 97.3% |
+| q8_0, float scores | 0.0176 | 0.094 | 95.9% |
+| int8 per row, int8 dot | 0.0086 | 0.105 | 96.7% |
+| int8 per row, float scores | 0.0074 | 0.107 | 96.5% |
+
+All five are within the spread of regrouping the prompt. Speed on the RX 6600 (32K context, `--prefill 2048`, thinking
+on, one run each): short questions f16 25.2-26.1 tok/s, q8_0 25.5-28.4, int8 25.0-28.8; after a 24K prompt (read at
+430 tok/s in all three) f16 21.5, q8_0 23.1, int8 22.5. The default stays f16 until more runs settle the speed.
 
 The other decode-path changes keep the old kernels' bits. `STRATA_Q36_VERIFY=1 strata ... --no-graph` runs the old
 kernel beside each new one on the real activations and compares them bit for bit. `STRATA_Q36_OLD_KERNELS=1` switches
