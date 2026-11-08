@@ -3378,6 +3378,31 @@ static void apply_fork_defaults(int argc, char** argv) {
         def("STRATA_STAGER_THREADS", "3");
         def("STRATA_STAGER_BATCH", "1");
         if (budget > 0.0) def("STRATA_RAM_THROUGH", "1");
+        // HC-UPMIX (2026-11-08): the prompt path's hyper-connection up GEMM and mix as one kernel on chunks of 33+ tokens (sm_80+; older
+        // cards keep the pair): 50K +4.3% on an RTX 4070 Ti, logits byte-identical there (and on an RTX 5090 upstream)
+        def("STRATA_HC_UPMIX", "1");
+        // HEAD-ROOM (2026-11-08): a serve prompt of 4,096+ new tokens borrows the drafter's weights and the output head - none of them is
+        // read while a prompt is read - for its chunk buffers, so it reads in larger chunks (fewer passes over the experts): DFlash2 50K
+        // +11%, MTP +19.5% on a 12 GB card; everything is back, byte for byte, before the first token.  The drafter is the one on the
+        // command line: DFlash2 (--draft dflash2) or the MTP layer (--mtp); with --batch the MTP room cannot apply and is left out.
+        bool serve = false, df2 = false, mtp = false, batch = false;
+        for (int i = 1; i < argc; ++i) {
+            if (std::strcmp(argv[i], "--serve") == 0) serve = true;
+            if (i + 1 < argc && std::strcmp(argv[i], "--draft") == 0 && std::strcmp(argv[i + 1], "dflash2") == 0) df2 = true;
+            if (i + 1 < argc && std::strcmp(argv[i], "--mtp") == 0) mtp = true;
+            if (i + 1 < argc && std::strcmp(argv[i], "--batch") == 0 && std::atoi(argv[i + 1]) > 0) batch = true;
+        }
+        if (serve && df2) {
+            def("STRATA_DF2_ROOM_MIN", "4096");
+            def("STRATA_DF2_ROOM_CHUNK", "1");
+            def("STRATA_DF2_ROOM_HEAD", "1");
+        } else if (serve && mtp && !batch) {
+            const bool by_hand = std::getenv("STRATA_MTP_ROOM_MIN") != nullptr;
+            def("STRATA_MTP_ROOM_MIN", "4096");
+            def("STRATA_MTP_ROOM_CHUNK", "1");
+            def("STRATA_MTP_ROOM_HEAD", "1");
+            strata::platform::g_fork_mtp_room = !by_hand;
+        }
         MEMORYSTATUSEX ms{};
         ms.dwLength = sizeof ms;
         if (budget > 0.0 && GlobalMemoryStatusEx(&ms) && ms.ullTotalPhys >= 28ull * 1000 * 1000 * 1000) def("STRATA_PREFILL_AUTO_MAX", "16384");
@@ -11095,18 +11120,22 @@ int main(int argc, char** argv) {
                             : o.batch > 0 ? "it does not support --batch: its slot drafters share the drafter's weights"
                             : mtp.experts_bytes() == 0 ? "the drafter's 512 experts are not this drafter's to lend"
                             : nullptr;
-            if (why != nullptr) {
+            if (why != nullptr && !strata::platform::g_fork_mtp_room) {
                 std::fprintf(stderr, "strata generate: STRATA_MTP_ROOM_MIN is unavailable: %s\n", why);
                 return 2;
             }
-            const int64_t blob = (int64_t) strata::kernels::cpu::expert_layout().max_blob;
-            mtp_room_slots = blob > 0 ? (int) std::min<int64_t>(mtp.experts_bytes() / blob, 4096) : 0;
-            std::fprintf(stderr, "strata serve: STRATA_MTP_ROOM_MIN=%lld: a request that reads %lld prompt tokens or "
-                                 "more points the prompt path's ring on CUDA%d at the drafter's %llu MiB of experts "
-                                 "(%d slots past its own) for as long as it is read, and the decode's own bytes are back "
-                                 "before the first window\n",
-                         (long long) mtp_room_min, (long long) mtp_room_min, mtp.device(),
-                         (unsigned long long) (mtp.experts_bytes() >> 20), mtp_room_slots);
+            if (why != nullptr) {   // the fork's default, not the caller's: left out, the prompt reads as it would without it
+                std::fprintf(stderr, "strata generate: the fork's default MTP prompt room is left out: %s\n", why);
+            } else {
+                const int64_t blob = (int64_t) strata::kernels::cpu::expert_layout().max_blob;
+                mtp_room_slots = blob > 0 ? (int) std::min<int64_t>(mtp.experts_bytes() / blob, 4096) : 0;
+                std::fprintf(stderr, "strata serve: STRATA_MTP_ROOM_MIN=%lld: a request that reads %lld prompt tokens or "
+                                     "more points the prompt path's ring on CUDA%d at the drafter's %llu MiB of experts "
+                                     "(%d slots past its own) for as long as it is read, and the decode's own bytes are back "
+                                     "before the first window\n",
+                             (long long) mtp_room_min, (long long) mtp_room_min, mtp.device(),
+                             (unsigned long long) (mtp.experts_bytes() >> 20), mtp_room_slots);
+            }
         }
         // STRATA_DF2_ROOM_MIN=TOKENS (opt-in, fork): STRATA_MTP_ROOM_MIN with the DFlash2 drafter's pack (its Q4_0 weights, 492 MiB on
         // Flash-Next) as the room.  A request that READS at least TOKENS prompt tokens points the prompt path's ring at the pack's bytes for as

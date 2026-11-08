@@ -16,4 +16,8 @@ inline bool fork_defaults_on() noexcept {
 /// rather than in a variable (the prompt path's lend cap, the stager's thread count) read this.
 inline bool g_fork_pack_defaults = false;
 
+/// Set by main() when the fork's defaults, not the caller, turned on STRATA_MTP_ROOM_MIN: a room that cannot apply is then left out
+/// with a note instead of stopping the start (set by hand, an unusable room still stops it, as upstream's switch does).
+inline bool g_fork_mtp_room = false;
+
 }  // namespace strata::platform
