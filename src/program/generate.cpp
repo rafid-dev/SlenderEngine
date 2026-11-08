@@ -17153,6 +17153,8 @@ int main(int argc, char** argv) {
             };
             // tokens [a, b) through the windows: commit all of them, then give the draft layer their residuals
             auto read_windows = [&](int64_t a, int64_t b, std::string& e) -> bool {
+                // STRATA_DF2_ROOM_MIN / _HEAD: the room closes before the first window runs (a window reads the output head; its rows follow the held ones)
+                if (df2_room_open && !df2_room_finish("windows", true, e)) return false;
                 // (STRATA_LOGPOS reads every window's logits: the serial loop)
                 // the pipelined prompt read stays two-stage (three or more stages read serially; only the decode overlaps)
                 if (pipe && n_stages == 2 && pl_pw >= 1 && std::getenv("STRATA_LOGPOS") == nullptr) return read_windows_pl(a, b, e);
