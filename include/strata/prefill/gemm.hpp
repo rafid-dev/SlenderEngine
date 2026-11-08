@@ -104,7 +104,17 @@ private:
     int64_t w16_reserve_ = 2ll << 30;   // VRAM kept free after a cached weight
     bool w16_logged_ = false;
     static constexpr int64_t kW16AutoReserve = 3ll << 30;
+    // STRATA_PF_W16_LAYER_MIB=N (HIP, opt-in): an N MiB arena of FP16 dequantized weights, filled in order and started
+    // over when full - sized for one layer's dense weights, so the sub-chunks of a layer-major walk dequantize each weight
+    // once per layer instead of once per sub-chunk.  Everything runs on stream_, so a reused region is written after the
+    // GEMMs that read it.  Freed by layer_cache_release() (the end of a prompt).
+    uint16_t* lc_arena_ = nullptr;
+    int64_t lc_bytes_ = -1, lc_cur_ = 0;
+    std::vector<W16Entry> lc_;
+    bool lc_logged_ = false;
 public:
+    /// STRATA_PF_W16_LAYER_MIB: frees the layer arena (the prompt is done: decode gets the VRAM back).
+    void layer_cache_release();
     /// The engine's own default for the FP16 weight cache when STRATA_PF_W16_CACHE_MIB is not set: true -> sized by the card (weights are cached while
     /// kW16AutoReserve stays free).  generate.cpp sets it on Linux CUDA when the engine runs batch slots (round0212 item 7).  =0 in the environment wins.
     static void set_w16_auto_default(bool on) { w16_auto_default_().store(on); }

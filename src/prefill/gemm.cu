@@ -1350,6 +1350,16 @@ void Gemm::f16_inplace(const uint16_t* X, const uint16_t* W, float* Y, int64_t T
 #endif
 }
 
+void Gemm::layer_cache_release() {
+    if (lc_arena_ != nullptr) {
+        cudaStreamSynchronize((cudaStream_t) stream_);
+        cudaFree(lc_arena_);
+    }
+    lc_arena_ = nullptr;
+    lc_.clear();
+    lc_cur_ = 0;
+}
+
 void Gemm::native(const uint16_t* X, int ggml_type, const void* W_blocks, float* Y, int64_t T, int64_t N, int64_t K,
                   int64_t ldy, float beta, int64_t ldx) {
 #ifdef STRATA_USE_HIP
@@ -1399,6 +1409,49 @@ void Gemm::native(const uint16_t* X, int ggml_type, const void* W_blocks, float*
     }
 #if defined(STRATA_PREFILL_MMQ) && defined(__HIPCC__)
     if (beta == 0.0f && (ldx == 0 || ldx == K) && native_mmq(X, ggml_type, W_blocks, Y, T, N, K, ldy)) return;
+#endif
+#ifdef STRATA_USE_HIP
+    if (lc_bytes_ < 0) {
+        const char* v = std::getenv("STRATA_PF_W16_LAYER_MIB");
+        lc_bytes_ = v != nullptr ? (int64_t) std::atoll(v) * (1ll << 20) : 0;
+    }
+    if (lc_bytes_ > 0 && N * K * 2 <= lc_bytes_) {
+        const int64_t bytes = N * K * 2;
+        uint16_t* cw = nullptr;
+        for (const W16Entry& e : lc_)
+            if (e.p == W_blocks && e.type == ggml_type && e.n == N && e.k == K) { cw = e.d; break; }
+        if (cw == nullptr) {
+            if (lc_arena_ == nullptr) {
+                size_t fb = 0, tb = 0;
+                if (cudaMemGetInfo(&fb, &tb) == cudaSuccess && fb > (size_t) lc_bytes_ + (64ull << 20) &&
+                    cudaMalloc((void**) &lc_arena_, (size_t) lc_bytes_) == cudaSuccess) {
+                    if (!lc_logged_) {
+                        lc_logged_ = true;
+                        std::fprintf(stderr, "strata prefill: STRATA_PF_W16_LAYER_MIB: a %lld MiB arena of FP16 weights (one dequant per weight per layer)\n",
+                                     (long long) (lc_bytes_ >> 20));
+                    }
+                } else {
+                    (void) cudaGetLastError();
+                    lc_arena_ = nullptr;
+                }
+            }
+            if (lc_arena_ != nullptr) {
+                int64_t at = (lc_cur_ + 255) & ~(int64_t) 255;
+                if (at + bytes > lc_bytes_) {   // full: start over (stream order: the GEMMs that read the old regions run first)
+                    lc_.clear();
+                    at = 0;
+                }
+                cw = lc_arena_ + at / 2;
+                strata::kernels::dequant_f16(ggml_type, W_blocks, 0, N, K, cw, stream_);
+                lc_.push_back({W_blocks, ggml_type, N, K, cw});
+                lc_cur_ = at + bytes;
+            }
+        }
+        if (cw != nullptr) {
+            f16(X, cw, Y, T, N, K, ldy, beta);
+            return;
+        }
+    }
 #endif
 #ifndef STRATA_USE_HIP
     // The FP16 weight kept on the device after its first dequant.  NOT bit-exact against the uncached sliced form on every

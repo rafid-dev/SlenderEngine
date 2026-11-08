@@ -17385,12 +17385,76 @@ int main(int argc, char** argv) {
                     if (planned) sp.force_chunk(plan.chunk, plan_single, plan.chunked);
                     if (!conc_read) share_gate();   // STRATA_PREFILL_CPU_SHARE_BATCH: re-decided for every run (a piece beside decoding slots too)
                     bool run_ok;
+#if defined(STRATA_HAVE_DFLASH2)
+                    // STRATA_DF2_PARK=<tokens> (opt-in): a prompt piece of at least that many tokens is read with the DFlash2 drafter's weights
+                    // parked in pinned RAM (Dflash2Drafter::park), so the prompt path's super-chunks get their VRAM.  The piece's taps (its last
+                    // 2047 rows) are held in RAM while it is read and handed to the drafter's context update after its weights are back: the same
+                    // rows, in the same order, through the same context() call as without the switch.
+                    static const int64_t df2_park_min = [] {
+                        const char* v = std::getenv("STRATA_DF2_PARK");
+                        return v != nullptr ? (int64_t) std::atoll(v) : (int64_t) 0;
+                    }();
+                    const bool df2_park = use_df2 && df2_park_min > 0 && r - q >= df2_park_min && stages.empty() && co_set.empty() &&
+                                          !conc_read && o.batch <= 0;
+                    std::vector<float> park_taps;
+                    int64_t park_pos0 = -1, park_rows = 0;
+                    std::function<bool(const float*, int64_t, int64_t, std::string&)> park_saved;
+                    bool parked_now = false;
+                    if (df2_park) {
+                        std::string pe;
+                        if (!df2.park(pe)) {
+                            std::fprintf(stderr, "strata serve: STRATA_DF2_PARK: the drafter stays on the card for this prompt (%s)\n", pe.c_str());
+                        } else {
+                            parked_now = true;
+                            park_saved = sp.on_taps;
+                            const size_t w = df2.tap_layers().size() * (size_t) g.n_embd;
+                            sp.on_taps = [&park_taps, &park_pos0, &park_rows, w](const float* taps, int64_t rows, int64_t pos0, std::string& te) -> bool {
+                                if (park_pos0 < 0) park_pos0 = pos0;
+                                if (pos0 != park_pos0 + park_rows) { te = "STRATA_DF2_PARK: the prompt's taps did not arrive in order"; return false; }
+                                park_taps.resize((size_t) (park_rows + rows) * w);
+                                if (cudaMemcpy(park_taps.data() + (size_t) park_rows * w, taps, (size_t) rows * w * 4, cudaMemcpyDefault) != cudaSuccess) {
+                                    te = std::string("STRATA_DF2_PARK: taps to RAM: ") + cudaGetErrorString(cudaGetLastError());
+                                    return false;
+                                }
+                                park_rows += rows;
+                                return true;
+                            };
+                        }
+                    }
+#endif
                     if (!co_set.empty() && !co_tried && admit_slot >= 0 && req_imgs.empty()) {
                         co_tried = true;
                         run_ok = co_run(q, r, e);
                     } else {
                         run_ok = sp.run(ids.data() + q, r - q, q, e);
                     }
+#if defined(STRATA_HAVE_DFLASH2)
+                    if (parked_now) {
+                        sp.on_taps = park_saved;
+                        std::string pe;
+                        if (!df2.unpark(pe)) {
+                            if (run_ok) e = pe;
+                            run_ok = false;
+                        } else if (run_ok && park_rows > 0) {
+                            const size_t w = df2.tap_layers().size() * (size_t) g.n_embd;
+                            float* dt = nullptr;
+                            if (cudaMalloc((void**) &dt, (size_t) park_rows * w * 4) != cudaSuccess) {
+                                (void) cudaGetLastError();
+                                e = "STRATA_DF2_PARK: no VRAM for the held taps";
+                                run_ok = false;
+                            } else {
+                                run_ok = cudaMemcpy(dt, park_taps.data(), (size_t) park_rows * w * 4, cudaMemcpyHostToDevice) == cudaSuccess &&
+                                         df2.context(dt, park_rows, park_pos0, e);
+                                if (!run_ok && e.empty()) e = "STRATA_DF2_PARK: the held taps' copy back failed";
+                                cudaFree(dt);
+                            }
+                        }
+                        std::fprintf(stderr, "strata serve: STRATA_DF2_PARK: %lld prompt tokens read with the drafter parked (%.0f MiB; park %.0f ms, "
+                                             "back %.0f ms in all, %lld recaptures), %lld tap rows handed over\n",
+                                     (long long) (r - q), (double) df2.park_bytes() / 1048576.0, df2.ms_park, df2.ms_unpark,
+                                     (long long) df2.n_recaptures, (long long) park_rows);
+                    }
+#endif
                     if (run_ok && q == 0 && sp.kva_floor() > 0) {   // KVA approximated the start of this prompt: remember which tokens
                         kva_floors.note(ids.data(), sp.kva_floor());
                         if (use_mtp && mtp.cell_floor_enabled()) mtp.set_cell_floor(sp.kva_floor());

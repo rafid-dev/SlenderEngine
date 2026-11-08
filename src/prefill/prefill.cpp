@@ -6427,6 +6427,7 @@ void Prefill::lm_release() {
     m.lm.mixed_h = nullptr;
     m.lm.ids = m.lm.tab = nullptr;
     m.lm.S = 0;
+    m.gemm.layer_cache_release();   // STRATA_PF_W16_LAYER_MIB: the arena is the prompt's, decode gets the VRAM back
 }
 
 int64_t Prefill::lm_prepare(int64_t n, std::string& why, int64_t cap) {
@@ -6539,7 +6540,6 @@ int64_t Prefill::lm_prepare(int64_t n, std::string& why, int64_t cap) {
     }
     Impl::LmBufs& lb = m.lm;
     // pinned host: the routing's copy, the tables, and (host mode) the residual rows
-    const size_t idsw = (size_t) (2 * s_use * K), tab = (size_t) lm_table_ints(s_use * K, G);
     auto host_grow = [](int32_t*& p, size_t& have, size_t want_n) -> bool {
         if (have >= want_n) return true;
         if (p) cudaFreeHost(p);
@@ -6549,13 +6549,22 @@ int64_t Prefill::lm_prepare(int64_t n, std::string& why, int64_t cap) {
         have = want_n;
         return true;
     };
-    if (!host_grow(lb.idsw_host, lb.idsw_host_n, idsw) || !host_grow(lb.tab_host, lb.tab_host_n, tab)) {
-        why = "no pinned RAM for the routing tables"; return 0;
-    }
-    if (!r_dev) {
-        int32_t* rh = (int32_t*) lb.R_host;
-        if (!host_grow(rh, lb.R_host_n, (size_t) s_use * D)) { why = "no pinned RAM for the residual rows"; lb.R_host = nullptr; return 0; }
-        lb.R_host = (float*) rh;
+    // a super-chunk the pinned RAM cannot hold steps down (halving, in whole chunks) before the walk is given up: a PC whose
+    // RAM tier pins most of its memory still reads layer-major, in more super-chunks
+    for (;;) {
+        const size_t idsw = (size_t) (2 * s_use * K), tab = (size_t) lm_table_ints(s_use * K, G);
+        bool ok = host_grow(lb.idsw_host, lb.idsw_host_n, idsw) && host_grow(lb.tab_host, lb.tab_host_n, tab);
+        if (ok && !r_dev) {
+            int32_t* rh = (int32_t*) lb.R_host;
+            ok = host_grow(rh, lb.R_host_n, (size_t) s_use * D);
+            lb.R_host = ok ? (float*) rh : nullptr;
+        }
+        if (ok) break;
+        const int64_t smaller = (s_use / 2) / m.T * m.T;
+        if (smaller < min_s) { why = "no pinned RAM for the routing tables or the residual rows"; return 0; }
+        std::fprintf(stderr, "strata prefill: layer-major: no pinned RAM for a %lld-token super-chunk, trying %lld\n",
+                     (long long) s_use, (long long) smaller);
+        s_use = smaller;
     }
     const uint64_t bytes = dev_bytes(s_use, r_dev);
     void* d = nullptr;
@@ -6574,6 +6583,7 @@ int64_t Prefill::lm_prepare(int64_t n, std::string& why, int64_t cap) {
     lb.ids = (int32_t*) carve_b((size_t) s_use * K * 4);
     lb.w = (float*) carve_b((size_t) s_use * K * 4);
     lb.R = r_dev ? (float*) carve_b((size_t) s_use * D * 4) : nullptr;
+    const size_t tab = (size_t) lm_table_ints(s_use * K, G);
     lb.tab = (int32_t*) carve_b(tab * 4);
     lb.tab_n = tab;
     lb.R2 = r_dev ? nullptr : (float*) carve_b((size_t) m.T * D * 4);
@@ -7944,6 +7954,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
         }
     }
     const bool body_ok = run_impl(tokens, n, pos0, err);
+    if (impl_) impl_->gemm.layer_cache_release();   // STRATA_PF_W16_LAYER_MIB (a chunk-major prompt)
 
     std::string drain_err;
     const bool drain_ok = drain_pipeline(drain_err);

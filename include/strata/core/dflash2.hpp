@@ -150,6 +150,18 @@ public:
     /// draft() returns token 0 with probability 0 for the rest.  Before prepare() / the first draft(); a later change drops the captured graphs.
     void set_max_drafts(int n);
 
+    /// STRATA_DF2_PARK (serve, opt-in): a long prompt does not use the drafter's weights, only its context update at the end, so the pack and the owned
+    /// draft head (about 0.5 GiB on Flash-Next) can leave the card while the prompt is read and its super-chunks take the room.  park() copies them to
+    /// RAM (pageable: the prompt needs the pinned RAM) (once: the weights never change) and frees them; unpark() allocates them again, copies them back and, when an address moved,
+    /// recaptures the round graphs.  The same bytes come back, so the drafts are bitwise the same.  Not for a drafter whose pack or head is shared
+    /// (batch slots, the MTP drafter's head).
+    bool park(std::string& err);
+    bool unpark(std::string& err);
+    bool parked() const { return parked_; }
+    uint64_t park_bytes() const { return blob_bytes_ + (dhead_shared_ ? 0 : dhead_bytes_); }
+    double ms_park = 0, ms_unpark = 0;
+    int64_t n_parks = 0, n_recaptures = 0;
+
     uint64_t vram_bytes() const { return vram_; }
     int64_t n_draft_vocab() const { return n_dvocab_; }
     int n_embd() const { return N_; }
@@ -187,6 +199,12 @@ private:
     std::vector<Tensor> tensors_;
     uint8_t* blob_ = nullptr;
     bool blob_shared_ = false;      ///< blob_ (and the bound head) belong to the parent drafter (clone_for_slot)
+    uint64_t blob_bytes_ = 0, dhead_bytes_ = 0;      ///< sizes of blob_ and the owned dhead_ (park / unpark)
+    uint8_t* h_blob_ = nullptr;     ///< host copies while parked (malloc; pageable) (kept after the first park: the weights never change)
+    uint8_t* h_dhead_ = nullptr;
+    bool parked_ = false, head_is_dhead_ = false;
+    uint8_t* last_blob_ = nullptr;  ///< the addresses the round graphs were captured with (park: recapture only when they move)
+    uint8_t* last_dhead_ = nullptr;
     float* landing_ = nullptr;
     float* dpend_ = nullptr;        ///< pinned host: deferred taps, row = position % kRing2048
     int64_t dpend_lo_ = 0, dpend_hi_ = 0;

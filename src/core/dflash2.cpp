@@ -57,6 +57,8 @@ Dflash2Drafter::~Dflash2Drafter() {
     if (!dhead_shared_ && !blob_shared_) { fr(dvocab_); fr(dhead_); }
     if (h_meta_) cudaFreeHost(h_meta_);
     if (h_out_) cudaFreeHost(h_out_);
+    std::free(h_blob_);
+    std::free(h_dhead_);
     if (cs_) cudaStreamDestroy(cs_);
     if (cs2_) cudaStreamDestroy(cs2_);
     if (ev_fork_) cudaEventDestroy(ev_fork_);
@@ -175,6 +177,7 @@ bool Dflash2Drafter::load(const std::string& path, int device, std::string& err)
     }
     if (cudaMalloc((void**) &blob_, total) != cudaSuccess) { err = "dflash2: the pack does not fit in VRAM (" + std::to_string(total >> 20) + " MiB)"; return false; }
     vram_ += total;
+    blob_bytes_ = total;
     uint64_t max_bytes = 0;
     for (const Tensor& t : tensors_) max_bytes = std::max(max_bytes, t.bytes);
     std::vector<uint8_t> stage(max_bytes);
@@ -376,6 +379,8 @@ bool Dflash2Drafter::bind(const WeightTable& wt, const NativeHead* head, const s
         { const OnDevice on_head(head_device); cudaFree(tmp); }
         if (pe != cudaSuccess) { err = std::string("dflash2: the head rows' copy to the drafter's card: ") + cudaGetErrorString(pe); return false; }
         vram_ += bytes;
+        dhead_bytes_ = bytes;
+        head_is_dhead_ = true;
         hw = dhead_;
         head_rows = (int64_t) vocab.size();
     } else if (!vocab.empty()) {
@@ -390,6 +395,8 @@ bool Dflash2Drafter::bind(const WeightTable& wt, const NativeHead* head, const s
         cudaDeviceSynchronize();
         cudaFree(dv);
         vram_ += (uint64_t) ((int64_t) vocab.size() * row_bytes);
+        dhead_bytes_ = (uint64_t) ((int64_t) vocab.size() * row_bytes);
+        head_is_dhead_ = true;
         hw = dhead_;
         head_rows = (int64_t) vocab.size();
     }
@@ -684,7 +691,79 @@ bool Dflash2Drafter::prepare(const float* taps, std::string& err) {
     for (int n = 1; n <= kRows; ++n)
         if (!capture(n, taps, err)) return false;
     graph_taps_ = taps;
+    last_blob_ = blob_;
+    last_dhead_ = dhead_;
     ms_capture = ms_since(t0);
+    return true;
+}
+
+bool Dflash2Drafter::park(std::string& err) {
+    if (parked_) return true;
+    if (blob_shared_ || blob_ == nullptr || blob_bytes_ == 0) { err = "dflash2 park: no pack of its own"; return false; }
+    if (dhead_shared_) { err = "dflash2 park: the draft head is the MTP drafter's"; return false; }
+    if (!context_wait(err)) return false;
+    const OnDevice on_device(device_);
+    const Clock::time_point t0 = Clock::now();
+    if (cudaDeviceSynchronize() != cudaSuccess) { err = std::string("dflash2 park: ") + cudaGetErrorString(cudaGetLastError()); return false; }
+    const bool own_head = head_is_dhead_ && dhead_ != nullptr && dhead_bytes_ > 0;
+    // the host copies are made once: the weights never change after load / bind
+    if (h_blob_ == nullptr) {
+        // pageable, not pinned: the prompt the park makes room for needs the pinned RAM (layer-major's residual rows)
+        h_blob_ = (uint8_t*) std::malloc(blob_bytes_);
+        if (h_blob_ == nullptr) { err = "dflash2 park: no RAM for the pack"; return false; }
+        if (cudaMemcpy(h_blob_, blob_, blob_bytes_, cudaMemcpyDeviceToHost) != cudaSuccess) {
+            std::free(h_blob_); h_blob_ = nullptr; err = "dflash2 park: the pack's copy to RAM failed"; return false;
+        }
+    }
+    if (own_head && h_dhead_ == nullptr) {
+        h_dhead_ = (uint8_t*) std::malloc(dhead_bytes_);
+        if (h_dhead_ == nullptr) { err = "dflash2 park: no RAM for the draft head"; return false; }
+        if (cudaMemcpy(h_dhead_, dhead_, dhead_bytes_, cudaMemcpyDeviceToHost) != cudaSuccess) {
+            std::free(h_dhead_); h_dhead_ = nullptr; err = "dflash2 park: the draft head's copy to RAM failed"; return false;
+        }
+    }
+    cudaFree(blob_);
+    blob_ = nullptr;
+    if (own_head) { cudaFree(dhead_); dhead_ = nullptr; head_w_ = nullptr; }
+    parked_ = true;
+    ++n_parks;
+    ms_park += ms_since(t0);
+    return true;
+}
+
+bool Dflash2Drafter::unpark(std::string& err) {
+    if (!parked_) return true;
+    const OnDevice on_device(device_);
+    const Clock::time_point t0 = Clock::now();
+    const bool own_head = head_is_dhead_ && h_dhead_ != nullptr && dhead_bytes_ > 0;
+    uint8_t* b = nullptr;
+    uint8_t* h = nullptr;
+    if (cudaMalloc((void**) &b, blob_bytes_) != cudaSuccess) {
+        (void) cudaGetLastError(); err = "dflash2 unpark: the pack does not fit in VRAM again (" + std::to_string(blob_bytes_ >> 20) + " MiB)"; return false;
+    }
+    if (own_head && cudaMalloc((void**) &h, dhead_bytes_) != cudaSuccess) {
+        (void) cudaGetLastError(); cudaFree(b); err = "dflash2 unpark: the draft head does not fit in VRAM again"; return false;
+    }
+    if (cudaMemcpy(b, h_blob_, blob_bytes_, cudaMemcpyHostToDevice) != cudaSuccess ||
+        (own_head && cudaMemcpy(h, h_dhead_, dhead_bytes_, cudaMemcpyHostToDevice) != cudaSuccess)) {
+        cudaFree(b); if (h) cudaFree(h); err = "dflash2 unpark: the copy back failed"; return false;
+    }
+    // the round graphs hold the old addresses: recapture them unless the allocator gave the same places back
+    const bool moved = b != last_blob_ || (own_head && h != last_dhead_);
+    blob_ = b;
+    if (own_head) { dhead_ = h; head_w_ = dhead_; }
+    parked_ = false;
+    if (moved && graph_taps_ != nullptr && prof_ == nullptr) {
+        for (auto& e : exec_)
+            if (e) { cudaGraphExecDestroy(e); e = nullptr; }
+        const float* taps = graph_taps_;
+        graph_taps_ = nullptr;
+        const double cap = ms_capture;
+        if (!prepare(taps, err)) { err = "dflash2 unpark: recapture: " + err; return false; }
+        ms_capture = cap;
+        ++n_recaptures;
+    }
+    ms_unpark += ms_since(t0);
     return true;
 }
 
