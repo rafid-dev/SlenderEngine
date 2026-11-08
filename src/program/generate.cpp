@@ -16155,17 +16155,20 @@ int main(int argc, char** argv) {
                 std::function<bool(const float*, int64_t, int64_t, std::string&)>* taps;
                 ~Df2RoomTapGuard() { if (*open && *saved) *taps = *saved; }
             } df2_room_tap_guard{&df2_room_open, &room_saved_taps, &sp.on_taps};
-            auto df2_room_close = [&](const char* why, bool hand) -> int {
+            // df2_room_finish: the room closes (the prompt path idle, its ring back to the rule's count, the tap callback back, the pack's weights
+            // back) and, with `hand`, the held rows go to the drafter in order.  Called once the prompt is read, and before the first verify window
+            // that reads prompt tokens (it feeds the drafter itself), whichever comes first.  false: `e` says why.
+            auto df2_room_finish = [&](const char* why, bool hand, std::string& e) -> bool {
 #if defined(STRATA_HAVE_DFLASH2)
-                if (!df2.room_lent()) { df2_room_open = false; return 0; }
+                if (!df2.room_lent()) { df2_room_open = false; return true; }
                 const auto t0 = Clock::now();
                 if (room_path != nullptr) {
                     // nothing stages into the pack after this, and the prompt path's streams are idle before it is written over
-                    if (!room_path->idle(err)) { std::printf("ERR %s\n", err.c_str()); return 1; }
+                    if (!room_path->idle(e)) return false;
                     room_path->set_ring_room_active(false);
                 }
                 if (df2_room_open && room_saved_taps) sp.on_taps = room_saved_taps;
-                if (!df2.room_reclaim(err)) { std::printf("ERR %s\n", err.c_str()); return 1; }
+                if (!df2.room_reclaim(e)) return false;
                 const bool was_open = df2_room_open;
                 df2_room_open = false;
                 const int64_t rows = room_rows;
@@ -16174,13 +16177,13 @@ int main(int argc, char** argv) {
                     float* dt = nullptr;
                     if (cudaMalloc((void**) &dt, (size_t) room_rows * w * 4) != cudaSuccess) {
                         (void) cudaGetLastError();
-                        std::printf("ERR STRATA_DF2_ROOM_MIN: no VRAM for the held tap rows\n");
-                        return 1;
+                        e = "STRATA_DF2_ROOM_MIN: no VRAM for the held tap rows";
+                        return false;
                     }
                     const bool ok = cudaMemcpy(dt, room_taps.data(), (size_t) room_rows * w * 4, cudaMemcpyHostToDevice) == cudaSuccess &&
-                                    df2.context(dt, room_rows, room_pos0, err);
+                                    df2.context(dt, room_rows, room_pos0, e);
                     cudaFree(dt);
-                    if (!ok) { std::printf("ERR STRATA_DF2_ROOM_MIN: %s\n", err.empty() ? "the held tap rows' copy back failed" : err.c_str()); return 1; }
+                    if (!ok) { if (e.empty()) e = "STRATA_DF2_ROOM_MIN: the held tap rows' copy back failed"; return false; }
                 }
                 room_taps.clear();
                 room_rows = 0;
@@ -16188,8 +16191,12 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "strata serve: prompt room (%s): the DFlash2 pack's weights are back in %.1f ms, %lld tap rows handed over\n",
                              why, std::chrono::duration<double, std::milli>(Clock::now() - t0).count(), (long long) rows);
 #else
-                (void) why; (void) hand;
+                (void) why; (void) hand; (void) e;
 #endif
+                return true;
+            };
+            auto df2_room_close = [&](const char* why, bool hand) -> int {
+                if (!df2_room_finish(why, hand, err)) { std::printf("ERR %s\n", err.c_str()); return 1; }
                 return 0;
             };
             // a room an earlier request left lent (a cancelled or failed prompt): its weights back before anything else
@@ -17131,6 +17138,8 @@ int main(int argc, char** argv) {
                     if (!ver.commit(T, e) || (use_mtp && !mtp.prefill(ver.final_R_all(), nxt.data(), T, q, e))) return false;
 #if defined(STRATA_HAVE_DFLASH2)
                     if (use_df2) {
+                        // STRATA_DF2_ROOM_MIN: the batched part's rows go to the drafter first, with its weights back (the window's rows follow them)
+                        if (df2_room_open && !df2_room_finish("windows", true, e)) return false;
                         const float* tp = df2_win_taps((int) T, e);
                         if (tp == nullptr || !df2.context(tp, T, q, e)) return false;
                         df2.note_rows(win.data(), T, q);
