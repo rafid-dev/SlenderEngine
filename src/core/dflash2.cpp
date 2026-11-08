@@ -767,6 +767,40 @@ bool Dflash2Drafter::unpark(std::string& err) {
     return true;
 }
 
+bool Dflash2Drafter::room_lend(std::string& err) {
+    if (room_lent_) return true;
+    if (blob_shared_ || blob_ == nullptr || blob_bytes_ == 0) { err = "dflash2 room: no pack of its own"; return false; }
+    if (parked_) { err = "dflash2 room: the drafter is parked"; return false; }
+    if (!context_wait(err)) return false;
+    const OnDevice on_device(device_);
+    // the drafter's last kernels read the pack: they are done before a prompt stages a byte into it
+    if (cudaDeviceSynchronize() != cudaSuccess) { err = std::string("dflash2 room: ") + cudaGetErrorString(cudaGetLastError()); return false; }
+    if (h_blob_ == nullptr) {   // once: the weights never change after load
+        h_blob_ = (uint8_t*) std::malloc(blob_bytes_);
+        if (h_blob_ == nullptr) { err = "dflash2 room: no RAM for the pack's copy"; return false; }
+        if (cudaMemcpy(h_blob_, blob_, blob_bytes_, cudaMemcpyDeviceToHost) != cudaSuccess) {
+            std::free(h_blob_); h_blob_ = nullptr; err = "dflash2 room: the pack's copy to RAM failed"; return false;
+        }
+    }
+    room_lent_ = true;
+    ++n_room_lends;
+    return true;
+}
+
+bool Dflash2Drafter::room_reclaim(std::string& err) {
+    if (!room_lent_) return true;
+    const OnDevice on_device(device_);
+    const Clock::time_point t0 = Clock::now();
+    // the same bytes to the same address: the round graphs captured with it read the weights again
+    if (cudaMemcpy(blob_, h_blob_, blob_bytes_, cudaMemcpyHostToDevice) != cudaSuccess) {
+        err = std::string("dflash2 room: the pack's copy back failed: ") + cudaGetErrorString(cudaGetLastError());
+        return false;
+    }
+    room_lent_ = false;
+    ms_room_reclaim += ms_since(t0);
+    return true;
+}
+
 // ---- ring log -----------------------------------------------------------------------------------------------------------------------------------------
 // The ring holds the last 2064 positions of the lineage it was filled for.  Resuming a prompt below the highest position written (a repeated or rewound
 // prefix, a parked conversation brought back) leaves the part of the first draft's window [n - 2047, resume) either overwritten by the later positions
@@ -1047,6 +1081,7 @@ void Dflash2Drafter::note_rows(const int32_t* toks, int64_t n, int64_t pos0) {
 }
 
 bool Dflash2Drafter::context(const float* taps, int64_t n, int64_t pos0, std::string& err) {
+    if (room_lent_) { err = "dflash2: context() while the pack is lent as the prompt room"; return false; }
     if (!context_wait(err)) return false;
     const OnDevice on_device(device_);
     const int tap_n = (int) taps_.size() * N_;
@@ -1097,6 +1132,7 @@ bool Dflash2Drafter::draft(const float* taps, int n_new, int64_t pos0, int32_t a
 
 bool Dflash2Drafter::draft_launch(const float* taps, int n_new, int64_t pos0, int32_t anchor, std::string& err) {
     if (!bound_) { err = "dflash2: not bound"; return false; }
+    if (room_lent_) { err = "dflash2: draft() while the pack is lent as the prompt room"; return false; }
     if (!context_wait(err)) return false;
     if (n_new < 1 || n_new > kRows) { err = "dflash2: draft rows out of range"; return false; }
     const OnDevice on_device(device_);

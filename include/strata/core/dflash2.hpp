@@ -162,6 +162,18 @@ public:
     double ms_park = 0, ms_unpark = 0;
     int64_t n_parks = 0, n_recaptures = 0;
 
+    /// STRATA_DF2_ROOM_MIN (serve, opt-in, fork): the pack lent IN PLACE as the prompt path's ring room (Prefill::set_ring_room_base).  The
+    /// allocation stays at the same address; a host copy is made once (pageable, the weights never change); room_reclaim() writes the weights back
+    /// where they were, so the captured round graphs stay valid and nothing is captured again.  Between the two the pack's bytes are the prompt's
+    /// staging slots: no draft() or context() may run (both refuse while lent).  The owned draft head is not lent and stays on the card.
+    uint8_t* pack_base() const { return blob_shared_ ? nullptr : blob_; }
+    uint64_t pack_bytes() const { return blob_shared_ ? 0 : blob_bytes_; }
+    bool room_lend(std::string& err);
+    bool room_reclaim(std::string& err);
+    bool room_lent() const { return room_lent_; }
+    double ms_room_reclaim = 0;
+    int64_t n_room_lends = 0;
+
     uint64_t vram_bytes() const { return vram_; }
     int64_t n_draft_vocab() const { return n_dvocab_; }
     int n_embd() const { return N_; }
@@ -203,6 +215,7 @@ private:
     uint8_t* h_blob_ = nullptr;     ///< host copies while parked (malloc; pageable) (kept after the first park: the weights never change)
     uint8_t* h_dhead_ = nullptr;
     bool parked_ = false, head_is_dhead_ = false;
+    bool room_lent_ = false;        ///< room_lend: the pack's bytes are the prompt path's ring until room_reclaim
     uint8_t* last_blob_ = nullptr;  ///< the addresses the round graphs were captured with (park: recapture only when they move)
     uint8_t* last_dhead_ = nullptr;
     float* landing_ = nullptr;

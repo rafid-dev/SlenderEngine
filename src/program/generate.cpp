@@ -11108,6 +11108,45 @@ int main(int argc, char** argv) {
                          (long long) mtp_room_min, (long long) mtp_room_min, mtp.device(),
                          (unsigned long long) (mtp.experts_bytes() >> 20), mtp_room_slots);
         }
+        // STRATA_DF2_ROOM_MIN=TOKENS (opt-in, fork): STRATA_MTP_ROOM_MIN with the DFlash2 drafter's pack (its Q4_0 weights, 492 MiB on
+        // Flash-Next) as the room.  A request that READS at least TOKENS prompt tokens points the prompt path's ring at the pack's bytes for as
+        // long as it is read (Dflash2Drafter::room_lend: nothing is freed or moved); the drafter's tap rows are held in RAM meanwhile, and before
+        // the first window its weights go back to the same address (room_reclaim) and it is handed the rows through the same context() call.
+        // With a small ring rule (STRATA_PREFILL_RING) the loan the chunk is sized in keeps fewer ring slots, so the chunk can grow, while the
+        // room still gives a long prompt a deep ring.  Unset: nothing below runs.
+        int64_t df2_room_min = -1;
+        int df2_room_slots = 0;
+        void* df2_room_base = nullptr;
+        uint64_t df2_room_bytes = 0;
+#if defined(STRATA_HAVE_DFLASH2)
+        if (const char* v = std::getenv("STRATA_DF2_ROOM_MIN"); v != nullptr && v[0] != '\0') {
+            char* end = nullptr;
+            const long long nv = std::strtoll(v, &end, 10);
+            const char* why = end == v || *end != '\0' || nv < 0 ? "it is not a token count"
+                            : !o.serve ? "it needs --serve"
+                            : !use_df2 ? "it needs the DFlash2 drafter (--draft dflash2)"
+                            : o.batch > 0 ? "it does not support --batch"
+                            : multi_gpu ? "it is for one GPU"
+                            : mtp_room_slots > 0 ? "STRATA_MTP_ROOM_MIN already gives the prompt a room"
+                            : df2.pack_base() == nullptr ? "the drafter's pack is not its own to lend"
+                            : nullptr;
+            if (why != nullptr) {
+                std::fprintf(stderr, "strata generate: STRATA_DF2_ROOM_MIN is unavailable: %s\n", why);
+            } else {
+                const int64_t blob = (int64_t) strata::kernels::cpu::expert_layout().max_blob;
+                df2_room_slots = blob > 0 ? (int) std::min<int64_t>((int64_t) (df2.pack_bytes() / (uint64_t) blob), 4096) : 0;
+                if (df2_room_slots > 0) {
+                    df2_room_min = (int64_t) nv;
+                    df2_room_base = df2.pack_base();
+                    df2_room_bytes = df2.pack_bytes();
+                    std::fprintf(stderr, "strata serve: STRATA_DF2_ROOM_MIN=%lld: a request that reads %lld prompt tokens or more points the "
+                                         "prompt path's ring at the DFlash2 pack's %llu MiB (%d slots past its own) for as long as it is read; "
+                                         "the drafter's weights are back, at the same address, before the first window\n",
+                                 (long long) nv, (long long) nv, (unsigned long long) (df2_room_bytes >> 20), df2_room_slots);
+                }
+            }
+        }
+#endif
         bool any_loan = borrow != nullptr;
         for (size_t i = 1; i < pf_parts.size(); ++i) any_loan = any_loan || pf_parts[i].first >= 0;
         if (nib::any_on()) {
@@ -11213,9 +11252,11 @@ int main(int argc, char** argv) {
             int cur_dev = 0;
             cudaGetDevice(&cur_dev);   // the device this path is about to run on (dev -1: the current one)
             const bool room_here = mtp_room_slots > 0 && mtp.device() == cur_dev;
-            if (room_here) room_path = &sp;
-            sp.set_ring_room(room_here ? mtp_room_slots : 0);
-            sp.set_ring_room_base(room_here ? mtp.experts_base() : nullptr, room_here ? mtp.experts_bytes() : 0);
+            const bool df2_room_here = df2_room_slots > 0;   // one GPU only (STRATA_DF2_ROOM_MIN above)
+            if (room_here || df2_room_here) room_path = &sp;
+            sp.set_ring_room(room_here ? mtp_room_slots : df2_room_here ? df2_room_slots : 0);
+            sp.set_ring_room_base(room_here ? mtp.experts_base() : df2_room_here ? df2_room_base : nullptr,
+                                  room_here ? mtp.experts_bytes() : df2_room_here ? df2_room_bytes : 0);
             if (!sp.init(wt, g, ss, prefill_src, &xcache, host_res.data(), o.prefill_chunk, main_cs, err, borrow, borrow_bytes,
                          o.prefill_head_alias))
                 return err.find("do not fit") != std::string::npos ? 2 : 1;
@@ -16101,6 +16142,58 @@ int main(int argc, char** argv) {
                 return 0;
             };
             if (mtp_room_open && room_close("left open") != 0) return 1;
+            // STRATA_DF2_ROOM_MIN: this request's DFlash2 room.  While it is open the prompt path's tap rows go to RAM (room_taps) instead of the
+            // drafter, whose pack is the ring; df2_room_close gives the pack its weights back (same address) and hands the rows over.  The guard
+            // puts the drafter's own tap callback back on every way out of the request, so no later prompt calls into this request's locals.
+            bool df2_room_open = false;
+            std::vector<float> room_taps;
+            int64_t room_pos0 = -1, room_rows = 0;
+            std::function<bool(const float*, int64_t, int64_t, std::string&)> room_saved_taps;
+            struct Df2RoomTapGuard {
+                bool* open;
+                std::function<bool(const float*, int64_t, int64_t, std::string&)>* saved;
+                std::function<bool(const float*, int64_t, int64_t, std::string&)>* taps;
+                ~Df2RoomTapGuard() { if (*open && *saved) *taps = *saved; }
+            } df2_room_tap_guard{&df2_room_open, &room_saved_taps, &sp.on_taps};
+            auto df2_room_close = [&](const char* why, bool hand) -> int {
+#if defined(STRATA_HAVE_DFLASH2)
+                if (!df2.room_lent()) { df2_room_open = false; return 0; }
+                const auto t0 = Clock::now();
+                if (room_path != nullptr) {
+                    // nothing stages into the pack after this, and the prompt path's streams are idle before it is written over
+                    if (!room_path->idle(err)) { std::printf("ERR %s\n", err.c_str()); return 1; }
+                    room_path->set_ring_room_active(false);
+                }
+                if (df2_room_open && room_saved_taps) sp.on_taps = room_saved_taps;
+                if (!df2.room_reclaim(err)) { std::printf("ERR %s\n", err.c_str()); return 1; }
+                const bool was_open = df2_room_open;
+                df2_room_open = false;
+                const int64_t rows = room_rows;
+                if (was_open && hand && room_rows > 0) {
+                    const size_t w = df2.tap_layers().size() * (size_t) g.n_embd;
+                    float* dt = nullptr;
+                    if (cudaMalloc((void**) &dt, (size_t) room_rows * w * 4) != cudaSuccess) {
+                        (void) cudaGetLastError();
+                        std::printf("ERR STRATA_DF2_ROOM_MIN: no VRAM for the held tap rows\n");
+                        return 1;
+                    }
+                    const bool ok = cudaMemcpy(dt, room_taps.data(), (size_t) room_rows * w * 4, cudaMemcpyHostToDevice) == cudaSuccess &&
+                                    df2.context(dt, room_rows, room_pos0, err);
+                    cudaFree(dt);
+                    if (!ok) { std::printf("ERR STRATA_DF2_ROOM_MIN: %s\n", err.empty() ? "the held tap rows' copy back failed" : err.c_str()); return 1; }
+                }
+                room_taps.clear();
+                room_rows = 0;
+                room_pos0 = -1;
+                std::fprintf(stderr, "strata serve: prompt room (%s): the DFlash2 pack's weights are back in %.1f ms, %lld tap rows handed over\n",
+                             why, std::chrono::duration<double, std::milli>(Clock::now() - t0).count(), (long long) rows);
+#else
+                (void) why; (void) hand;
+#endif
+                return 0;
+            };
+            // a room an earlier request left lent (a cancelled or failed prompt): its weights back before anything else
+            if (df2_room_slots > 0 && df2_room_close("left open", false) != 0) return 1;
             // STRATA_HEAD_ALIAS_SHORT=N (opt-in, with --prefill-head-alias): the head stays loaded at the request's start,
             // a part of at most N tokens reads through the verify windows (as --short-read N would), and the head becomes
             // prompt workspace only at the first part read batched.  Unset: the head goes at every request's start.
@@ -16795,6 +16888,38 @@ int main(int argc, char** argv) {
                                  std::chrono::duration<double, std::milli>(Clock::now() - room_t0).count());
                 }
             }
+#if defined(STRATA_HAVE_DFLASH2)
+            // STRATA_DF2_ROOM_MIN: the same, with the DFlash2 pack; the drafter's tap rows wait in RAM until df2_room_close
+            if (df2_room_slots > 0 && room_path != nullptr && use_df2 && n - read_from >= df2_room_min && !df2.room_lent()) {
+                const auto room_t0 = Clock::now();
+                if (!df2.room_lend(err)) {
+                    std::fprintf(stderr, "strata serve: prompt room: %s: this prompt reads as it always did\n", err.c_str());
+                } else {
+                    room_path->set_ring_room_active(true);   // before the loan: a relayout re-carves with the room
+                    df2_room_open = true;
+                    room_saved_taps = sp.on_taps;
+                    room_taps.clear();
+                    room_rows = 0;
+                    room_pos0 = -1;
+                    const size_t w = df2.tap_layers().size() * (size_t) g.n_embd;
+                    sp.on_taps = [&room_taps, &room_pos0, &room_rows, w](const float* taps, int64_t rows, int64_t pos0, std::string& te) -> bool {
+                        if (room_pos0 < 0) room_pos0 = pos0;
+                        if (pos0 != room_pos0 + room_rows) { te = "STRATA_DF2_ROOM_MIN: the prompt's tap rows did not arrive in order"; return false; }
+                        room_taps.resize((size_t) (room_rows + rows) * w);
+                        if (cudaMemcpy(room_taps.data() + (size_t) room_rows * w, taps, (size_t) rows * w * 4, cudaMemcpyDefault) != cudaSuccess) {
+                            te = std::string("STRATA_DF2_ROOM_MIN: tap rows to RAM: ") + cudaGetErrorString(cudaGetLastError());
+                            return false;
+                        }
+                        room_rows += rows;
+                        return true;
+                    };
+                    std::fprintf(stderr, "strata serve: prompt room: %lld tokens to read, the prompt path's ring is the DFlash2 pack's %llu MiB "
+                                         "(%d slots past its own, lent in %.1f ms)\n",
+                                 (long long) (n - read_from), (unsigned long long) (df2_room_bytes >> 20), df2_room_slots,
+                                 std::chrono::duration<double, std::milli>(Clock::now() - room_t0).count());
+                }
+            }
+#endif
             conversations.limit_reuse(read_from);
             pp_total = n;
             pp_from = read_from;
@@ -18219,6 +18344,7 @@ int main(int argc, char** argv) {
                 return 1;
             }
             if (mtp_room_open && room_close("prompt done") != 0) return 1;
+            if (df2_room_open && df2_room_close("prompt done", true) != 0) return 1;
             if (head_restore() != 0) return 1;
             tr("prompt done (slots refilled)");
             if (il_parts > 0)
