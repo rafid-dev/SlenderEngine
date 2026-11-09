@@ -1,4 +1,7 @@
-# Contributing to Strata
+# Contributing
+
+This fork is based on [Niko1221/Strata](https://github.com/Niko1221/Strata). A problem that is also in upstream
+Strata, or a change that would help every Strata user, belongs there first.
 
 **AI assistance is welcome. The contributor is responsible for understanding the change and supplying real evidence.**
 
@@ -7,8 +10,8 @@ You should be able to explain every changed line and answer review questions abo
 
 ## Before starting
 
-1. Search [issues](https://github.com/Niko1221/Strata/issues) and
-   [pull requests](https://github.com/Niko1221/Strata/pulls), including closed discussions. Add new evidence to an
+1. Search [issues](https://github.com/rafid-dev/Strata-32GB/issues) and
+   [pull requests](https://github.com/rafid-dev/Strata-32GB/pulls), including closed discussions. Add new evidence to an
    existing thread when it covers your problem.
 2. Read [AGENTS.md](AGENTS.md) and the documentation for the component you want to change.
 3. Get maintainer agreement on scope before substantial features, refactors, architecture changes, or changes to
@@ -21,10 +24,10 @@ the situation, bring it to the original discussion and let a maintainer decide w
 
 ## Report a problem people can investigate
 
-Use the matching [issue form](https://github.com/Niko1221/Strata/issues/new/choose). A bug report should include:
+Use the matching [issue form](https://github.com/rafid-dev/Strata-32GB/issues/new/choose). A bug report should include:
 
 - The smallest steps or command that reproduce the problem, and the expected and actual behavior.
-- Strata version or commit, OS, GPU and VRAM, and relevant model, quantization, and configuration.
+- The commit, OS, GPU and VRAM, and relevant model, quantization, and configuration.
 - The exact error and relevant logs, with credentials and private content removed.
 - Whether you reproduced it yourself. Label a finding based only on reading code or a scanner as
   **unconfirmed static analysis**, and explain the suspected path without presenting it as an observed failure.
@@ -49,7 +52,7 @@ Reproduction status: <reproduced locally OR unconfirmed static analysis>
 
 Every issue and pull request title starts with its area in square brackets, then a short description: `[Engine]`, `[GUI]`, `[TUI]`,
 `[Benchmark]`, `[Docs]` or `[Other]`. For example `[Engine] fix decode stop on long prompts` or `[GUI] keep the model list after a tab
-switch`. The issue forms ask for the area and a check on the title fails when the prefix is missing.
+switch`. The bug report form asks for the area.
 
 ## Prepare a focused pull request
 

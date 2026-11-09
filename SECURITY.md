@@ -4,15 +4,15 @@
 
 Please report anything that should not be public until it is fixed **privately**, through GitHub's private
 vulnerability reporting: the repository's **Security** tab, **Report a vulnerability**
-([direct link](https://github.com/Niko1221/Strata/security/advisories/new)). Say what you found, how to reproduce it
-(the request, the config keys involved, the Strata version), and what an attacker gains. We answer there, fix it in
-a release, and credit you in the advisory unless you ask us not to.
+([direct link](https://github.com/rafid-dev/Strata-32GB/security/advisories/new)). Say what you found, how to reproduce it
+(the request, the config keys involved, the commit), and what an attacker gains. We answer there, fix it on
+`speed-fork`, and credit you in the advisory unless you ask us not to. A problem that is also in upstream Strata
+belongs with [Niko1221/Strata](https://github.com/Niko1221/Strata/security/advisories/new) as well.
 
 Ordinary hardening ideas and findings that are safe to discuss in public are welcome as an
-[issue](https://github.com/Niko1221/Strata/issues) (#544 collects audit findings) or as a pull request, which we
-review like our own code.
+[issue](https://github.com/rafid-dev/Strata-32GB/issues) or as a pull request, which we review like our own code.
 
-Supported: the latest release. Fixes go into the next release, not into older ones.
+Supported: the latest commit on `speed-fork`. Fixes go there, not into older commits.
 
 ## What the server exposes
 
