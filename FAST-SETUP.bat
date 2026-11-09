@@ -7,7 +7,7 @@ cd /d "%~dp0"
 if exist "strata-iq3_s.json" goto tune
 echo.
 echo  First run. This will:
-echo    - download Qwen3.8-Flash-Next IQ3_S (allow about 120 GB of disk space)
+echo    - download Qwen3.8-Flash-Next IQ3_S (allow about 140 GB of disk space)
 echo    - build the engine from this folder, which needs the Visual Studio 2022 Build Tools
 echo      with the C++ workload, the CUDA toolkit and CMake
 echo.

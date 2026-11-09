@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Tunes an installed Qwen3.8-Flash-Next IQ3_S for a 32 GB PC on Windows and, if you want, sets up dual SSD streaming.
+"""Tunes an installed Qwen3.8-Flash-Next IQ3_S for a 32 GB PC on Windows or Linux and, if you want, sets up dual SSD streaming.
 
-It reads the config setup wrote, and writes its own config and launcher beside it (strata-fast.json, run-fast.bat).
-Setup's files are not changed. Nothing is written with --dry-run. FAST-SETUP.bat runs this.
+It reads the config setup wrote, and writes its own config and launcher beside it (strata-fast.json, and run-fast.bat on
+Windows or run-fast.sh on Linux). Setup's files are not changed. Nothing is written with --dry-run. FAST-SETUP.bat (Windows)
+and FAST-SETUP.sh (Linux) run this.
 
   --dry-run           show what would happen and stop
   --yes               no questions: the settings, and the best second drive unless --no-mirror
@@ -31,6 +32,9 @@ GIB = 1024 ** 3
 MIRROR_SPARE = 5 * GIB
 PATCHED_MARK = b"STRATA_FORK_DEFAULTS"   # only this fork's engine holds this name, from the build that applies its defaults itself
 SETUP_ARGS = "--family qwen --model IQ3_S --build --context 262144 --kv int8 --vision gpu --no-start"
+WINDOWS = os.name == "nt"
+SETUP_CMD = "START-HERE.bat" if WINDOWS else "./setup.sh"
+FAST_CMD = "FAST-SETUP.bat" if WINDOWS else "./FAST-SETUP.sh"
 
 
 def say(text=""):
@@ -38,6 +42,11 @@ def say(text=""):
 
 
 def total_ram_gib():
+    if not WINDOWS:
+        for line in open("/proc/meminfo", encoding="ascii"):
+            if line.startswith("MemTotal:"):
+                return int(line.split()[1]) * 1024 / GIB
+        return 0.0
     class Status(ctypes.Structure):
         _fields_ = [("length", ctypes.c_ulong), ("load", ctypes.c_ulong), ("total", ctypes.c_ulonglong), ("avail", ctypes.c_ulonglong),
                     ("page", ctypes.c_ulonglong), ("avail_page", ctypes.c_ulonglong), ("virt", ctypes.c_ulonglong),
@@ -48,8 +57,44 @@ def total_ram_gib():
     return s.total / GIB
 
 
+def cpu_list(text):
+    """A Linux CPU list ("0-15,20,22-23") as numbers."""
+    out = []
+    for part in text.strip().split(","):
+        if "-" in part:
+            a, b = part.split("-")
+            out += range(int(a), int(b) + 1)
+        elif part:
+            out.append(int(part))
+    return out
+
+
+def cpu_cores_linux():
+    """Per physical core: (1 for a P-core, 0 for an E-core or a CPU with one kind of core, its logical processors). Hybrid Intel CPUs
+    name their two kinds in /sys/devices/cpu_core/cpus and /sys/devices/cpu_atom/cpus; the core a thread belongs to is in its topology."""
+    try:
+        p_set = set(cpu_list(Path("/sys/devices/cpu_core/cpus").read_text()))
+        e_set = set(cpu_list(Path("/sys/devices/cpu_atom/cpus").read_text()))
+    except (OSError, ValueError):
+        p_set = e_set = set()
+    seen, cores = set(), []
+    for d in sorted(Path("/sys/devices/system/cpu").glob("cpu[0-9]*"), key=lambda p: int(p.name[3:])):
+        n = int(d.name[3:])
+        if n in seen:
+            continue
+        try:
+            sib = cpu_list((d / "topology" / "thread_siblings_list").read_text())
+        except (OSError, ValueError):
+            sib = [n]
+        seen.update(sib)
+        cores.append((1 if (p_set and e_set and n in p_set) else 0, sib))
+    return cores
+
+
 def cpu_cores():
     """Per physical core: (efficiency class, its logical processors), in Windows' order."""
+    if not WINDOWS:
+        return cpu_cores_linux()
     k = ctypes.windll.kernel32
     size = ctypes.c_ulong(0)
     k.GetLogicalProcessorInformationEx(0, None, ctypes.byref(size))
@@ -89,8 +134,49 @@ def gpu_info():
         return None, 0.0
 
 
+def volumes_linux():
+    """The mounted filesystems, with free space, the physical disk under each (lsblk's tree: a partition, LVM or LUKS volume counts as
+    its top disk) and what kind of disk it is. "letter" holds the mount point, so the rest of this file reads the same on both systems."""
+    r = subprocess.run(["lsblk", "-J", "-b", "-o", "NAME,MOUNTPOINT,FSAVAIL,FSTYPE,ROTA,TRAN,MODEL,TYPE"], capture_output=True, text=True)
+    try:
+        tree = json.loads(r.stdout or "{}").get("blockdevices") or []
+    except ValueError:
+        return []
+    out = []
+
+    def walk(dev, disk):
+        mnt = dev.get("mountpoint")
+        if mnt and dev.get("fsavail") is not None and dev.get("fstype") not in ("swap", None):
+            out.append({"letter": mnt, "free": int(dev["fsavail"]), "fs": dev.get("fstype"), "disk": disk["name"],
+                        "media": "HDD" if disk.get("rota") in (True, "1", 1) else "SSD",
+                        "bus": {"nvme": "NVMe", "usb": "USB", "sata": "SATA", "mmc": "MMC"}.get((disk.get("tran") or "").lower(), disk.get("tran") or ""),
+                        "name": (disk.get("model") or disk["name"]).strip()})
+        for c in dev.get("children") or []:
+            walk(c, disk)
+
+    for d in tree:
+        if d.get("type") in ("disk",):
+            walk(d, d)
+    return out
+
+
+def volume_of(path, vols):
+    """The volume a path is on: by drive letter on Windows, by the longest mount point that holds it on Linux."""
+    if WINDOWS:
+        return next((v for v in vols if v["letter"].upper() == Path(path).drive[:1].upper()), None)
+    p = str(Path(path).resolve())
+    best = None
+    for v in vols:
+        m = v["letter"].rstrip("/") or "/"
+        if (p == m or p.startswith(m.rstrip("/") + "/")) and (best is None or len(m) > len(best["letter"])):
+            best = v
+    return best
+
+
 def volumes():
     """The fixed drives with a letter: free space, physical disk, and what kind of disk it is."""
+    if not WINDOWS:
+        return volumes_linux()
     script = r"""
 $out = foreach ($v in Get-Volume | Where-Object { $_.DriveLetter -and $_.DriveType -eq 'Fixed' }) {
   try {
@@ -109,13 +195,18 @@ $out = foreach ($v in Get-Volume | Where-Object { $_.DriveLetter -and $_.DriveTy
     return [v] if isinstance(v, dict) else v
 
 
-def mirror_candidates(vols, pack_letter, need):
-    """Other physical SSDs with room. A second partition of the same disk would gain nothing, a hard disk or a USB drive would slow reads down."""
-    here = next((v for v in vols if v["letter"].upper() == pack_letter.upper()), None)
+def mirror_candidates(vols, src, need):
+    """Other physical SSDs with room. A second partition of the same disk would gain nothing, a hard disk or a USB drive would slow reads down.
+    On Linux the mount must also be writable by this user (the copy goes in <mount>/StrataMirror)."""
+    here = volume_of(src, vols)
     if here is None:
         return []
     return [v for v in vols if v["disk"] != here["disk"] and v["media"] != "HDD" and v["bus"] not in ("USB", "SD", "MMC", "File Backed Virtual")
-            and v["free"] >= need]
+            and v["free"] >= need and (WINDOWS or os.access(v["letter"], os.W_OK))]
+
+
+def mirror_dir_for(v):
+    return Path(f"{v['letter']}:\\StrataMirror") if WINDOWS else Path(v["letter"]) / "StrataMirror"
 
 
 def sha256_of(path, out):
@@ -141,7 +232,16 @@ def same_file(a, b):
 
 
 def file_extents(path):
-    """How many pieces the file is stored in (fsutil), or None if Windows won't say."""
+    """How many pieces the file is stored in (fsutil on Windows, filefrag on Linux), or None if the system won't say."""
+    if not WINDOWS:
+        try:
+            r = subprocess.run(["filefrag", str(path)], capture_output=True, text=True)
+        except OSError:
+            return None
+        try:   # "<path>: 12 extents found"
+            return int(r.stdout.rsplit(":", 1)[1].split()[0]) if r.returncode == 0 else None
+        except (IndexError, ValueError):
+            return None
     r = subprocess.run(["fsutil", "file", "queryextents", str(path)], capture_output=True, text=True)
     n = r.stdout.count("VCN:")
     return n if r.returncode == 0 and n > 0 else None
@@ -150,10 +250,63 @@ def file_extents(path):
 FRAGMENTED = 1000   # more pieces than this: some reads of the copy become many small disk requests (68,990 measured 3x slower)
 
 
+def copy_experts_linux(src, dst):
+    """The Linux copy, for the same reasons: the whole size reserved first (posix_fallocate), then 64 MiB at a time with O_DIRECT through
+    a page-aligned buffer, so the page cache isn't filled. A filesystem that refuses O_DIRECT gets a buffered copy that drops each
+    piece from the cache after writing it."""
+    import mmap
+    chunk, size = 64 << 20, src.stat().st_size
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(dst, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+    try:
+        os.posix_fallocate(fd, 0, size)
+    except OSError:
+        os.close(fd)
+        return False
+    os.close(fd)
+    n = file_extents(dst)
+    if n is not None:
+        say(f"  Space reserved in {n} piece{'s' if n != 1 else ''}.")
+    direct = getattr(os, "O_DIRECT", 0)
+    try:
+        s = os.open(src, os.O_RDONLY | direct)
+        d = os.open(dst, os.O_WRONLY | direct)
+    except OSError:
+        direct = 0
+        s = os.open(src, os.O_RDONLY)
+        d = os.open(dst, os.O_WRONLY)
+    buf, done, ok = mmap.mmap(-1, chunk), 0, True
+    try:
+        while ok and done < size:
+            want = min(chunk, (size - done + 4095) // 4096 * 4096) if direct else min(chunk, size - done)
+            view = memoryview(buf)[:want]
+            got = os.preadv(s, [view], done)
+            if got <= 0:
+                ok = False
+                break
+            n_out = (got + 4095) // 4096 * 4096 if direct else got
+            ok = os.pwritev(d, [memoryview(buf)[:n_out]], done) == n_out
+            if not direct:
+                os.posix_fadvise(d, done, n_out, os.POSIX_FADV_DONTNEED)
+                os.posix_fadvise(s, done, got, os.POSIX_FADV_DONTNEED)
+            done += got
+            if done % (10 << 30) < chunk:
+                say(f"  {done / GIB:.0f} of {size / GIB:.0f} GB")
+    finally:
+        os.close(s)
+        os.close(d)
+        buf.close()
+    if ok and size % 4096:   # the last block was written whole: cut the file back to the original's size
+        os.truncate(dst, size)
+    return ok and done == size and dst.stat().st_size == size
+
+
 def copy_experts(src, dst):
     """Unbuffered, so the copy does not push everything else out of RAM, and with the whole size reserved first, so the
     copy lands in a few large pieces. A copy written as it goes (robocopy /J) took the free gaps of a well-used drive:
     68,990 pieces, and about 880 experts read 3x slower from it."""
+    if not WINDOWS:
+        return copy_experts_linux(src, dst)
     k = ctypes.WinDLL("kernel32", use_last_error=True)
     k.CreateFileW.restype = ctypes.c_void_p
     k.CreateFileW.argtypes = [ctypes.c_wchar_p, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_void_p]
@@ -207,25 +360,24 @@ def copy_experts(src, dst):
 def choose_mirror(a, src, vols):
     """The path to use, or None for one drive. Copies the file if it is not there yet."""
     size = src.stat().st_size
-    pack_letter = src.drive[:1]
     if a.no_mirror:
         say("Dual SSD: off (--no-mirror).")
         return None
     if a.mirror_dir:
         dst = Path(a.mirror_dir) / src.name
-        here = next((v for v in vols if v["letter"].upper() == pack_letter.upper()), None)
-        there = next((v for v in vols if v["letter"].upper() == dst.drive[:1].upper()), None)
+        here = volume_of(src, vols)
+        there = volume_of(dst.parent if dst.parent.exists() else Path(a.mirror_dir).anchor or "/", vols)
         if here is None or there is None or here["disk"] == there["disk"]:
             sys.exit(f"{a.mirror_dir} is not on another physical drive than {src}. It would gain nothing, so nothing was copied.")
     else:
-        found = mirror_candidates(vols, pack_letter, size + MIRROR_SPARE)
+        found = mirror_candidates(vols, src, size + MIRROR_SPARE)
         if not found:
             say(f"Dual SSD: no other SSD has {(size + MIRROR_SPARE) / GIB:.0f} GB free, so this stays on one drive. The other settings still apply.")
             return None
         say(f"Dual SSD: a copy of experts.bin ({size / GIB:.1f} GB) on a second SSD lets each read come from both drives.")
         say("  Measured on two 990 PRO: +12% text, +39% prompt reading. Reading does not wear an SSD; the copy writes the file once.")
         for i, v in enumerate(found, 1):
-            say(f"  {i}. {v['letter']}: {v['name']}, {v['free'] / GIB:.0f} GB free")
+            say(f"  {i}. {v['letter']}{':' if WINDOWS else ''} {v['name']}, {v['free'] / GIB:.0f} GB free")
         if a.yes:
             pick = max(found, key=lambda v: (v["bus"] == "NVMe", v["free"]))
         else:
@@ -234,13 +386,13 @@ def choose_mirror(a, src, vols):
                 say("Dual SSD: off.")
                 return None
             pick = found[int(ans) - 1]
-        dst = Path(f"{pick['letter']}:\\StrataMirror") / src.name
+        dst = mirror_dir_for(pick) / src.name
     if dst.exists() and dst.stat().st_size == size:
         say(f"Dual SSD: {dst} is already there with the right size.")
         n = file_extents(dst)
         if n is not None and n > FRAGMENTED:
             say(f"  It is stored in {n:,} pieces, so some of its reads are slow (measured: about 880 experts 3x slower at 68,990 pieces).")
-            say(f"  To fix it: delete {dst} and run FAST-SETUP.bat again; the new copy reserves its space first.")
+            say(f"  To fix it: delete {dst} and run {FAST_CMD} again; the new copy reserves its space first.")
         if a.verify and not a.dry_run and not same_file(src, dst):
             sys.exit(f"{dst} differs from {src}. Delete it and run this again.")
         return dst
@@ -287,7 +439,7 @@ def choose_ram(a, ram):
     if not measured:
         say(f"This fork is tuned for 32 GB. {pick:g} GiB of experts on a {ram:.0f} GB PC has not been measured.")
     if pick > safe:
-        say(f"{pick:g} GiB leaves little free RAM: close other large programs, or Windows will page heavily, which writes to your SSD.")
+        say(f"{pick:g} GiB leaves little free RAM: close other large programs, or the system will page heavily, which writes to your SSD.")
     return pick
 
 
@@ -316,7 +468,18 @@ def set_arg(args, name, value):
         args += [name, value]
 
 
+def launcher_sh(cfg_path, env):
+    py = HOME / ".venv" / "bin" / "python"
+    lines = ["#!/usr/bin/env bash", "# Written by FAST-SETUP.sh. Chat page and API: http://127.0.0.1:8080"]
+    lines += [f"export {k}={json.dumps(str(v))}" for k, v in env.items()]
+    lines += ["export PYTHONUTF8=1", f'cd "{HOME}" || exit 1',
+              f'exec "{py}" "{HOME / "serve" / "server.py"}" --engine strata --config "{cfg_path}" --port 8080 --open "$@"', ""]
+    return "\n".join(lines)
+
+
 def launcher(cfg_path, env):
+    if not WINDOWS:
+        return launcher_sh(cfg_path, env)
     py = HOME / ".venv" / "Scripts" / "python.exe"
     lines = ["@echo off", "rem Written by FAST-SETUP.bat. Chat page and API: http://127.0.0.1:8080", "title SlenderEngine (32 GB tuned)"]
     lines += [f'set "{k}={v}"' for k, v in env.items()]
@@ -325,8 +488,8 @@ def launcher(cfg_path, env):
 
 
 def main():
-    if os.name != "nt":
-        sys.exit("This setup is for Windows. On Linux, use ./setup.sh and the settings in FORK.md.")
+    if not WINDOWS and not sys.platform.startswith("linux"):
+        sys.exit("This setup is for Windows and Linux. On a Mac, use ./setup.sh and the settings in FORK.md.")
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--yes", action="store_true")
@@ -341,7 +504,7 @@ def main():
 
     source = Path(a.config) if a.config else next((p for p in (HOME / "strata-iq3_s.json", HOME / "strata-iq3_xxs.json") if p.exists()), None)
     if source is None or not source.exists():
-        sys.exit(f"No model is installed yet. Run FAST-SETUP.bat, or: START-HERE.bat {SETUP_ARGS}")
+        sys.exit(f"No model is installed yet. Run {FAST_CMD}, or: {SETUP_CMD} {SETUP_ARGS}")
     cfg = json.loads(source.read_text(encoding="utf-8"))
     args = cfg.get("args") or []
     if "--pack" not in args:
@@ -349,9 +512,9 @@ def main():
 
     exe = Path(cfg.get("exe") or "")
     if not exe.exists():
-        sys.exit(f"The engine {exe} is missing. Run: START-HERE.bat {SETUP_ARGS}")
+        sys.exit(f"The engine {exe} is missing. Run: {SETUP_CMD} {SETUP_ARGS}")
     if PATCHED_MARK not in exe.read_bytes():
-        sys.exit(f"{exe} is a stock engine, or this fork's from before it applied its own defaults. Build this one with: START-HERE.bat {SETUP_ARGS}")
+        sys.exit(f"{exe} is a stock engine, or this fork's from before it applied its own defaults. Build this one with: {SETUP_CMD} {SETUP_ARGS}")
 
     src = Path(args[args.index("--pack") + 1]) / "experts.bin"
     if not src.exists():
@@ -418,8 +581,11 @@ def main():
     out.mkdir(parents=True, exist_ok=True)
     cfg_path = out / "strata-fast.json"
     cfg_path.write_text(json.dumps(cfg, indent=1, ensure_ascii=False), encoding="utf-8")
-    (out / "run-fast.bat").write_text(launcher(cfg_path, env), encoding="utf-8", newline="")
-    say(f"\nDone. Start it with {out / 'run-fast.bat'}")
+    run = out / ("run-fast.bat" if WINDOWS else "run-fast.sh")
+    run.write_text(launcher(cfg_path, env), encoding="utf-8", newline="")
+    if not WINDOWS:
+        run.chmod(0o755)
+    say(f"\nDone. Start it with {run}")
     say("Close your browser and other large programs first: this uses most of a 32 GB PC.")
     return 0
 
