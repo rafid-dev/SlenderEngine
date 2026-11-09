@@ -11198,7 +11198,7 @@ int main(int argc, char** argv) {
             const char* cv = std::getenv(pr_mtp ? "STRATA_MTP_ROOM_CHUNK" : "STRATA_DF2_ROOM_CHUNK");
             if (cv != nullptr && cv[0] == '1') {
                 if (pf_parts.size() != 1 || pf_parts[0].first < 0 || o.prefill_chunk <= 0 || o.prefill_head_alias ||
-                    (pr_mtp && (multi_gpu || mtp.device() != pf_parts[0].dev && pf_parts[0].dev >= 0))) {
+                    (pr_mtp && (multi_gpu || (mtp.device() != pf_parts[0].dev && pf_parts[0].dev >= 0)))) {
                     std::fprintf(stderr, "strata serve: STRATA_%s_ROOM_CHUNK is unavailable: it needs one prompt path with a loan on the "
                                          "drafter's card (no layer split, no --prefill-head-alias)\n", pr_mtp ? "MTP" : "DF2");
                 } else {
