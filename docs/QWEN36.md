@@ -120,7 +120,7 @@ chunk (every chat turn after the first) is one chunk either way.
 
 ## An 8 GB card with 32 GB of RAM
 
-Measured 2026-11-07 on an AMD RX 6600 8 GB (gfx1032, HIP, Windows 11), Ryzen with 6 cores / 12 threads, 32 GB of RAM,
+Measured 2026-11-07 on an AMD RX 6600 8 GB (gfx1032, HIP, Windows 11), Intel i5-10400 (6 cores / 12 threads), 32 GB of RAM,
 UD-Q4_K_M (the same expert formats as UD-Q4_K_XL), thinking on, temperature 1.0, top-k 20, top-p 0.95. Config `args`:
 `--max-context 32768 --prefill 2048 --mtp 2 --pool-workers 8`. llama.cpp is the same file with Vulkan on the same PC
 (its own hybrid expert cache, 262K context with the KV cache in RAM).
@@ -159,7 +159,38 @@ What the engine does on such a card by itself:
 
 The prompt chunk trades prompt speed for decode slots: 2048 reads a 24K prompt at 420 tok/s and decodes at 26-27 tok/s,
 4096 at 540 and 24-25. `STRATA_Q36_PROF=1` prints each streamed chunk's copy and stage times, `=2` exact per-stage
-times (the host waits at each stage); the decode step summary is printed at exit.
+times (the host waits at each stage), `=3` the decode steps' GPU time per stage, summed and printed at exit; the decode
+step summary is printed at exit.
+
+### Opt-in switches for this card (2026-11-09)
+
+Four switches, all off by default; with none set the output is bit-identical to the build before them. Measured on the
+same PC (RX 6600, i5-10400, DDR4-2666):
+
+- **`STRATA_Q36_HANDOFF=1`: a decode step queued whole.** A hybrid layer's CPU experts used to finish before the host
+  queued that layer's next kernels and the CPU rows' upload, so every layer paid a launch and a copy on the critical
+  path. Now a decode or verify forward (up to 16 rows) is queued at once: each hybrid layer's GPU part writes its routing
+  to host-mapped memory and sets a flag, waits in a one-thread kernel for the host's flag, and merges the CPU rows from
+  mapped memory. The host computes the layers' CPU experts in order. The same arithmetic, the same tokens. Greedy,
+  `--mtp 2`: 31.2 -> 41.2 tok/s. (Both directions use memory flags: on Windows an event queued behind a waiting kernel
+  is only reported when the whole submission ends.)
+- **`STRATA_Q36_KV=q8_0`** (from before, opt-in): the same speed per step as f16, half the cache, KL 0.0068 vs f16's
+  0.0144 against an fp32 cache.
+- **`STRATA_Q36_KV_RAM=1`: 262K context on 8 GB** (an 8-bit cache, one session). The cache in 4096-cell segments; the
+  first `STRATA_Q36_KV_WINDOW` cells (32768) in VRAM, the rest in pinned RAM allocated as the context reaches it
+  (2.56 GiB at 262K). Cells past the window are copied by DMA into a VRAM staging block, 32K cells at a time, for the
+  decode attention and for the prompt attention, which runs in 32K-cell blocks with an online softmax past the window.
+  A context inside the window computes exactly what the plain cache does; past it the KL is 0.063 (top-1 98.4%) on an
+  8K prompt with a 4K window, below the 0.142 of reading the same prompt in 1024-token chunks. Without it 128K did
+  not start on this card. Past the window every decode step streams the older cells over PCIe: 16.9 tok/s after a
+  54K prompt, 8.8 after a 110K one (greedy).
+- **`STRATA_Q36_PROMPT_DECAY=1`:** after a prompt of 256+ tokens its routing counts are scaled down to one rebalance
+  period and the first decode rebalance may swap 16 experts a layer, so the slots follow the answer rather than the
+  prompt. After a 24K prompt the slot hit rate goes 32% -> 42%, decode +4%.
+
+Measured and not kept: `--mtp 3` (fewer steps, each 15% dearer: slower); `--draft-vocab` (now works with a Q6_K head;
+acceptance falls, no gain); pool workers 6 / 7 / 10, rebalance every 16 / 64, 4 swaps (all within noise); more slots
+from the q8_0 cache (9 -> 13 a layer: hit rate 52.5% -> 53.5%).
 
 ## Speed and exactness
 
