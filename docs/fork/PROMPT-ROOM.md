@@ -28,9 +28,10 @@ A variable you set yourself wins. To turn the room off, set the `..._ROOM_MIN` v
 
 ## Why prompts read in passes
 
-The model has 24,576 experts (48 layers of 512), about 37 GiB on this quant. Most of them don't fit in VRAM. A prompt is read in
-chunks: for each chunk, every expert that isn't already in VRAM is streamed from RAM or the SSD and used for all the chunk's tokens.
-So the number of chunks is the number of passes over the experts, and each pass costs about 3 seconds of drive and RAM reading here.
+The model has 24,576 experts (48 layers of 512), about 47 GiB on this quant (about 2 MB each). Only about 4 GiB of them fit in
+VRAM here; 10 GiB more sit in the RAM cache and the rest on the SSDs. A prompt is read in chunks: for each chunk, every expert that
+isn't already in VRAM is streamed from RAM or the SSD and used for all the chunk's tokens. So the number of chunks is the number of
+passes over the experts, and each pass takes about 4 seconds here, most of it reading.
 
 A 50K prompt in chunks of 8,448 tokens takes 6 passes. In chunks of 10,240 it takes 5. Fewer passes means less reading.
 
