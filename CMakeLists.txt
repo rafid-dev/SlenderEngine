@@ -868,6 +868,9 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     target_link_libraries(tune_rocblas PRIVATE hip::host roc::rocblas)
     add_executable(tune_attn_rocblas tools/hip/tune_attn_rocblas.cpp)   # the 35B's prompt-attention GEMMs
     target_link_libraries(tune_attn_rocblas PRIVATE hip::host roc::rocblas)
+    add_executable(pcie_gather_bench tools/hip/pcie_gather_bench.cpp)   # scattered KV pages from pinned host memory
+    target_link_libraries(pcie_gather_bench PRIVATE hip::host)
+    set_source_files_properties(tools/hip/pcie_gather_bench.cpp PROPERTIES LANGUAGE HIP)
   endif()
 
   # DFlash2 drafter tools (not built by default: cmake --build <dir> --target dflash2_parity dflash2_gemm_bench dflash2_attn_bench): the drafter against

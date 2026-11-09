@@ -436,12 +436,14 @@ __global__ void k_attn_part(const float* q, const KT* kc, const KT* vc, const in
 template <bool DOT8>
 __global__ void k_attn_part_q8(const float* q, const int8_t* kc, const int8_t* vc, const int32_t* pos0, int t0, int H,
                                int HKV, int ctx, float scale, int n_chunk, float* pacc, float* pm, float* pl, RowSel rs,
-                               int qb, KvTab kt = KvTab(), int c_base = 0) {
+                               int qb, KvTab kt = KvTab(), int c_base = 0, int npos_bias = 0, int slot_base = 0) {
     constexpr int HD = 256;
     __shared__ float qs[HD], sc[kChunkCells], sh[kThreads];
     const int c = blockIdx.x + c_base, row = blockIdx.y;   // c_base: a launch over a range of the chunks (KV_RAM rounds)
     const int t = t0 + row / H, h = row % H, kvh = h / (H / HKV);
-    const int npos = (rs.cell ? rs.cell[t] : *pos0 + t) + 1;
+    // npos_bias: a compact cache (STRATA_Q36_SPARSE: the selected pages, then the recent cells) where row t sees
+    // cells [0, pos + t + 1 + bias); slot_base: its partials after the window's
+    const int npos = (rs.cell ? rs.cell[t] : *pos0 + t) + 1 + npos_bias;
     if (rs.kc) {
         kc = (const int8_t*) rs.kc[rs.slot[t]];
         vc = (const int8_t*) rs.vc[rs.slot[t]];
@@ -514,7 +516,7 @@ __global__ void k_attn_part_q8(const float* q, const int8_t* kc, const int8_t* v
     const int8_t* vp = vc + cell0 * HD + j;
     const __half* vsp = vs + cell0 * nb + j / qb;
     for (int k = 0; k < n; ++k) acc += sc[k] * __half2float(vsp[(size_t) k * nb]) * (float) vp[(size_t) k * HD];
-    const size_t o = (size_t) row * n_chunk + c;
+    const size_t o = (size_t) row * n_chunk + slot_base + c;
     pacc[o * HD + j] = acc;
     if (j == 0) {
         pm[o] = m;
@@ -523,19 +525,31 @@ __global__ void k_attn_part_q8(const float* q, const int8_t* kc, const int8_t* v
 }
 /// The chunks merged, times sigmoid(gate): grid (n_rows), block HD.
 __global__ void k_attn_merge(const float* pacc, const float* pm, const float* pl, const float* gate,
-                             const int32_t* pos0, int t0, int H, int n_chunk, float* out, RowSel rs) {
+                             const int32_t* pos0, int t0, int H, int n_chunk, float* out, RowSel rs,
+                             int win_chunks = -1, int bias = 0, int tail_slot = -1) {
     constexpr int HD = 256;
     const int row = blockIdx.x, t = t0 + row / H, h = row % H, d = threadIdx.x;
     const int npos = (rs.cell ? rs.cell[t] : *pos0 + t) + 1;
-    const int nc = (npos + kChunkCells - 1) / kChunkCells;
+    // sparse (win_chunks >= 0): the window's chunks, then the compact cache's for the cells [0, npos + bias)
+    const int nc = win_chunks >= 0 ? win_chunks + (npos + bias + kChunkCells - 1) / kChunkCells
+                                   : (npos + kChunkCells - 1) / kChunkCells;
     float M = -INFINITY;
     for (int c = 0; c < nc; ++c) M = fmaxf(M, pm[(size_t) row * n_chunk + c]);
+    if (tail_slot >= 0) M = fmaxf(M, pm[(size_t) row * n_chunk + tail_slot]);
     float num = 0.f, den = 0.f;
     for (int c = 0; c < nc; ++c) {
         const size_t o = (size_t) row * n_chunk + c;
         const float w = expf(pm[o] - M);
         num += w * pacc[o * HD + d];
         den += w * pl[o];
+    }
+    if (tail_slot >= 0) {   // the sparse tail estimate (k_sp_tail)
+        const size_t o = (size_t) row * n_chunk + tail_slot;
+        if (pm[o] > -INFINITY) {
+            const float w = expf(pm[o] - M);
+            num += w * pacc[o * HD + d];
+            den += w * pl[o];
+        }
     }
     const size_t gi = ((size_t) t * H + h) * HD + d;
     out[gi] = num / den * sigm(gate[gi]);
@@ -664,6 +678,159 @@ __global__ void k_kv_q8_f16(const int8_t* kc, const int8_t* vc, __half* k16, __h
     const __half* vs = (const __half*) (vc + (size_t) HKV * ctx * HD);
     k16[i] = __float2half(__half2float(ks[sci]) * (float) kc[src]);
     v16[i] = __float2half(__half2float(vs[sci]) * (float) vc[src]);
+}
+/// KV_RAM staging: segments [s0, s0 + n) of a layer's K (blockIdx.y < n) and V into the staging block (K at slot
+/// s - s0, V at nwin + s - s0), read from host-mapped memory with 16-byte loads.  grid (64, 2 n), block 256.
+__global__ void k_seg_gather(int8_t* const* ktab, int8_t* const* vtab, int s0, int n, int nwin, int seg_u4, int8_t* stage) {
+    const int j = blockIdx.y % n;
+    const bool v = blockIdx.y >= n;
+    const uint4* src = (const uint4*) (v ? vtab : ktab)[s0 + j];
+    uint4* dst = (uint4*) (stage + (size_t) ((v ? nwin : 0) + j) * seg_u4 * 16);
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < seg_u4; i += gridDim.x * blockDim.x) dst[i] = src[i];
+}
+// ---- STRATA_Q36_SPARSE: sparse decode attention over the cells past the KV_RAM window (junkinfer's method: this
+// model's attention is broad, so a large exact fraction, ranked by an estimate of each page's attention mass)
+constexpr int kSpPage = 32;                         // cells a page
+constexpr int kSpPagesSeg = 4096 / kSpPage;         // pages a KV_RAM segment
+/// Page statistics: the mean and the variance of each of K's 256 dims and the mean of V's over the page's 32 cells
+/// (dequantized), as f16 at stab[seg][(page_in_seg * HKV + kvh) * kSpStat + {0: K mean, 256: K var, 512: V mean} + d].
+/// Pages [pb, pb + n).  grid (n, HKV), block 256 (one thread a dim).
+constexpr int kSpStat = 768;
+__global__ void k_sp_stats(KvTab kt, __half* const* stab, int pb, int HKV, int qb) {
+    const int page = pb + blockIdx.x, kvh = blockIdx.y, d = threadIdx.x;
+    float m = 0.f, m2 = 0.f, mv = 0.f;
+    for (int c = 0; c < kSpPage; ++c) {
+        __half *sc, *sv;
+        const int8_t* r = kv_row(nullptr, kt.k, kt.shift, kvh, page * kSpPage + c, HKV, 0, 256, qb, &sc);
+        const int8_t* rv = kv_row(nullptr, kt.v, kt.shift, kvh, page * kSpPage + c, HKV, 0, 256, qb, &sv);
+        const float x = __half2float(sc[d / qb]) * (float) r[d];
+        const float dl = x - m;
+        m += dl / (float) (c + 1);
+        m2 += dl * (x - m);
+        mv += __half2float(sv[d / qb]) * (float) rv[d];
+    }
+    __half* o = stab[page / kSpPagesSeg] + ((size_t) (page % kSpPagesSeg) * HKV + kvh) * kSpStat;
+    o[d] = __float2half(m);
+    o[256 + d] = __float2half(m2 / (float) kSpPage);
+    o[512 + d] = __float2half(mv / (float) kSpPage);
+}
+/// Each page's estimated log attention mass for the step's rows: log n + q.mu / 16 + (q^2).var / 512 (junkinfer's
+/// estimate, scale 1/sqrt(256)), the max over the T rows and the query heads of KV head kvh. Pages [pb, pb + n) ->
+/// score[kvh][page - pb].  grid (n, HKV), block 256.
+__global__ void k_sp_score(const float* q, int T, int H, int HKV, __half* const* stab, int pb, int n, float* score,
+                           float* lm) {
+    __shared__ float sh[kThreads];
+    const int page = pb + blockIdx.x, kvh = blockIdx.y, d = threadIdx.x, G = H / HKV;
+    const __half* st = stab[page / kSpPagesSeg] + ((size_t) (page % kSpPagesSeg) * HKV + kvh) * kSpStat;
+    const float mu = __half2float(st[d]), var = __half2float(st[256 + d]);
+    float best = -INFINITY;
+    for (int t = 0; t < T; ++t)
+        for (int g = 0; g < G; ++g) {
+            const float qd = q[((size_t) t * H + kvh * G + g) * 256 + d];
+            const float s = block_sum(qd * mu / 16.f + qd * qd * var / 512.f, sh);
+            best = fmaxf(best, s);
+            // the tail estimate's log-mass of this row and head (log 32 + s), lm[kvh][page][t * G + g]
+            if (d == 0 && lm) lm[((size_t) kvh * n + blockIdx.x) * (T * G) + t * G + g] = s + 3.4657359f;
+        }
+    if (d == 0) score[(size_t) kvh * n + blockIdx.x] = best;
+}
+/// mark[kvh][page - pb] = 1 for the selected pages (sel), 0 for the rest.  grid (HKV), block 256.
+__global__ void k_sp_mark(const int* sel, int S, int pb, int n, unsigned char* mark) {
+    const int kvh = blockIdx.x;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) mark[(size_t) kvh * n + i] = 0;
+    __syncthreads();
+    for (int j = threadIdx.x; j < S; j += blockDim.x) mark[(size_t) kvh * n + sel[(size_t) kvh * S + j] - pb] = 1;
+}
+/// The tail estimate (STRATA_Q36_SP_TAIL): each unselected far page as one cell of its estimated mass (lm) and its
+/// mean V, as one more partial of row (t, h) at slot `slot`: m = the largest log-mass, l = the sum of exp(lm - m),
+/// acc = that sum weighted by the mean Vs.  grid (T * H), block 256.
+__global__ void k_sp_tail(const float* lm, const unsigned char* mark, __half* const* stab, int pb, int n, int T, int H,
+                          int HKV, int slot, int n_chunk, float* pacc, float* pm, float* pl) {
+    __shared__ float sh[kThreads];
+    const int row = blockIdx.x, t = row / H, h = row % H, G = H / HKV, kvh = h / G, g = h % G, d = threadIdx.x;
+    const int TG = T * G;
+    float mx = -INFINITY;
+    for (int i = d; i < n; i += blockDim.x)
+        if (!mark[(size_t) kvh * n + i]) mx = fmaxf(mx, lm[((size_t) kvh * n + i) * TG + t * G + g]);
+    mx = block_max(mx, sh);
+    float acc = 0.f, l = 0.f;
+    if (mx > -INFINITY)
+        for (int i = 0; i < n; ++i) {
+            if (mark[(size_t) kvh * n + i]) continue;
+            const int page = pb + i;
+            const float w = expf(lm[((size_t) kvh * n + i) * TG + t * G + g] - mx);
+            const __half* st = stab[page / kSpPagesSeg] + ((size_t) (page % kSpPagesSeg) * HKV + kvh) * kSpStat;
+            acc += w * __half2float(st[512 + d]);
+            l += w;
+        }
+    const size_t o = (size_t) row * n_chunk + slot;
+    pacc[o * 256 + d] = acc;
+    if (d == 0) { pm[o] = mx; pl[o] = l; }
+}
+/// The top S of score[kvh][0 .. n) per KV head, in page order: a threshold by bisection (count(>= t) >= S, 32
+/// steps), then the pages at or above it in page order until S. Writes sel[kvh][0 .. S) (pages, pb added).
+/// grid (HKV), block 1024.
+__global__ void k_sp_select(const float* score, int n, int S, int pb, int* sel) {
+    __shared__ float rlo[1024], rhi[1024];
+    __shared__ int cnt[1024];
+    const int kvh = blockIdx.x, tid = threadIdx.x;
+    const float* sc = score + (size_t) kvh * n;
+    float lo = INFINITY, hi = -INFINITY;
+    for (int i = tid; i < n; i += 1024) { lo = fminf(lo, sc[i]); hi = fmaxf(hi, sc[i]); }
+    rlo[tid] = lo; rhi[tid] = hi;
+    __syncthreads();
+    for (int o = 512; o > 0; o >>= 1) {
+        if (tid < o) { rlo[tid] = fminf(rlo[tid], rlo[tid + o]); rhi[tid] = fmaxf(rhi[tid], rhi[tid + o]); }
+        __syncthreads();
+    }
+    float t_lo = rlo[0], t_hi = rhi[0];
+    __syncthreads();
+    for (int it = 0; it < 32; ++it) {
+        const float mid = 0.5f * (t_lo + t_hi);
+        int c = 0;
+        for (int i = tid; i < n; i += 1024) c += sc[i] >= mid;
+        cnt[tid] = c;
+        __syncthreads();
+        for (int o = 512; o > 0; o >>= 1) { if (tid < o) cnt[tid] += cnt[tid + o]; __syncthreads(); }
+        const int total = cnt[0];
+        __syncthreads();
+        if (total >= S) t_lo = mid; else t_hi = mid;
+    }
+    const float thr = t_lo;
+    const int per = (n + 1023) / 1024, b = tid * per, e = min(n, b + per);
+    int c = 0;
+    for (int i = b; i < e; ++i) c += sc[i] >= thr;
+    cnt[tid] = c;
+    __syncthreads();
+    if (tid == 0) {   // exclusive prefix over the threads' ranges
+        int run = 0;
+        for (int i = 0; i < 1024; ++i) { const int v = cnt[i]; cnt[i] = run; run += v; }
+    }
+    __syncthreads();
+    int w = cnt[tid];
+    for (int i = b; i < e && w < S; ++i)
+        if (sc[i] >= thr) sel[(size_t) kvh * S + w++] = pb + i;
+}
+/// The compact cache: per KV head, slots 0 .. S - 1 the selected pages (sel[kvh][j]), then the recent pages from
+/// page rp (nr of them), each 32 cells copied from the segments (values, then the scales) into a contiguous cache of
+/// cap cells (the layout k_attn_part_q8 reads with ctx = cap).  grid (S + nr, HKV), block 256.
+__global__ void k_sp_gather(KvTab kt, const int* sel, int S, int rp, int HKV, int qb, int cap, int8_t* ck, int8_t* cv) {
+    const int j = blockIdx.x, kvh = blockIdx.y, tid = threadIdx.x;
+    const int page = j < S ? sel[(size_t) kvh * S + j] : rp + (j - S);
+    const int nb = 256 / qb;
+    for (int kind = 0; kind < 2; ++kind) {
+        int8_t* const* tab = kind ? kt.v : kt.k;
+        int8_t* dst = kind ? cv : ck;
+        __half* sc;
+        const int8_t* src = kv_row(nullptr, tab, kt.shift, kvh, page * kSpPage, HKV, 0, 256, qb, &sc);
+        // values: 32 cells x 256 B contiguous in the segment
+        const uint4* s4 = (const uint4*) src;
+        uint4* d4 = (uint4*) (dst + ((size_t) kvh * cap + (size_t) j * kSpPage) * 256);
+        for (int i = tid; i < kSpPage * 256 / 16; i += blockDim.x) d4[i] = s4[i];
+        // scales: 32 cells x nb halves, contiguous too
+        __half* ds = (__half*) (dst + (size_t) HKV * cap * 256) + ((size_t) kvh * cap + (size_t) j * kSpPage) * nb;
+        for (int i = tid; i < kSpPage * nb; i += blockDim.x) ds[i] = sc[i];
+    }
 }
 /// k_kv_q8_f16 over a segmented cache (KvTab): cells [pb, pb + P) dequantized into compact [HKV][P][HD] halves.
 __global__ void k_kv_q8_f16_tab(KvTab kt, __half* k16, __half* v16, int pb, int P, int HD, int HKV, int qb) {
@@ -2100,12 +2267,62 @@ struct Engine {
     }
     /// state li's host segments [s0, s1) (s1 - s0 <= kvr_nwin) into the staging block, on the engine's stream
     void stage_copy(size_t li, int s0, int s1) {
+        // STRATA_Q36_KVR_GATHER (default on): a GPU kernel reads the host segments through their mapped pointers with
+        // 16-byte loads (6.8 GB/s on this PCIe 3.0 x8 link, tools/hip/pcie_gather_bench; the DMA copies ran at ~3-4)
+        static const bool gk = [] { const char* v = std::getenv("STRATA_Q36_KVR_GATHER"); return !(v && v[0] == '0'); }();
+        if (gk && s1 > s0) {
+            k_seg_gather<<<dim3(64, 2 * (s1 - s0)), 256, 0, st>>>(d_kvtab + (li * 2) * (size_t) kvr_nseg,
+                d_kvtab + (li * 2 + 1) * (size_t) kvr_nseg, s0, s1 - s0, kvr_nwin, (int) (kvr_segbytes / 16), kvr_stage);
+            return;
+        }
         for (int s = s0; s < s1; ++s) {
             CK(cudaMemcpyAsync(kvr_stage + (size_t) (s - s0) * kvr_segbytes, kvr_hseg[(li * 2) * kvr_nseg + s], kvr_segbytes,
                                cudaMemcpyHostToDevice, st));
             CK(cudaMemcpyAsync(kvr_stage + (size_t) (kvr_nwin + s - s0) * kvr_segbytes,
                                kvr_hseg[(li * 2 + 1) * kvr_nseg + s], kvr_segbytes, cudaMemcpyHostToDevice, st));
         }
+    }
+    // ---- STRATA_Q36_SPARSE=1 (opt-in, with KV_RAM): sparse decode attention past the window. Per decode step and
+    // attention layer: the window's cells and the most recent STRATA_Q36_SP_RECENT (4096) cells exactly, plus the
+    // fraction STRATA_Q36_SP_FRAC (0.5) of the pages in between with the highest estimated attention mass (k_sp_score
+    // from per-page K statistics), gathered from pinned memory into a compact cache. Prompts stay dense.
+    bool sp_on = false;
+    float sp_frac = 0.5f;
+    int sp_recent = 4096, sp_built = 0, sp_maxsel = 0, sp_cap = 0;
+    std::vector<__half*> sp_stats_h;   // [state][segment] page statistics (device), host segments only
+    __half** d_sp_stab = nullptr;
+    float* sp_score = nullptr;
+    float* sp_lm = nullptr;              // per page and row-head log-mass (the tail estimate)
+    unsigned char* sp_mark = nullptr;    // the selected pages (the tail estimate)
+    int* sp_sel = nullptr;
+    int8_t *sp_ck = nullptr, *sp_cv = nullptr;
+    struct SpPlan { int pb = 0, n_cand = 0, S = 0, rp = 0, nr = 0, bias = 0; };
+    /// the sparse layout for rows that see the cells [0, p_end): false = dense
+    bool sp_plan(int64_t p_end, SpPlan& o) const {
+        if (!sp_on) return false;
+        const int64_t win_cells = (int64_t) kvr_nwin * KvRam::kSeg;
+        const int64_t rs_ = std::max<int64_t>(win_cells, (p_end - sp_recent) / kSpPage * kSpPage);
+        o.pb = (int) (win_cells / kSpPage);
+        o.rp = (int) (rs_ / kSpPage);
+        o.n_cand = o.rp - o.pb;
+        if (o.n_cand * kSpPage < 8192 || o.rp > sp_built) return false;   // too few far cells, or stats missing
+        o.S = std::max(1, std::min(sp_maxsel, (int) std::ceil(sp_frac * o.n_cand)));
+        o.nr = (int) ((p_end - rs_ + kSpPage - 1) / kSpPage);
+        if ((int64_t) (o.S + o.nr) * kSpPage > sp_cap) return false;
+        o.bias = (int) ((int64_t) o.S * kSpPage - rs_);
+        return true;
+    }
+    /// the page statistics of every complete page below the cell `upto` (all attention states)
+    void sp_build(int64_t upto) {
+        if (!sp_on) return;
+        const int up = (int) (upto / kSpPage), wp = kvr_nwin * kSpPagesSeg;
+        if (up < sp_built) sp_built = std::max(wp, up);   // the position went back (a reused prompt): rebuild from there
+        if (up <= sp_built) return;
+        for (size_t li = 0; li < sess[0].kc.size(); ++li)
+            if (sess[0].kc[li])
+                k_sp_stats<<<dim3(up - sp_built, (unsigned) m->g.n_head_kv), 256, 0, st>>>(kvtab(li),
+                    d_sp_stab + li * (size_t) kvr_nseg, sp_built, (int) m->g.n_head_kv, kv_qb());
+        sp_built = up;
     }
     /// the cells a session's window holds (per K or V of an attention state)
     size_t kv_cells() const { return kvr_on ? (size_t) std::min(ctx, kv_ram().win) : (size_t) ctx; }
@@ -2142,6 +2359,29 @@ struct Engine {
             CK(cudaMalloc(&d_stab, t.size() * sizeof(int8_t*)));
             CK(cudaMemcpy(d_stab, t.data(), t.size() * sizeof(int8_t*), cudaMemcpyHostToDevice));
         }
+        if (const char* v = std::getenv("STRATA_Q36_SPARSE"); v && v[0] == '1' && kvr_nseg > kvr_nwin) {
+            if (const char* f = std::getenv("STRATA_Q36_SP_FRAC")) sp_frac = std::max(0.05f, std::min(1.0f, (float) std::atof(f)));
+            if (const char* r = std::getenv("STRATA_Q36_SP_RECENT")) sp_recent = std::max(kSpPage, std::atoi(r) / kSpPage * kSpPage);
+            const int maxp = (kvr_nseg - kvr_nwin) * kSpPagesSeg;
+            sp_maxsel = (int) std::ceil(sp_frac * maxp) + 1;
+            sp_cap = (sp_maxsel + sp_recent / kSpPage + 2) * kSpPage;
+            sp_ck = (int8_t*) kv_alloc((size_t) g.n_head_kv * sp_cap * g.head_dim);
+            sp_cv = (int8_t*) kv_alloc((size_t) g.n_head_kv * sp_cap * g.head_dim);
+            sp_score = dalloc((size_t) g.n_head_kv * maxp);
+            if (const char* tv = std::getenv("STRATA_Q36_SP_TAIL"); !(tv && tv[0] == '0')) {   // the tail estimate (default on)
+                sp_lm = dalloc((size_t) g.n_head_kv * maxp * kGemmT * (g.n_head / g.n_head_kv));
+                sp_mark = dalloc_t<unsigned char>((size_t) g.n_head_kv * maxp);
+            }
+            sp_sel = dalloc_t<int>((size_t) g.n_head_kv * sp_maxsel);
+            sp_stats_h.assign(ns * (size_t) kvr_nseg, nullptr);
+            CK(cudaMalloc(&d_sp_stab, sp_stats_h.size() * sizeof(__half*)));
+            CK(cudaMemset(d_sp_stab, 0, sp_stats_h.size() * sizeof(__half*)));
+            sp_built = kvr_nwin * kSpPagesSeg;
+            sp_on = true;
+            std::fprintf(stderr, "strata-q36: STRATA_Q36_SPARSE=1: decode past the window reads the recent %d cells and %.0f%% of the "
+                         "other far pages (by estimated attention mass); compact cache %.0f MiB\n", sp_recent, sp_frac * 100.0,
+                         (double) kv_bytes((size_t) g.n_head_kv * sp_cap * g.head_dim) * 2 / (1 << 20));
+        }
         size_t n_attn = 0;
         for (size_t li = 0; li < ns; ++li) n_attn += sess[0].kc[li] ? 1 : 0;
         std::fprintf(stderr, "strata-q36: STRATA_Q36_KV_RAM=1: %d of %d cells in VRAM (%.2f GiB), the rest in pinned RAM as "
@@ -2173,9 +2413,13 @@ struct Engine {
                     kvr_tab_h[(li * 2 + kv) * kvr_nseg + s] = (int8_t*) dp;
                     kvr_hseg[(li * 2 + kv) * kvr_nseg + s] = (int8_t*) hp;
                 }
+                if (sp_on && !sp_stats_h[li * kvr_nseg + s])   // the segment's page statistics (VRAM)
+                    sp_stats_h[li * kvr_nseg + s] =
+                        dalloc_t<__half>((size_t) kSpPagesSeg * m->g.n_head_kv * kSpStat);
             }
         kvr_upto = need;
         CK(cudaMemcpy(d_kvtab, kvr_tab_h.data(), kvr_tab_h.size() * sizeof(int8_t*), cudaMemcpyHostToDevice));
+        if (sp_on) CK(cudaMemcpy(d_sp_stab, sp_stats_h.data(), sp_stats_h.size() * sizeof(__half*), cudaMemcpyHostToDevice));
     }
 
     void alloc_session(Sess& ss) const {
@@ -3173,6 +3417,7 @@ struct Engine {
                     const int nt = std::min(rows_per, T - t0);
                     const int nc = graph_mode ? n_chunk
                                               : (int) std::min<int64_t>(n_chunk, (p0 + t0 + nt + kChunkCells - 1) / kChunkCells);
+                    int m_win = -1, m_bias = 0;   // the merge's sparse layout (STRATA_Q36_SPARSE)
                     if (kvq8()) {
                         const int8_t* kq = rows_mode ? nullptr : (const int8_t*) kc[li];
                         const int8_t* vq = rows_mode ? nullptr : (const int8_t*) vc[li];
@@ -3187,7 +3432,30 @@ struct Engine {
                                     ctx, 1.0f / sqrtf((float) HD), n_chunk, pacc, pm, pl, rs, kv_qb(), tb, c0);
                         };
                         const int win_c = kvr_on ? kvr_nwin * (KvRam::kSeg / kChunkCells) : nc;
-                        if (!kvr_on || rows_mode || nc <= win_c) {
+                        // sparse: the window's cells, the best-scored far pages and the recent cells (see sp_plan)
+                        SpPlan sp;
+                        if (!rows_mode && nc > win_c && sp_plan(p0 + t0 + nt, sp)) {
+                            part(kt, 0, win_c);
+                            k_sp_score<<<dim3(sp.n_cand, HKV), 256, 0, st>>>(q + (size_t) t0 * H * HD, nt, H, HKV,
+                                d_sp_stab + li * (size_t) kvr_nseg, sp.pb, sp.n_cand, sp_score, sp_lm);
+                            k_sp_select<<<HKV, 1024, 0, st>>>(sp_score, sp.n_cand, sp.S, sp.pb, sp_sel);
+                            if (sp_lm) {   // the unselected pages as one estimated partial, in the last slot
+                                k_sp_mark<<<HKV, 256, 0, st>>>(sp_sel, sp.S, sp.pb, sp.n_cand, sp_mark);
+                                k_sp_tail<<<nt * H, 256, 0, st>>>(sp_lm, sp_mark, d_sp_stab + li * (size_t) kvr_nseg, sp.pb,
+                                    sp.n_cand, nt, H, HKV, n_chunk - 1, n_chunk, pacc, pm, pl);
+                            }
+                            k_sp_gather<<<dim3(sp.S + sp.nr, HKV), 256, 0, st>>>(kt, sp_sel, sp.S, sp.rp, HKV, kv_qb(), sp_cap,
+                                                                                    sp_ck, sp_cv);
+                            const int cc = (p0 + t0 + nt + sp.bias + kChunkCells - 1) / kChunkCells;
+                            if (kv_dot8())
+                                k_attn_part_q8<true><<<dim3(cc, nt * H), kChunkCells, 0, st>>>(q, sp_ck, sp_cv, dpos, t0, H, HKV,
+                                    sp_cap, 1.0f / sqrtf((float) HD), n_chunk, pacc, pm, pl, rs, kv_qb(), KvTab(), 0, sp.bias, win_c);
+                            else
+                                k_attn_part_q8<false><<<dim3(cc, nt * H), kChunkCells, 0, st>>>(q, sp_ck, sp_cv, dpos, t0, H, HKV,
+                                    sp_cap, 1.0f / sqrtf((float) HD), n_chunk, pacc, pm, pl, rs, kv_qb(), KvTab(), 0, sp.bias, win_c);
+                            m_win = win_c;
+                            m_bias = sp.bias;
+                        } else if (!kvr_on || rows_mode || nc <= win_c) {
                             part(kt, 0, nc);
                         } else {   // KV_RAM past the window: the window's chunks, then the host cells in staged rounds
                             part(kt, 0, win_c);
@@ -3207,7 +3475,8 @@ struct Engine {
                         k_attn_part<float><<<dim3(nc, nt * H), kChunkCells, 0, st>>>(q, rows_mode ? nullptr : kc[li],
                             rows_mode ? nullptr : vc[li], dpos, t0, H, HKV, ctx, 1.0f / sqrtf((float) HD), n_chunk, pacc, pm,
                             pl, rs);
-                    k_attn_merge<<<nt * H, HD, 0, st>>>(pacc, pm, pl, gate, dpos, t0, H, n_chunk, att, rs);
+                    k_attn_merge<<<nt * H, HD, 0, st>>>(pacc, pm, pl, gate, dpos, t0, H, n_chunk, att, rs, m_win, m_bias,
+                                                        m_win >= 0 && sp_lm ? n_chunk - 1 : -1);
                 }
             }
             mm(L.wo, att, y, T);
@@ -3400,6 +3669,7 @@ struct Engine {
         const int N = (int) g.n_embd;
         ensure_set(T);
         kvr_ensure(p0 + T);   // KV_RAM: memory for the cells this forward writes
+        if (T <= kGemmT) sp_build(p0);   // sparse decode: the statistics of the pages completed so far
         const bool streamed = main_hybrid && T > hybrid_t && use_mmq;
         const auto prof_t0 = Clock::now();
         // STRATA_Q36_PROF=3: the small forwards' (decode, verify) GPU timeline split by stage, summed over the run and
@@ -3520,6 +3790,7 @@ struct Engine {
         const auto& g = m->g;
         const int N = (int) g.n_embd;
         kvr_ensure(p0 + T);
+        if (T <= kGemmT) sp_build(p0);
         ensure_set(T);
         if (main_hybrid && lhy(m->layers.size()) && T > hybrid_t && use_mmq && (!lm_active || lm_first)) {
             drop_xslots();   // the stream overwrites the staging buffers that hold extra slots
