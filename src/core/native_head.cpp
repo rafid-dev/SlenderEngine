@@ -18,6 +18,11 @@
 #include <string>
 #include <thread>
 #include <vector>
+#if defined(__linux__)
+#include <cerrno>
+#include <fcntl.h>
+#include <unistd.h>
+#endif
 
 namespace strata::core {
 
@@ -118,6 +123,53 @@ bool upload_direct(void* dst, const std::string& path, uint64_t off, uint64_t by
     if (!ok) (void) cudaGetLastError();
     return ok;
 }
+#elif defined(__linux__)
+// The same on Linux: one O_DIRECT descriptor read by 4 threads with pread (each its own 4 KiB-aligned range of the chunk; the pinned
+// buffers from cudaHostAlloc are page-aligned, so every read lands aligned), no page cache filled.  False: not done (the caller
+// copies from the mapping), for instance on a filesystem that refuses O_DIRECT.
+bool upload_direct(void* dst, const std::string& path, uint64_t off, uint64_t bytes) {
+    constexpr uint64_t kSector = 4096;
+    if (ensure_buffers() != cudaSuccess) { (void) cudaGetLastError(); return false; }
+    const int fd = ::open(path.c_str(), O_RDONLY | O_DIRECT | O_CLOEXEC);
+    if (fd < 0) return false;
+    bool ok = true;
+    const uint64_t end = off + bytes;
+    const uint64_t a_end = (end + kSector - 1) & ~(kSector - 1);
+    for (uint64_t c0 = off & ~(kSector - 1), i = 0; ok && c0 < end; c0 += kChunk, ++i) {
+        const int b = (int) (i & 1);
+        const uint64_t c1 = std::min<uint64_t>(c0 + kChunk, a_end);
+        const uint64_t part = ((c1 - c0) / kThreads + kSector - 1) & ~(kSector - 1);
+        if (cudaEventSynchronize(done[b]) != cudaSuccess) { ok = false; break; }   // the buffer's last copy has left it
+        std::atomic<bool> good{true};
+        std::vector<std::thread> ts;
+        for (int t = 0; t < kThreads; ++t) {
+            const uint64_t s = c0 + (uint64_t) t * part;
+            if (s >= c1) break;
+            const uint64_t n = std::min<uint64_t>(part, c1 - s);
+            ts.emplace_back([&, s, n] {
+                uint64_t got = 0;
+                while (got < n) {
+                    const ssize_t r = ::pread(fd, (uint8_t*) buf[b] + (s - c0) + got, (size_t) (n - got), (off_t) (s + got));
+                    if (r < 0 && errno == EINTR) continue;
+                    if (r <= 0) break;   // the end of the file, or an error
+                    got += (uint64_t) r;
+                }
+                // a read that reaches the end of the file returns fewer bytes: enough when they cover the tensor
+                if (s + got < std::min<uint64_t>(s + n, end)) good = false;
+            });
+        }
+        for (auto& t : ts) t.join();
+        if (!good) { ok = false; break; }
+        const uint64_t s = std::max<uint64_t>(c0, off), e = std::min<uint64_t>(c1, end);   // the tensor's part
+        if (cudaMemcpyAsync((uint8_t*) dst + (s - off), (uint8_t*) buf[b] + (s - c0), e - s, cudaMemcpyHostToDevice, st) != cudaSuccess ||
+            cudaEventRecord(done[b], st) != cudaSuccess)
+            ok = false;
+    }
+    if (cudaStreamSynchronize(st) != cudaSuccess) ok = false;
+    ::close(fd);
+    if (!ok) (void) cudaGetLastError();
+    return ok;
+}
 #endif
 }   // namespace
 
@@ -196,7 +248,7 @@ bool NativeHead::load(const std::vector<std::string>& shards, int64_t n_in, int6
         if (status == cudaSuccess)
             status = cudaMalloc(&scratch, strata::kernels::native_q8_1_bytes((int) n_in, 1));
         if (!head_fast_load()) strata::platform::advise_willneed(gguf.tensor_data(*tensor), bytes);
-#if defined(_WIN32)
+#if defined(_WIN32) || defined(__linux__)
         bool direct = false;   // STRATA_HEAD_FAST_LOAD: unbuffered reads first (see upload_direct)
         if (status == cudaSuccess && host == nullptr && head_fast_load())
             direct = upload_direct(weights, gguf.path(), gguf.data_start() + tensor->offset, bytes);
@@ -308,7 +360,7 @@ bool NativeHead::room_reclaim(std::string& err) {
         const strata::GgufFile& gguf = model.shard(at);
         if (tensor == nullptr || (int) tensor->type != type_) { err = "native head room: output.weight changed in the model file"; return false; }
         bool direct = false;
-#if defined(_WIN32)
+#if defined(_WIN32) || defined(__linux__)
         direct = upload_direct(weights_, gguf.path(), gguf.data_start() + tensor->offset, bytes_);   // unbuffered: no page cache filled
 #endif
         if (!direct && cudaMemcpy(weights_, gguf.tensor_data(*tensor), bytes_, cudaMemcpyHostToDevice) != cudaSuccess) {
