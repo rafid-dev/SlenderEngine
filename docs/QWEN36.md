@@ -188,6 +188,22 @@ same PC (RX 6600, i5-10400, DDR4-2666):
   period and the first decode rebalance may swap 16 experts a layer, so the slots follow the answer rather than the
   prompt. After a 24K prompt the slot hit rate goes 32% -> 42%, decode +4%.
 
+**Long prompts** (two more opt-in switches, measured on the same PC, 262K context, a 24K-token prompt):
+
+- **`STRATA_Q36_ATT_F16=1`:** the prompt attention's two GEMMs write FP16 (FP32 compute, the scale in alpha). rocBLAS
+  on gfx1032 runs FP16-in / FP32-out at ~3.3 TFLOPS and FP16-out at 9-13 (`tools/hip/tune_attn_rocblas`). Attention
+  at 20K cells: 2.96 -> 1.78 s a 2048-token chunk. KL 0.043 against the FP32-out path (8K prompt, 128 forced tokens,
+  placement pinned), below the 0.142 of the same prompt read in 1024-token chunks.
+- **`STRATA_Q36_LM=1`: layer-major prompts.** Every layer runs over all chunks of a super-chunk
+  (`STRATA_Q36_LM_CHUNKS`, 4) before the next, so each layer's streamed experts cross PCIe once per super-chunk instead
+  of once per chunk (every 2048 tokens streamed all 18.7 GiB). The output is bit-identical (the same logits). The
+  super-chunk's rows take 0.12 GiB of VRAM (2 expert slots).
+
+Server, thinking on, warm file cache, same session: the 24K prompt 433 -> 732 tok/s; decode 36.6-40.8 -> 35.8-38.6 tok/s
+on short questions and 30.7 -> 30.0 after the prompt. A fused flash-attention kernel (`STRATA_Q36_FA=1`) is correct
+but 3x slower than the GEMMs here. rocBLAS's own solutions run the values GEMM 1.2-2.3x faster than its default past
+8K cells, but one of them faulted the GPU on a shape it accepted; they need a table checked at every engine shape first.
+
 Measured and not kept: `--mtp 3` (fewer steps, each 15% dearer: slower); `--draft-vocab` (now works with a Q6_K head;
 acceptance falls, no gain); pool workers 6 / 7 / 10, rebalance every 16 / 64, 4 swaps (all within noise); more slots
 from the q8_0 cache (9 -> 13 a layer: hit rate 52.5% -> 53.5%).
