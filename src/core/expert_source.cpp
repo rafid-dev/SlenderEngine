@@ -2856,6 +2856,20 @@ bool FileExpertSource::open_direct(std::string& why) {
         }
         direct_.push_back((void*) (intptr_t) fd);
     }
+    // STRATA_EXPERTS_MIRROR=<path>: as on Windows, the same experts.bin on a second drive, opened O_DIRECT too; read_direct splits each
+    // read between the two.  Only the size is checked here.
+    if (const char* mp = std::getenv("STRATA_EXPERTS_MIRROR");
+        mp != nullptr && *mp != 0 && role_ptr_.empty() && direct_.size() == 1 && direct_mirror_ == nullptr) {
+        const int fd = ::open(mp, O_RDONLY | O_DIRECT | O_CLOEXEC);
+        struct stat a{}, b{};
+        if (fd > 0 && ::fstat((int) (intptr_t) direct_[0], &a) == 0 && ::fstat(fd, &b) == 0 && a.st_size == b.st_size) {
+            direct_mirror_ = (void*) (intptr_t) fd;
+            std::fprintf(stderr, "FileExpertSource: reads split between %s and %s\n", paths_[0].c_str(), mp);
+        } else {
+            if (fd >= 0) ::close(fd);
+            std::fprintf(stderr, "FileExpertSource: STRATA_EXPERTS_MIRROR %s cannot be opened or differs in size: one drive only\n", mp);
+        }
+    }
     if (role_ptr_.empty()) {   // experts.bin: blob() now assembles into the stage buffers, sized for the largest blob
         std::lock_guard<std::mutex> lk(stage_mu_);
         for (uint64_t b : layer_blob_bytes_) stage_blob_ = std::max(stage_blob_, b);
@@ -3365,6 +3379,7 @@ bool FileExpertSource::read_direct(const Fill* fills, size_t n) const {
     constexpr long kDepth = 256;   // requests in flight per thread; a larger batch is read in waves of this many
     struct Window { int file; uint64_t a0, size, skip, n, at; uint8_t* dst; size_t req; uint64_t in_req; };
     struct Req { int fd; uint64_t a0, size, pos; };
+    struct Io { int fd; uint64_t a0, size, pos; size_t req; };
     struct Scratch {
         uint8_t* buf = nullptr;
         size_t cap = 0;
@@ -3373,6 +3388,8 @@ bool FileExpertSource::read_direct(const Fill* fills, size_t n) const {
         std::vector<size_t> order;
         std::vector<Req> req;
         std::vector<int64_t> got;
+        std::vector<Io> io;           // what the drives are asked for: a request, or one of its two halves (the mirror)
+        std::vector<int64_t> iog;     // each io's result
         std::vector<iocb> cb;
         std::vector<iocb*> cbp;
         std::vector<io_event> ev;
@@ -3444,15 +3461,38 @@ bool FileExpertSource::read_direct(const Fill* fills, size_t n) const {
         sc.buf = posix_memalign(&p, (size_t) kSector, sc.cap) == 0 ? (uint8_t*) p : nullptr;
         if (sc.buf == nullptr) { sc.cap = 0; return false; }
     }
+    // STRATA_EXPERTS_MIRROR: a request of 256 KiB or more is read in two parts, the first from experts.bin and the rest from its copy on
+    // the other drive, into the same buffer, as the Windows branch does.  STRATA_EXPERTS_MIRROR_SHARE (default 0.5): the mirror's part.
+    sc.io.clear();
+    {
+        constexpr uint64_t kSplitMin = 256ull << 10;
+        static const double mirror_share = [] {
+            const char* e = std::getenv("STRATA_EXPERTS_MIRROR_SHARE");
+            return e != nullptr ? std::clamp(std::atof(e), 0.05, 0.95) : 0.5;
+        }();
+        const bool mirror = direct_mirror_ != nullptr && !direct_.empty();
+        for (size_t q = 0; q < sc.req.size(); ++q) {
+            const Req& r = sc.req[q];
+            const uint64_t half = mirror && r.size >= kSplitMin
+                                      ? (uint64_t) ((double) r.size * (1.0 - mirror_share)) / kSector * kSector : 0;
+            if (half > 0 && half < r.size) {
+                sc.io.push_back({r.fd, r.a0, half, r.pos, q});
+                sc.io.push_back({(int) (intptr_t) direct_mirror_, r.a0 + half, r.size - half, r.pos + half, q});
+            } else {
+                sc.io.push_back({r.fd, r.a0, r.size, r.pos, q});
+            }
+        }
+    }
     sc.got.assign(sc.req.size(), -1);
-    sc.cb.resize(std::min<size_t>(sc.req.size(), (size_t) kDepth));
+    sc.iog.assign(sc.io.size(), -1);
+    sc.cb.resize(std::min<size_t>(sc.io.size(), (size_t) kDepth));
     sc.cbp.resize(sc.cb.size());
     sc.ev.resize(sc.cb.size());
     bool ok = true;
-    for (size_t w0 = 0; ok && w0 < sc.req.size(); w0 += (size_t) kDepth) {
-        const size_t wn = std::min<size_t>((size_t) kDepth, sc.req.size() - w0);
+    for (size_t w0 = 0; ok && w0 < sc.io.size(); w0 += (size_t) kDepth) {
+        const size_t wn = std::min<size_t>((size_t) kDepth, sc.io.size() - w0);
         for (size_t j = 0; j < wn; ++j) {
-            const Req& r = sc.req[w0 + j];
+            const Io& r = sc.io[w0 + j];
             iocb& c = sc.cb[j];
             std::memset(&c, 0, sizeof c);
             c.aio_lio_opcode = IOCB_CMD_PREAD;
@@ -3484,13 +3524,21 @@ bool FileExpertSource::read_direct(const Fill* fills, size_t n) const {
             }
             for (long j = 0; j < r; ++j) {
                 const io_event& e = sc.ev[(size_t) j];
-                sc.got[(size_t) e.data] = e.res;
+                sc.iog[(size_t) e.data] = e.res;
                 if (e.res < 0) ok = false;
             }
             done += (size_t) r;
         }
     }
     if (!ok) return false;
+    // a request's bytes that arrived in order: its first part, and the mirror's part only after a whole first part
+    for (size_t i = 0; i < sc.io.size(); ++i) {
+        const Io& r = sc.io[i];
+        int64_t& g = sc.got[r.req];
+        const uint64_t before = r.pos - sc.req[r.req].pos;   // 0 for a request's first part
+        if (before == 0) g = sc.iog[i];
+        else if (g == (int64_t) before) g += sc.iog[i];
+    }
     for (const Window& x : sc.win) {
         // a request may run past the end of the file: only the role's own bytes have to arrive
         if (sc.got[x.req] < 0 || (uint64_t) sc.got[x.req] < x.in_req + x.skip + x.n) return false;
