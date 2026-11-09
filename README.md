@@ -10,7 +10,7 @@ Run **Qwen3.8-Flash-Next IQ3_S locally on a Windows PC with 32 GB of RAM**. Slen
 
 | Part | Requirement for this setup |
 |---|---|
-| System | Windows. `FAST-SETUP.bat` is for Windows with an NVIDIA GPU. |
+| System | Windows with an NVIDIA GPU (`FAST-SETUP.bat`), or Linux with an NVIDIA GPU (`FAST-SETUP.sh`, new: see [On Linux](#on-linux)). |
 | RAM | 32 GB. Close other large apps before running the model. |
 | GPU | NVIDIA; measured on an RTX 4070 Ti with 12 GB of VRAM. Other cards may perform differently. |
 | Storage | About 140 GB free on an SSD: about 85 GB of model files and a 52 GB prepared copy of the experts, plus room for build tools. A second physical SSD with about 52 GB free is optional. |
@@ -18,7 +18,7 @@ Run **Qwen3.8-Flash-Next IQ3_S locally on a Windows PC with 32 GB of RAM**. Slen
 
 Install [Git for Windows](https://git-scm.com/download/win) and your NVIDIA graphics driver first. Setup can install Python, CMake and Ninja, and offers to install Visual Studio 2022 Build Tools and the CUDA toolkit if they are missing. Installing build tools may ask for Windows administrator permission.
 
-This guide builds the fork from source. For AMD, Mac, Linux or the upstream desktop app, use the [original Strata guides](https://github.com/Niko1221/Strata).
+This guide builds the fork from source. Linux with an NVIDIA card has its own setup ([On Linux](#on-linux)). For AMD, Mac or the upstream desktop app, use the [original Strata guides](https://github.com/Niko1221/Strata).
 
 ## Easy setup
 
@@ -59,6 +59,18 @@ Double-click **`run-fast.bat`**, or run this in the same terminal:
 Keep its window open. The browser opens at [http://127.0.0.1:8080](http://127.0.0.1:8080); wait for the model to finish loading, then send a message.
 
 To stop, press **Ctrl+C** in the server window. Next time, just run `run-fast.bat` again. To change your RAM or SSD choices, stop the server and rerun `FAST-SETUP.bat`.
+
+### On Linux
+
+Linux support is new. It has been checked for correct answers in WSL 2 (Ubuntu 26.04, CUDA 13.3), but **its speed has not been measured on a native Linux PC yet**. You need an NVIDIA driver, the CUDA toolkit, CMake, a C++ compiler and Python 3.10 or newer with `venv`. Then:
+
+```bash
+git clone --branch speed-fork --single-branch https://github.com/rafid-dev/SlenderEngine.git
+cd SlenderEngine
+./FAST-SETUP.sh
+```
+
+It asks the same questions as on Windows and writes `run-fast.sh`; start the model with `./run-fast.sh`. For a second SSD, the drive must be mounted and writable by you; setup puts the copy in `StrataMirror` on it.
 
 ## Speed and memory
 

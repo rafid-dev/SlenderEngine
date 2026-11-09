@@ -3,7 +3,22 @@
 Branch `linux-support`, started 2026-11-09 from `speed-fork` (`88b24a6c`). Goal: a Linux PC with an NVIDIA card gets the same
 speed changes a Windows PC gets, with the same answers.
 
-## Where it stands
+## Progress (2026-11-09)
+
+| Item | State |
+|---|---|
+| 1. The 28 GB RAM check | Done (`3c78d3e8`). Windows banner unchanged |
+| 2. The defaults on Linux | Done (`3c78d3e8`). Windows output byte-identical to `speed-fork`; WSL lists the full set and answers correctly. No memlock check needed: CUDA's pinning isn't bound by `ulimit -l`, and the one `mlock` fallback already says how to raise it |
+| 3. The mirror | Done (`087c6355`). WSL: logits byte-identical with and without the mirror (second copy on C:). Speed: needs native Linux |
+| 4. The head reload | Done (`dad67791`). WSL: 2,115-2,809 ms with the old fallback, 1,328 ms now (WSL's file access limits it), and `STRATA_DF2_ROOM_VERIFY=1` reports a match |
+| 5. FAST-SETUP | Done (`3fdbdce1`). WSL dry run; helpers checked against a two-NVMe / i7-14700KF sample; Windows dry run unchanged |
+| 6. Docs | FORK.md and README updated on this branch |
+
+With all of these in, the Windows build's first-token logits are still byte-identical to `speed-fork`'s (same MD5 at 3K / 29K / 50K, same answers).
+
+Still open: speed on a native Linux PC (all items), and a real Linux FAST-SETUP run with two drives.
+
+## Where it stood when planned
 
 On 2026-11-09 the fork was built on Linux (WSL 2, Ubuntu 26.04, CUDA 13.3, gcc 15.2) with no errors. It ran the model twice at
 temperature 0 and answered correctly both times:
