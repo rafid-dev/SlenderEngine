@@ -134,8 +134,16 @@ public:
         try_ready(sp);
         return sp.state.load(std::memory_order_acquire) == kReady && sp.layer == layer && sp.expert == e ? s : -1;
     }
-    const uint8_t* mat(int slot, int r) const { return slots_[(size_t) slot].base + geo_[(size_t) slots_[(size_t) slot].layer].tr[r]; }
+    const uint8_t* mat(int slot, int r) const {
+        const Slot& sp = slots_[(size_t) slot];
+        return sp.base + geo_[(size_t) sp.layer].tr[r] + sp.delta[r];
+    }
     const uint8_t* blob(int slot) const { return slots_[(size_t) slot].base; }
+    /// the slot's matrices lie in the blob's own layout (blob() and dev_blob() hold the expert as one piece): not after a NOMOVE read
+    bool whole(int slot) const {
+        const Slot& sp = slots_[(size_t) slot];
+        return sp.delta[0] == 0 && sp.delta[1] == 0 && sp.delta[2] == 0;
+    }
     /// The device address of the slot's blob (0: the arena is not mapped for the GPU)
     unsigned long long dev_blob(int slot) const {
         const size_t c = (size_t) slot / kChunk;
@@ -175,6 +183,18 @@ public:
             st_.misses.fetch_add(1, std::memory_order_relaxed);
             s = start_fill(layer, e, true);
             sl[(size_t) i] = s;
+        }
+    }
+    /// (Q2.3) Waits until the matrices in `mask` of slot s are in (gate 1, up 2, down 4); false if a read failed, was dropped or
+    /// the slot's reads ended without them - then the caller waits for the whole expert as before.
+    bool wait_parts(int s, int mask) {
+        if (s < 0) return false;
+        Slot& sp = slots_[(size_t) s];
+        for (;;) {
+            if (sp.bad.load(std::memory_order_acquire)) return false;
+            if ((sp.mdone.load(std::memory_order_acquire) & mask) == mask) return true;
+            if (sp.left.load(std::memory_order_acquire) <= 0) return (sp.mdone.load(std::memory_order_acquire) & mask) == mask;
+            io_->wait_any(2000);
         }
     }
     /// True when the reads of slot sl (from begin) are all done.
@@ -279,6 +299,7 @@ public:
         sp.pin = 1;
         sp.prefetch = false;
         sp.visible = false;
+        sp.delta[0] = sp.delta[1] = sp.delta[2] = 0;   // (the blob is copied in whole, in its own layout)
         sp.tick = ++clock_;
         sp.bad.store(false);
         sp.cancel.store(false);
@@ -448,7 +469,18 @@ private:
         std::atomic<int> state{kFree}, left{0};
         std::atomic<bool> bad{false}, cancel{false};
         uint64_t tick = 0;
+        std::atomic<int> mdone{0};      // (Q2.3) the matrices whose reads are in: gate 1, up 2, down 4
+        int32_t delta[3] = {0, 0, 0};   // DS4_STORE_NOMOVE: where each matrix lies against base + tr[r] (where the aligned read put it)
     };
+    // DS4_STORE_NOMOVE (SlenderEngine, on by default; =0 off): a read's matrix stays where the aligned read lands it (up to 4 KB
+    // before its place, inside the slack the reads already spill into) instead of being moved up by the reader thread - a
+    // ~9.7 MB memmove per expert off the readers, which share the CPU lane's cores.  mat() points at it; blob() (the
+    // PCIe lane's whole-blob copies) and put_begin keep the moved layout (delta 0).
+    static bool no_move() {
+        // (SlenderEngine default since 2026-11-09: i7-14700KF, 200-token decodes alternated, 6.14 -> 6.92 tok/s; DS4_STORE_NOMOVE=0: the move)
+        static const bool on = std::getenv("DS4_STORE_NOMOVE") == nullptr || std::atoi(std::getenv("DS4_STORE_NOMOVE")) != 0;
+        return on;
+    }
 
     static int vis_hash(int layer, int e) { return (int) (((unsigned) layer * 2654435761u + (unsigned) e * 40503u) >> 7) % 100; }
     double score(const Slot& sp) const {
@@ -483,6 +515,7 @@ private:
         sp.bad.store(false);
         sp.cancel.store(false);
         sp.left.store(3, std::memory_order_release);
+        sp.mdone.store(0, std::memory_order_release);
         where_[(size_t) layer][(size_t) e] = s;
         const LayerGeo& g = geo_[(size_t) layer];
         IoQueue::Job jobs[3];
@@ -502,7 +535,10 @@ private:
             j.off = off;
             j.len = g.bytes[r];
             j.dst = dst;
-            j.keep = fin;
+            j.keep = no_move() ? nullptr : fin;
+            j.bits = &sp.mdone;
+            j.bit = r;
+            sp.delta[r] = no_move() ? (int32_t) ((dst + lead) - fin) : 0;
             j.left = &sp.left;
             j.bad = &sp.bad;
             j.cancel = demand ? nullptr : &sp.cancel;

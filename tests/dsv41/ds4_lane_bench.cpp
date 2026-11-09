@@ -10,6 +10,7 @@
 #include "../../src/dsv41/ds4_gguf_cpu.hpp"
 #include "../../src/dsv41/ds4_pcie.hpp"
 #include "../../src/dsv41/ds4_pool.hpp"
+#include "../../src/dsv41/ds4_os.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -17,6 +18,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <functional>
 #include <random>
 #include <string>
@@ -57,7 +59,9 @@ struct Experts {
     Fmt f;
     int n = 0;
     std::vector<uint8_t> mem;
+    std::vector<const uint8_t*> ptr;   // --real: each expert's gate / up / down where they are (n * 3), else empty
     const uint8_t* mat(int e, int r) const {
+        if (!ptr.empty()) return ptr[(size_t) e * 3 + (size_t) r];
         const size_t g = (size_t) FF * f.gr;
         return mem.data() + (size_t) e * f.blob + (r == 0 ? 0 : r == 1 ? g : 2 * g);
     }
@@ -169,7 +173,8 @@ std::vector<int> core_cpus() {
 int main(int argc, char** argv) {
     int threads = 0, n_exp = 24;
     double link = 12.0, gpu_ms = 0.03;
-    std::string formats = "mxfp4,iq2_xxs,iq2_s";
+    std::string formats = "mxfp4,iq2_xxs,iq2_s", cpu_list, pack_dir, real_where = "heap";
+    int real_layer = -1;   // --real L --pack <dir> [--where heap|map]: layer L's first --experts experts from the model files
     for (int i = 1; i + 1 < argc; i += 2) {
         const std::string a = argv[i], v = argv[i + 1];
         if (a == "--threads") threads = std::atoi(v.c_str());
@@ -177,8 +182,27 @@ int main(int argc, char** argv) {
         else if (a == "--experts") n_exp = std::max(4, std::atoi(v.c_str()));
         else if (a == "--link") link = std::atof(v.c_str());
         else if (a == "--gpu-ms") gpu_ms = std::atof(v.c_str());
+        else if (a == "--cpus") cpu_list = v;
+        else if (a == "--real") real_layer = std::atoi(v.c_str());
+        else if (a == "--pack") pack_dir = v;
+        else if (a == "--where") real_where = v;
     }
-    const std::vector<int> cores = core_cpus();
+    std::vector<int> cores = core_cpus();
+    if (!cpu_list.empty()) {   // --cpus 0-15,16: the logical CPUs to pin to, the caller on the first
+        cores.clear();
+        size_t p = 0;
+        while (p < cpu_list.size()) {
+            size_t q = cpu_list.find(',', p);
+            if (q == std::string::npos) q = cpu_list.size();
+            const std::string t = cpu_list.substr(p, q - p);
+            const size_t d = t.find('-');
+            const int lo = std::atoi(t.c_str()), hi = d == std::string::npos ? lo : std::atoi(t.c_str() + d + 1);
+            for (int c = lo; c <= hi; ++c) cores.push_back(c);
+            p = q + 1;
+        }
+        if (threads <= 0) threads = (int) cores.size();
+        strata::ds4::os::pin_self(cores[0]);
+    }
     if (threads <= 0) threads = (int) cores.size();
     // (the engine's pool: a worker on each physical core but the caller's, the caller helping)
     std::vector<int> pin(cores.begin() + 1, cores.end());
@@ -200,8 +224,10 @@ int main(int argc, char** argv) {
             X.f.gr = (size_t) E / 32 * 17;
             X.f.dr = (size_t) FF / 32 * 17;
         } else {
-            const int tg = fn == "iq2_xxs" ? 16 : fn == "iq2_s" ? 22 : fn == "iq3_xxs" ? 18 : fn == "iq3_s" ? 21 : -1;
-            const int td = fn == "iq2_xxs" ? 18 : fn == "iq2_s" ? 21 : fn == "iq3_xxs" ? 21 : fn == "iq3_s" ? 21 : -1;
+            auto ty = [](const std::string& t) { return t == "iq2_xxs" ? 16 : t == "iq2_xs" ? 17 : t == "iq2_s" ? 22 : t == "iq3_xxs" ? 18 : t == "iq3_s" ? 21 : -1; };
+            const size_t sl = fn.find('/');   // gate-up/down, e.g. iq2_xxs/iq2_s (the packs' mixes)
+            const int tg = sl != std::string::npos ? ty(fn.substr(0, sl)) : fn == "iq2_xxs" ? 16 : fn == "iq2_s" ? 22 : fn == "iq3_xxs" ? 18 : fn == "iq3_s" ? 21 : -1;
+            const int td = sl != std::string::npos ? ty(fn.substr(sl + 1)) : fn == "iq2_xxs" ? 18 : fn == "iq2_s" ? 21 : fn == "iq3_xxs" ? 21 : fn == "iq3_s" ? 21 : -1;
             std::string err;
             if (tg < 0 || !gg::iq_cpu_fmt(tg, td, E, FF, X.f.iq, err)) {
                 std::printf("%s: not run (%s)\n", fn.c_str(), tg < 0 ? "unknown format" : err.c_str());
@@ -214,6 +240,62 @@ int main(int argc, char** argv) {
         }
         X.f.blob = 2 * (size_t) FF * X.f.gr + (size_t) E * X.f.dr;
         fill(X, 1234);
+        if (real_layer >= 0) {
+            std::string mdir;
+            {
+                std::FILE* f = std::fopen((pack_dir + "/ds4.txt").c_str(), "r");
+                char line[4096];
+                while (f && std::fgets(line, sizeof line, f))
+                    if (std::strncmp(line, "model_dir ", 10) == 0) { mdir = line + 10; while (!mdir.empty() && (mdir.back() == '\n' || mdir.back() == '\r')) mdir.pop_back(); }
+                if (f) std::fclose(f);
+            }
+            std::vector<std::string> files;
+            struct T { int file = -1; uint64_t off = 0, bytes = 0; std::string type; };
+            std::vector<T> w((size_t) X.n * 3);
+            std::FILE* f = std::fopen((pack_dir + "/tensors.txt").c_str(), "r");
+            char line[4096];
+            while (f && std::fgets(line, sizeof line, f)) {
+                char a0[16], nm[512], ty[32];
+                int fi = 0;
+                unsigned long long off = 0, by = 0;
+                if (std::sscanf(line, "%15s", a0) != 1) continue;
+                if (std::strcmp(a0, "file") == 0) { char fn[1024]; if (std::sscanf(line, "file %d %1023s", &fi, fn) == 2) { if ((int) files.size() <= fi) files.resize((size_t) fi + 1); files[(size_t) fi] = fn; } continue; }
+                if (std::sscanf(line, "t %511s %31s %d %llu %llu", nm, ty, &fi, &off, &by) != 5) continue;
+                int L = -1, e = -1, k = -1;
+                if (std::sscanf(nm, "layers.%d.ffn.experts.%d.w%d.weight", &L, &e, &k) != 3 || L != real_layer || e >= X.n) continue;
+                const int r = k == 1 ? 0 : k == 3 ? 1 : 2;   // w1 gate, w3 up, w2 down
+                w[(size_t) e * 3 + (size_t) r] = {fi, off, by, ty};
+            }
+            if (f) std::fclose(f);
+            std::vector<strata::ds4::os::fd_t> fds(files.size(), strata::ds4::os::kBadFd);
+            std::vector<const uint8_t*> maps(files.size(), nullptr);
+            X.ptr.assign((size_t) X.n * 3, nullptr);
+            static std::vector<std::vector<uint8_t>> keep;
+            bool ok = true;
+            for (size_t i = 0; i < w.size() && ok; ++i) {
+                const T& t = w[i];
+                const size_t want = (i % 3) < 2 ? (size_t) FF * X.f.gr : (size_t) E * X.f.dr;
+                if (t.file < 0 || t.bytes != want) { std::printf("--real: layer %d expert %zu matrix %zu: %s (%s, %llu bytes, want %zu)\n", real_layer, i / 3, i % 3, t.file < 0 ? "missing" : "wrong size", t.type.c_str(), (unsigned long long) t.bytes, want); ok = false; break; }
+                auto& fd = fds[(size_t) t.file];
+                if (fd == strata::ds4::os::kBadFd) {
+                    fd = strata::ds4::os::open_ro(mdir + "/" + files[(size_t) t.file]);
+                    if (real_where == "map") maps[(size_t) t.file] = (const uint8_t*) strata::ds4::os::map_ro(fd, strata::ds4::os::file_size(fd));
+                }
+                if (real_where == "map") X.ptr[i] = maps[(size_t) t.file] + t.off;
+                else {
+                    keep.emplace_back(t.bytes);
+                    std::FILE* g = _wfopen(std::filesystem::path(mdir + "/" + files[(size_t) t.file]).wstring().c_str(), L"rb");
+                    _fseeki64(g, (long long) t.off, SEEK_SET);
+                    ok = std::fread(keep.back().data(), 1, t.bytes, g) == t.bytes;
+                    std::fclose(g);
+                    X.ptr[i] = keep.back().data();
+                }
+            }
+            if (!ok) continue;
+            if (real_where == "map")   // (the experts' pages read in once, as the engine's tune_lane does)
+                for (size_t i = 0; i < X.ptr.size(); ++i) { volatile uint8_t s2 = 0; const size_t b = w[i].bytes; for (size_t o = 0; o < b; o += 4096) s2 ^= X.ptr[i][o]; }
+            std::printf("--real: layer %d, %d experts (%s) from %s\n", real_layer, X.n, w[0].type.c_str(), real_where.c_str());
+        }
         Lane ln;
         ln.pool = &pool;
         int e0 = 0;

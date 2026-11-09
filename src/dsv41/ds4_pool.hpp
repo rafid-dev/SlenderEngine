@@ -150,6 +150,8 @@ public:
         uint8_t* keep = nullptr;        // non-null (a read): the len bytes read copied here as well
         bool exact = false;             // the len bytes land exactly at dst (a ring slot: no staging slack around them)
         std::atomic<bool>* cancel = nullptr;   // set before the job starts: it is dropped unread (bad is set, left counted down)
+        std::atomic<int>* bits = nullptr;      // (Q2.3) set: 1 << bit is or-ed in once this job's bytes are in place
+        int bit = 0;
         std::chrono::steady_clock::time_point pushed{};   // (DS4_IO_STATS: when it was queued)
     };
     explicit IoQueue(int n) {
@@ -261,6 +263,7 @@ private:
                                    std::chrono::steady_clock::now() - t0).count(),
                                std::memory_order_relaxed);
             if (!ok && j.bad != nullptr) j.bad->store(true, std::memory_order_release);
+            if (ok && j.bits != nullptr) j.bits->fetch_or(1 << j.bit, std::memory_order_acq_rel);
             if (j.left != nullptr) j.left->fetch_sub(1, std::memory_order_acq_rel);
             {
                 std::lock_guard<std::mutex> lk(done_mu_);
