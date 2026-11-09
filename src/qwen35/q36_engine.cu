@@ -723,6 +723,151 @@ __global__ void k_attn_blk_end(float* acc, const float* l, const float* gate, in
     const size_t i = (size_t) blockIdx.x * HD + threadIdx.x;
     acc[i] = acc[i] / l[blockIdx.x] * sigm(gate[i]);
 }
+/// STRATA_Q36_FA=1: the prompt's attention fused (a flash-attention kernel; the GEMM path writes every score to memory
+/// and reloads K / V per query head). A block takes kFaQ tokens x the kFaG query heads that share one KV head (64 rows),
+/// walks the cells [b0, b0 + Pb) a row can see in tiles of kFaK, scores with FP16 dot products in FP32 (as the GEMMs),
+/// an online softmax in FP32, and the values in FP32. q16 [T][H][256] f16; k16 / v16 [HKV][Pb][256] f16 (cells b0 ..).
+/// FINAL: out [T][H][256] = O / l * sigmoid(gate); else the block of cells' unnormalized O, its max and sum (ob / mb / lb,
+/// row t * H + h) for k_attn_blk_merge.  grid (ceil(T / kFaQ), HKV), block 256.
+constexpr int kFaQ = 8, kFaG = 8, kFaK = 16, kFaHD = 256, kFaR = kFaQ * kFaG, kFaPad = 8;
+template <bool FINAL>
+__global__ void __launch_bounds__(256) k_fa_prompt(const __half* __restrict__ q16, const __half* __restrict__ k16,
+                                                   const __half* __restrict__ v16, int T, int H, int Pb, int ld_cells, int b0, int pos0,
+                                                   float scale, const float* __restrict__ gate, float* __restrict__ out,
+                                                   float* __restrict__ mb, float* __restrict__ lb) {
+    constexpr int HD = kFaHD, QS = HD + kFaPad;
+    __shared__ __align__(16) __half sQ[kFaR * QS];
+    __shared__ __align__(16) __half sK[kFaK * QS];
+    __shared__ __align__(16) float sV[kFaK * HD];
+    __shared__ float sS[kFaR][kFaK + 1];
+    __shared__ float sM[kFaR], sL[kFaR], sA[kFaR];
+    const int tid = threadIdx.x, kvh = blockIdx.y, t0 = blockIdx.x * kFaQ;
+    // the Q tile: row r = token r / kFaG, head kvh * kFaG + r % kFaG (8 halves a load, 8 loads a thread)
+    for (int i = tid; i < kFaR * HD / 8; i += 256) {
+        const int r = i / (HD / 8), d = (i % (HD / 8)) * 8, t = t0 + r / kFaG;
+        uint4 v = make_uint4(0, 0, 0, 0);
+        if (t < T) v = *(const uint4*) (q16 + ((size_t) t * H + kvh * kFaG + r % kFaG) * HD + d);
+        *(uint4*) (sQ + r * QS + d) = v;
+    }
+    if (tid < kFaR) { sM[tid] = -INFINITY; sL[tid] = 0.f; }
+    // O: rows ro, ro + 1, columns dg * 32 .. + 32 (64 accumulators)
+    const int ro = (tid / 8) * 2, dg = tid % 8;
+    float o0[32], o1[32];
+    for (int i = 0; i < 32; ++i) o0[i] = o1[i] = 0.f;
+    const int t_last = min(T - 1, t0 + kFaQ - 1);
+    const int c_end = min(Pb, pos0 + t_last + 1 - b0);   // past it no row of the tile sees a cell
+    const __half* kh = k16 + (size_t) kvh * ld_cells * HD;   // (a KV head's cells ld_cells apart: Pb, or ctx in place)
+    const __half* vh = v16 + (size_t) kvh * ld_cells * HD;
+    // scores: rows sr, sr + 1 x cells sc, sc + 1
+    const int sr = (tid / 8) * 2, sc = (tid % 8) * 2;
+    for (int c0 = 0; c0 < c_end; c0 += kFaK) {
+        __syncthreads();   // (the previous tile's sV / sS reads are done; the Q tile and sM are written)
+        for (int i = tid; i < kFaK * HD / 8; i += 256) {
+            const int c = i / (HD / 8), d = (i % (HD / 8)) * 8;
+            uint4 kv = make_uint4(0, 0, 0, 0), vv = make_uint4(0, 0, 0, 0);
+            if (c0 + c < Pb) {
+                kv = *(const uint4*) (kh + (size_t) (c0 + c) * HD + d);
+                vv = *(const uint4*) (vh + (size_t) (c0 + c) * HD + d);
+            }
+            *(uint4*) (sK + c * QS + d) = kv;
+            const __half* vp = (const __half*) &vv;
+            for (int j = 0; j < 8; ++j) sV[c * HD + d + j] = __half2float(vp[j]);
+        }
+        __syncthreads();
+        {   // S = Q K^T * scale, the causal mask
+            float a00 = 0.f, a01 = 0.f, a10 = 0.f, a11 = 0.f;
+            const __half* q0p = sQ + sr * QS;
+            const __half* q1p = q0p + QS;
+            const __half* k0p = sK + sc * QS;
+            const __half* k1p = k0p + QS;
+#pragma unroll 4
+            for (int d = 0; d < HD; d += 8) {
+                const uint4 qa = *(const uint4*) (q0p + d), qb = *(const uint4*) (q1p + d);
+                const uint4 ka = *(const uint4*) (k0p + d), kb = *(const uint4*) (k1p + d);
+                const __half2* qa2 = (const __half2*) &qa;
+                const __half2* qb2 = (const __half2*) &qb;
+                const __half2* ka2 = (const __half2*) &ka;
+                const __half2* kb2 = (const __half2*) &kb;
+#pragma unroll
+                for (int j = 0; j < 4; ++j) {
+#if defined(STRATA_USE_HIP)
+                    a00 = __builtin_amdgcn_fdot2(qa2[j], ka2[j], a00, false);
+                    a01 = __builtin_amdgcn_fdot2(qa2[j], kb2[j], a01, false);
+                    a10 = __builtin_amdgcn_fdot2(qb2[j], ka2[j], a10, false);
+                    a11 = __builtin_amdgcn_fdot2(qb2[j], kb2[j], a11, false);
+#else
+                    const float2 fa = __half22float2(qa2[j]), fb = __half22float2(qb2[j]);
+                    const float2 ga = __half22float2(ka2[j]), gb = __half22float2(kb2[j]);
+                    a00 += fa.x * ga.x + fa.y * ga.y; a01 += fa.x * gb.x + fa.y * gb.y;
+                    a10 += fb.x * ga.x + fb.y * ga.y; a11 += fb.x * gb.x + fb.y * gb.y;
+#endif
+                }
+            }
+            const int p0r = pos0 + t0 + sr / kFaG, p1r = pos0 + t0 + (sr + 1) / kFaG;   // the rows' cells
+            const int ca = b0 + c0 + sc, cb = ca + 1;
+            const bool okc_a = c0 + sc < Pb, okc_b = c0 + sc + 1 < Pb;
+            sS[sr][sc] = (okc_a && ca <= p0r) ? a00 * scale : -INFINITY;
+            sS[sr][sc + 1] = (okc_b && cb <= p0r) ? a01 * scale : -INFINITY;
+            sS[sr + 1][sc] = (okc_a && ca <= p1r) ? a10 * scale : -INFINITY;
+            sS[sr + 1][sc + 1] = (okc_b && cb <= p1r) ? a11 * scale : -INFINITY;
+        }
+        __syncthreads();
+        {   // the online softmax: 4 threads a row, 4 cells each
+            const int r = tid / 4, q = tid % 4;
+            float mx = -INFINITY;
+            for (int c = q * 4; c < q * 4 + 4; ++c) mx = fmaxf(mx, sS[r][c]);
+            mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, 1, 4));
+            mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, 2, 4));
+            const float mo = sM[r];
+            const float mn = fmaxf(mo, mx);
+            float sum = 0.f;
+            for (int c = q * 4; c < q * 4 + 4; ++c) {
+                const float p = mn == -INFINITY ? 0.f : expf(sS[r][c] - mn);
+                sS[r][c] = p;
+                sum += p;
+            }
+            sum += __shfl_xor_sync(0xffffffffu, sum, 1, 4);
+            sum += __shfl_xor_sync(0xffffffffu, sum, 2, 4);
+            if (q == 0) {
+                const float a = (mo == -INFINITY) ? 0.f : expf(mo - mn);
+                sA[r] = a;
+                sL[r] = sL[r] * a + sum;
+                sM[r] = mn;
+            }
+        }
+        __syncthreads();
+        {   // O = O * alpha + P V
+            const float al0 = sA[ro], al1 = sA[ro + 1];
+            for (int i = 0; i < 32; ++i) { o0[i] *= al0; o1[i] *= al1; }
+            const int nc = min(kFaK, c_end - c0);
+            for (int c = 0; c < nc; ++c) {
+                const float p0 = sS[ro][c], p1 = sS[ro + 1][c];
+                const float4* vp = (const float4*) (sV + c * HD + dg * 32);
+#pragma unroll
+                for (int i = 0; i < 8; ++i) {
+                    const float4 v = vp[i];
+                    o0[i * 4 + 0] += p0 * v.x; o0[i * 4 + 1] += p0 * v.y; o0[i * 4 + 2] += p0 * v.z; o0[i * 4 + 3] += p0 * v.w;
+                    o1[i * 4 + 0] += p1 * v.x; o1[i * 4 + 1] += p1 * v.y; o1[i * 4 + 2] += p1 * v.z; o1[i * 4 + 3] += p1 * v.w;
+                }
+            }
+        }
+    }
+    __syncthreads();
+    for (int k = 0; k < 2; ++k) {
+        const int r = ro + k, t = t0 + r / kFaG;
+        if (t >= T) continue;
+        const int h = kvh * kFaG + r % kFaG;
+        const size_t base = ((size_t) t * H + h) * HD + dg * 32;
+        const float* o = k ? o1 : o0;
+        if (FINAL) {
+            const float inv = sL[r] > 0.f ? 1.f / sL[r] : 0.f;
+            for (int i = 0; i < 32; ++i) out[base + i] = o[i] * inv * sigm(gate[base + i]);
+        } else {
+            for (int i = 0; i < 32; ++i) out[base + i] = o[i];
+            if (dg == 0) { mb[(size_t) t * H + h] = sM[r]; lb[(size_t) t * H + h] = sL[r]; }
+        }
+    }
+}
 /// The prompt's causal softmax: row (h, t) of S (ld floats, P cells) -> softmax(S * scale) over the cells
 /// [0, pos0 + t], 0 past them, as FP16 probabilities (S16, the same row offsets, ld halves).  grid (T, H), block 256.
 __global__ void k_attn_softmax16(const float* S, __half* S16, int ld, int T, int P, int pos0, float scale) {
@@ -739,6 +884,51 @@ __global__ void k_attn_softmax16(const float* S, __half* S16, int ld, int T, int
     sum = block_sum(sum, sh);
     const float inv = 1.0f / sum;
     for (int p = threadIdx.x; p < P; p += blockDim.x) out[p] = __float2half(p < n ? expf(row[p] * scale - mx) * inv : 0.f);
+}
+/// STRATA_Q36_ATT_F16: k_attn_softmax16 over FP16 scores already scaled (the GEMM's alpha), in place: row (h, t) of S16.
+__global__ void k_attn_softmax16_h(__half* S16, int ld, int T, int P, int pos0) {
+    __shared__ float sh[kThreads];
+    const int t = blockIdx.x, h = blockIdx.y;
+    __half* row = S16 + ((size_t) h * T + t) * ld;
+    const int n = min(P, pos0 + t + 1);
+    float mx = -INFINITY;
+    for (int p = threadIdx.x; p < n; p += blockDim.x) mx = fmaxf(mx, __half2float(row[p]));
+    mx = block_max(mx, sh);
+    float sum = 0.f;
+    for (int p = threadIdx.x; p < n; p += blockDim.x) sum += expf(__half2float(row[p]) - mx);
+    sum = block_sum(sum, sh);
+    const float inv = 1.0f / sum;
+    for (int p = threadIdx.x; p < P; p += blockDim.x) row[p] = __float2half(p < n ? expf(__half2float(row[p]) - mx) * inv : 0.f);
+}
+/// The blocked variant (KV_RAM): the block's softmax over the cells the row sees, normalized within the block (an FP16
+/// output stays in range), and m_b / l_b; k_h2f_rows multiplies the block's output by l_b again before the merge.
+__global__ void k_attn_softmax16_h_blk(__half* S16, int ld, int T, int Pb, int b0, int pos0, float* mb, float* lb) {
+    __shared__ float sh[kThreads];
+    const int t = blockIdx.x, h = blockIdx.y;
+    __half* row = S16 + ((size_t) h * T + t) * ld;
+    const int n = max(0, min(Pb, pos0 + t + 1 - b0));
+    float mx = -INFINITY;
+    for (int p = threadIdx.x; p < n; p += blockDim.x) mx = fmaxf(mx, __half2float(row[p]));
+    mx = block_max(mx, sh);
+    float sum = 0.f;
+    for (int p = threadIdx.x; p < n; p += blockDim.x) sum += expf(__half2float(row[p]) - mx);
+    sum = block_sum(sum, sh);
+    const float inv = sum > 0.f ? 1.0f / sum : 0.f;
+    for (int p = threadIdx.x; p < Pb; p += blockDim.x) row[p] = __float2half(p < n ? expf(__half2float(row[p]) - mx) * inv : 0.f);
+    if (threadIdx.x == 0) {
+        mb[(size_t) t * gridDim.y + h] = n > 0 ? mx : -INFINITY;
+        lb[(size_t) t * gridDim.y + h] = sum;
+    }
+}
+/// FP16 attention output to FP32: out = o16 * sigmoid(gate) (gated) or out = o16, n values.
+__global__ void k_h2f_gate(const __half* o16, const float* gate, float* out, int64_t n) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) out[i] = gate ? __half2float(o16[i]) * sigm(gate[i]) : __half2float(o16[i]);
+}
+/// out[r][d] = o16[r][d] * scale[r] (rows of HD): a block's normalized FP16 output back to k_attn_blk_merge's form.
+__global__ void k_h2f_rows(const __half* o16, const float* scale, float* out, int HD, int64_t n) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) out[i] = __half2float(o16[i]) * scale[i / HD];
 }
 /// att *= sigmoid(gate) (the attention output gate), n values.
 __global__ void k_gate_mul(float* att, const float* gate, int64_t n) {
@@ -1735,7 +1925,12 @@ struct Engine {
     float* sk_part = nullptr;          // the split-K partials of the F32 projections: [kSplitK][tmax][<= 257]
     __half* att_p16 = nullptr;         // the probabilities in FP16 (kAttScoreFloats halves)
     __half *k16 = nullptr, *v16 = nullptr, *q16 = nullptr;   // the prompt attention's FP16 operands
-    size_t kAttScoreFloats = (size_t) 64 << 20;   // 256 MB (16 M floats when the experts' fit is close)
+    // 256 MB (16 M floats when the experts' fit is close); STRATA_Q36_ATT_MFLOATS sets it (millions of floats): more
+    // query rows per attention GEMM at a long context (64 M: ~200 rows at 20K cells)
+    size_t kAttScoreFloats = [] {
+        const char* v = std::getenv("STRATA_Q36_ATT_MFLOATS");
+        return (size_t) (v ? std::max(4, std::atoi(v)) : 64) << 20;
+    }();
     // the prompt's MMQ experts
     bool use_mmq = false;
     std::unique_ptr<MMQ::Context> mctx;
@@ -2157,6 +2352,17 @@ struct Engine {
             v16 = dalloc_t<__half>((size_t) g.n_head_kv * cells * g.head_dim);
         }
         q16 = dalloc_t<__half>(T * g.n_head * g.head_dim);
+        if (att16_on()) ensure_o16(T * g.n_head * g.head_dim);   // (allocated before the slots)
+        if (const char* lv = std::getenv("STRATA_Q36_LM"); lv && lv[0] == '1') {   // layer-major prompts (forward_lm)
+            if (const char* c = std::getenv("STRATA_Q36_LM_CHUNKS")) lm_chunks = std::max(2, std::min(32, std::atoi(c)));
+            lm_on = true;
+            lm_X = dalloc((size_t) lm_chunks * T * N);
+            lm_H = dalloc((size_t) lm_chunks * T * N);
+            lm_tok = dalloc_t<int32_t>((size_t) lm_chunks * T);
+            lm_pos = dalloc_t<int32_t>((size_t) lm_chunks);
+            std::fprintf(stderr, "strata-q36: STRATA_Q36_LM=1: prompts layer-major in super-chunks of %d x %zu tokens "
+                         "(%.2f GiB of VRAM)\n", lm_chunks, T, (double) lm_chunks * T * N * 8 / (1 << 30));
+        }
         use_mmq = MMQ::built() && std::getenv("STRATA_Q36_NO_MMQ") == nullptr;
         auto mmq_ok = [&](const Layer& L) {
             return MMQ::supported(L.L.gu_type) && MMQ::supported(L.L.d_type) && MMQ::fits(L.L.gu_type, 2 * g.n_ff) &&
@@ -2675,6 +2881,39 @@ struct Engine {
     /// cells in blocks of kv_cells, each block's scores / exp / values as in the unblocked path (FP16 GEMMs, FP32
     /// accumulation), the blocks' outputs merged with an online softmax, then / l and the gate. q / gate / att as in
     /// layer(); att gets the gated output.
+    /// STRATA_Q36_FA=1 (opt-in): the prompt attention on k_fa_prompt (needs 8 query heads a KV head and head_dim 256)
+    bool fa_ok() const {
+        static const bool on = [] { const char* v = std::getenv("STRATA_Q36_FA"); return v && v[0] == '1'; }();
+        return on && m->g.n_head == kFaG * m->g.n_head_kv && m->g.head_dim == kFaHD;
+    }
+    /// STRATA_Q36_ATT_F16=1 (opt-in): the prompt attention's two GEMMs write FP16 (FP32 compute): rocBLAS's tuned kernel
+    /// family on RDNA2 (FP16 in, FP32 out ran at ~3.3 TFLOPS there, FP16 out at ~9-13)
+    static bool att16_on() {
+        static const bool on = [] { const char* v = std::getenv("STRATA_Q36_ATT_F16"); return v && v[0] == '1'; }();
+        return on;
+    }
+    /// The attention values GEMM (FP16 out): out [nt][H * HD] per query head of KV head kvh = V . P16. (rocBLAS's own
+    /// solutions run it 1.2-2.3x faster than its default past 8K cells - tools/hip/tune_attn_rocblas - but some of them
+    /// fault on shapes they accept, so the default stays until a checked table exists.)
+    void attn_values16(const __half* V, const __half* P16, __half* out, int P, int nt, int ldp, int H, int HD, int G) {
+        const float one = 1.0f, zero = 0.0f;
+        if (cublasGemmStridedBatchedEx(blas, CUBLAS_OP_N, CUBLAS_OP_N, HD, nt, P, &one, V, CUDA_R_16F, HD, 0, P16, CUDA_R_16F,
+                                       ldp, (long long) nt * ldp, &zero, out, CUDA_R_16F, H * HD, HD, G, CUBLAS_COMPUTE_32F,
+                                       CUBLAS_GEMM_DEFAULT) != CUBLAS_STATUS_SUCCESS) {
+            std::fprintf(stderr, "strata-q36: attention values GEMM failed\n");
+            std::exit(1);
+        }
+    }
+    __half* o16_buf = nullptr;
+    size_t o16_n = 0;
+    __half* ensure_o16(size_t n) {
+        if (n > o16_n) {
+            if (o16_buf) CK(cudaFree(o16_buf));
+            o16_buf = dalloc_t<__half>(n);
+            o16_n = n;
+        }
+        return o16_buf;
+    }
     float *blk_ob = nullptr, *blk_mb = nullptr, *blk_lb = nullptr, *blk_m = nullptr, *blk_l = nullptr;
     size_t blk_rows = 0;
     void attn_prompt_blocked(size_t li, int T, int64_t p0) {
@@ -2704,6 +2943,35 @@ struct Engine {
             }
             k_kv_q8_f16_tab<<<grid1((int64_t) HKV * Pb * HD), kThreads, 0, st>>>(kb, k16, v16, b0, Pb, HD, HKV, kv_qb());
             const size_t kv_head = (size_t) Pb * HD;
+            if (att16_on()) {   // FP16-out GEMMs: the block normalized in the softmax, l_b put back after the values
+                __half* o16b = ensure_o16((size_t) T * H * HD);
+                for (int t0 = 0; t0 < T; t0 += tq) {
+                    const int nt = std::min(tq, T - t0);
+                    for (int kvh = 0; kvh < HKV; ++kvh) {
+                        if (cublasGemmStridedBatchedEx(blas, CUBLAS_OP_T, CUBLAS_OP_N, Pb, nt, HD, &scale, k16 + (size_t) kvh * kv_head,
+                                CUDA_R_16F, HD, 0, q16 + ((size_t) t0 * H + kvh * G) * HD, CUDA_R_16F, H * HD, HD, &zero,
+                                att_p16 + (size_t) kvh * G * nt * ldp, CUDA_R_16F, ldp, (long long) nt * ldp, G,
+                                CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT) != CUBLAS_STATUS_SUCCESS) {
+                            std::fprintf(stderr, "strata-q36: attention scores GEMM failed\n");
+                            std::exit(1);
+                        }
+                    }
+                    k_attn_softmax16_h_blk<<<dim3(nt, H), kThreads, 0, st>>>(att_p16, ldp, nt, Pb, b0, (int) p0 + t0,
+                                                                             blk_mb + (size_t) t0 * H, blk_lb + (size_t) t0 * H);
+                    for (int kvh = 0; kvh < HKV; ++kvh)
+                        attn_values16(v16 + (size_t) kvh * kv_head, att_p16 + (size_t) kvh * G * nt * ldp,
+                                      o16b + ((size_t) t0 * H + kvh * G) * HD, Pb, nt, ldp, H, HD, G);
+                }
+                k_h2f_rows<<<grid1((int64_t) T * H * HD), kThreads, 0, st>>>(o16b, blk_lb, blk_ob, HD, (int64_t) T * H * HD);
+                k_attn_blk_merge<<<T * H, HD, 0, st>>>(att, blk_ob, blk_m, blk_l, blk_mb, blk_lb, HD, bi == 0);
+                continue;
+            }
+            if (fa_ok()) {   // the fused kernel: the block's unnormalized output and its row stats
+                k_fa_prompt<false><<<dim3((T + kFaQ - 1) / kFaQ, HKV), 256, 0, st>>>(q16, k16, v16, T, H, Pb, Pb, b0, (int) p0,
+                                                                                      scale, nullptr, blk_ob, blk_mb, blk_lb);
+                k_attn_blk_merge<<<T * H, HD, 0, st>>>(att, blk_ob, blk_m, blk_l, blk_mb, blk_lb, HD, bi == 0);
+                continue;
+            }
             for (int t0 = 0; t0 < T; t0 += tq) {
                 const int nt = std::min(tq, T - t0);
                 for (int kvh = 0; kvh < HKV; ++kvh) {
@@ -2841,6 +3109,30 @@ struct Engine {
                 const __half* vbase = in_place ? (const __half*) vc[li] : v16;
                 const size_t kv_head = in_place ? (size_t) ctx * HD : (size_t) P * HD;
                 k_to_f16<<<grid1((int64_t) T * H * HD), kThreads, 0, st>>>(q, q16, (int64_t) T * H * HD);
+                if (fa_ok()) {   // STRATA_Q36_FA: the fused kernel (the gate in its epilogue)
+                    k_fa_prompt<true><<<dim3((T + kFaQ - 1) / kFaQ, HKV), 256, 0, st>>>(q16, kbase, vbase, T, H, P,
+                        (int) (kv_head / HD), 0, (int) p0, 1.0f / sqrtf((float) HD), gate, att, nullptr, nullptr);
+                } else if (att16_on()) {   // STRATA_Q36_ATT_F16: both GEMMs FP16 out (FP32 compute), the scale in alpha
+                    const float sc = 1.0f / sqrtf((float) HD);
+                    __half* o16b = ensure_o16((size_t) T * H * HD);
+                    for (int t0 = 0; t0 < T; t0 += tq) {
+                        const int nt = std::min(tq, T - t0);
+                        for (int kvh = 0; kvh < HKV; ++kvh) {
+                            if (cublasGemmStridedBatchedEx(blas, CUBLAS_OP_T, CUBLAS_OP_N, P, nt, HD, &sc, kbase + (size_t) kvh * kv_head,
+                                    CUDA_R_16F, HD, 0, q16 + ((size_t) t0 * H + kvh * G) * HD, CUDA_R_16F, H * HD, HD, &zero,
+                                    att_p16 + (size_t) kvh * G * nt * ldp, CUDA_R_16F, ldp, (long long) nt * ldp, G,
+                                    CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT) != CUBLAS_STATUS_SUCCESS) {
+                                std::fprintf(stderr, "strata-q36: attention scores GEMM failed\n");
+                                std::exit(1);
+                            }
+                        }
+                        k_attn_softmax16_h<<<dim3(nt, H), kThreads, 0, st>>>(att_p16, ldp, nt, P, (int) p0 + t0);
+                        for (int kvh = 0; kvh < HKV; ++kvh)
+                            attn_values16(vbase + (size_t) kvh * kv_head, att_p16 + (size_t) kvh * G * nt * ldp,
+                                          o16b + ((size_t) t0 * H + kvh * G) * HD, P, nt, ldp, H, HD, G);
+                    }
+                    k_h2f_gate<<<grid1((int64_t) T * H * HD), kThreads, 0, st>>>(o16b, gate, att, (int64_t) T * H * HD);
+                } else {
                 for (int t0 = 0; t0 < T; t0 += tq) {
                     const int nt = std::min(tq, T - t0);
                     for (int kvh = 0; kvh < HKV; ++kvh) {
@@ -2871,6 +3163,7 @@ struct Engine {
                     }
                 }
                 k_gate_mul<<<grid1((int64_t) T * H * HD), kThreads, 0, st>>>(att, gate, (int64_t) T * H * HD);
+                }   // (the GEMM path)
                 }   // (the unblocked prompt attention)
             } else {
                 // split-K over 256-cell chunks; the chunk grid covers every cell a row can see (graph mode: the whole
@@ -2954,13 +3247,20 @@ struct Engine {
             if (lhy(li))
                 for (int x = 0; x < ne; ++x) hy[li].score[(size_t) x] += h_cnt[li * g.n_expert + x];
             const int64_t maxr = hpin[10];
-            const uint8_t* wbase = lhy(li) ? stream_take((int) li) : L.blobs;
+            pmark("moe: routing sort + host sync");
+            // layer-major prompts (STRATA_Q36_LM): a layer's streamed experts are taken by its first chunk of the
+            // super-chunk and given back after its last
+            const uint8_t* wbase = !lhy(li) ? L.blobs
+                                 : !lm_active ? stream_take((int) li)
+                                 : lm_first ? (lm_wbase = stream_take((int) li)) : lm_wbase;
+            pmark("moe: waiting for the stream");
             MMQ::quantize(h, ent_tok, mq_x, L.L.gu_type, N, N, n_ent, st);
             MMQ::Product gu;
             gu.w = wbase; gu.type = L.L.gu_type; gu.w_rows = 2 * FF; gu.w_cols = N; gu.expert_bytes = L.stride;
             gu.n = ne; gu.xq = mq_x; gu.bounds = rbounds; gu.ids = ident; gu.total_rows = n_ent; gu.max_rows = maxr;
             gu.dst = mq_gu; gu.ld_dst = 2 * FF;
             mctx->run(gu, st);
+            pmark("moe: quantize + gate/up MMQ");
             MMQ::swiglu(mq_gu, mq_h, n_ent, FF, false, st);
             MMQ::quantize(mq_h, nullptr, mq_hq, L.L.d_type, FF, FF, n_ent, st);
             MMQ::Product dn;
@@ -2968,7 +3268,8 @@ struct Engine {
             dn.expert_bytes = L.stride; dn.n = ne; dn.xq = mq_hq; dn.bounds = rbounds; dn.ids = ident;
             dn.total_rows = n_ent; dn.max_rows = maxr; dn.dst = eparts; dn.ld_dst = N;
             mctx->run(dn, st);
-            if (lhy(li)) stream_done();
+            pmark("moe: swiglu + down MMQ");
+            if (lhy(li) && (!lm_active || lm_last)) stream_done();
             prow = rinv;
         } else {
             group_entries(L, nullptr, T);
@@ -2997,6 +3298,98 @@ struct Engine {
         // the combine, the shared expert's gate, the residual add and the next norm in one launch
         moe_end(T, prow, sy, ext ? logits_r + g.n_expert : sgate, wn, hout, ext ? (int) g.n_expert + 1 : 1);
         pmark("shared expert + combine");
+    }
+
+    /// STRATA_Q36_LM=1 (opt-in): layer-major prompts. A prompt's full chunks run in super-chunks of up to
+    /// STRATA_Q36_LM_CHUNKS (4) chunks: every layer over all of a super-chunk's chunks before the next layer, so each
+    /// layer's experts cross PCIe once per super-chunk instead of once per chunk (the chunk-major order streamed all
+    /// 18.7 GiB of experts for every 2048 tokens). Within a layer the chunks run in order, so the recurrent state and the
+    /// cache see what the chunk-major order gives them: the same arithmetic. The super-chunk's residual and normed rows
+    /// live in lm_X / lm_H. The MTP block's pass over the prompt runs the same way.
+    bool lm_on = false, lm_active = false, lm_first = false, lm_last = false;
+    int lm_chunks = 4;
+    const uint8_t* lm_wbase = nullptr;
+    float *lm_X = nullptr, *lm_H = nullptr;
+    int32_t *lm_tok = nullptr, *lm_pos = nullptr;
+    /// ns rows at p0 (chunks of tmax rows, the last one may be shorter but above hybrid_t), their tokens on the host;
+    /// the last row's logits when `head`
+    void forward_lm(int ns, int64_t p0, const int32_t* toks, bool head) {
+        const auto& g = m->g;
+        const int N = (int) g.n_embd, T = tmax;
+        const int nsub = (ns + T - 1) / T;
+        auto rows = [&](int j) { return std::min(T, ns - j * T); };
+        kvr_ensure(p0 + ns);
+        ensure_set(T);
+        CK(cudaStreamSynchronize(st));   // (the pinned words are reused)
+        for (int j = 0; j < nsub; ++j) hpin[16 + j] = (int32_t) (p0 + (int64_t) j * T);
+        CK(cudaMemcpyAsync(lm_tok, toks, (size_t) ns * 4, cudaMemcpyHostToDevice, st));
+        CK(cudaMemcpyAsync(lm_pos, hpin + 16, (size_t) nsub * 4, cudaMemcpyHostToDevice, st));
+        drop_xslots();
+        std::vector<int> seq;
+        for (size_t l = 0; l < m->layers.size(); ++l)
+            if (lhy(l)) seq.push_back((int) l);
+        stream_begin(seq);
+        float* const x0 = x;
+        float* const h0 = h;
+        for (int j = 0; j < nsub; ++j) {
+            x = lm_X + (size_t) j * T * N;
+            h = lm_H + (size_t) j * T * N;
+            K::iq_embed_rows(m->embd_type, m->embd, m->embd_row, lm_tok + (size_t) j * T, rows(j), N, x, st);
+            k_rms<<<rows(j), kThreads, 0, st>>>(x, m->layers[0].attn_norm, h, N, m->eps);
+        }
+        lm_active = true;
+        const auto lm_t0 = Clock::now();
+        if (prof_on()) { pmark_on = true; pmark_n = 0; }   // STRATA_Q36_PROF=2: the super-chunk's stages, summed
+        for (size_t l = 0; l < m->layers.size(); ++l) {
+            const bool last = l + 1 == m->layers.size();
+            for (int j = 0; j < nsub; ++j) {
+                x = lm_X + (size_t) j * T * N;
+                h = lm_H + (size_t) j * T * N;
+                lm_first = j == 0;
+                lm_last = j == nsub - 1;
+                layer(m->layers[l], l, rows(j), p0 + (int64_t) j * T, lm_pos + j, false, false,
+                      last ? m->out_norm : m->layers[l + 1].attn_norm, h);
+            }
+        }
+        lm_active = false;
+        x = x0;
+        h = h0;
+        if (head) head_rows(lm_H + (size_t) (ns - 1) * N, 1, logits, pick);
+        if (pmark_on) {
+            CK(cudaDeviceSynchronize());
+            std::map<std::string, float> by;
+            for (size_t i = 1; i < pmark_n; ++i) {
+                float ms = 0.f;
+                CK(cudaEventElapsedTime(&ms, pmarks[i - 1].second, pmarks[i].second));
+                by[pmarks[i].first] += ms;
+            }
+            for (const auto& kv : by) std::fprintf(stderr, "strata-q36 lm prof:   GPU %7.0f ms  %s\n", kv.second, kv.first.c_str());
+            std::fprintf(stderr, "strata-q36 lm prof: %d x %d rows at %lld: %.0f ms\n", nsub, T, (long long) p0, ms_since(lm_t0));
+            pmark_on = false;
+        }
+    }
+    /// The MTP block over the super-chunk forward_lm just ran (its K / V cells for those positions)
+    void forward_mtp_lm(int ns, int64_t p0) {
+        const int N = (int) m->g.n_embd, T = tmax;
+        const int nsub = (ns + T - 1) / T;
+        lm_active = true;
+        for (int j = 0; j < nsub; ++j) {
+            const float* seeds;
+            if (j == 0) {   // h_{q-1} for each row q: hlast, then the super-chunk's rows 0 .. T - 2
+                CK(cudaMemcpyAsync(mtp_seed(), hlast, (size_t) N * 4, cudaMemcpyDeviceToDevice, st));
+                CK(cudaMemcpyAsync(mtp_seed() + N, lm_H, (size_t) (T - 1) * N * 4, cudaMemcpyDeviceToDevice, st));
+                seeds = mtp_seed();
+            } else {
+                seeds = lm_H + ((size_t) j * T - 1) * N;
+            }
+            const int Tj = std::min(T, ns - j * T);
+            CK(cudaMemcpyAsync(tok_m, lm_tok + (size_t) j * T, (size_t) Tj * 4, cudaMemcpyDeviceToDevice, st));
+            CK(cudaMemcpyAsync(pos0_m, lm_pos + j, 4, cudaMemcpyDeviceToDevice, st));
+            lm_first = j == 0;
+            lm_last = j == nsub - 1;
+            forward_mtp(Tj, p0 + (int64_t) j * T, seeds, false, false);
+        }
+        lm_active = false;
     }
 
     /// The main model over T rows (device `tok`, positions p0 .. p0 + T - 1, also at *pos0): hmain gets every row's
@@ -3128,7 +3521,7 @@ struct Engine {
         const int N = (int) g.n_embd;
         kvr_ensure(p0 + T);
         ensure_set(T);
-        if (main_hybrid && lhy(m->layers.size()) && T > hybrid_t && use_mmq) {
+        if (main_hybrid && lhy(m->layers.size()) && T > hybrid_t && use_mmq && (!lm_active || lm_first)) {
             drop_xslots();   // the stream overwrites the staging buffers that hold extra slots
             stream_begin({(int) m->layers.size()});
         }
@@ -3612,7 +4005,26 @@ struct Engine {
             on_chunk(1);
             return 1;
         }
-        for (int64_t i = 0; i < n; i += tmax) {
+        for (int64_t i = 0; i < n;) {
+            // layer-major: the full chunks in super-chunks (no pictures; a partial last chunk takes the path below)
+            if (lm_on && !img_active && m->hybrid && n - i >= 2 * (int64_t) tmax) {
+                // whole chunks; the prompt's last super-chunk also takes a partial last chunk above hybrid_t rows
+                const int64_t rem = n - i;
+                int ns = (int) std::min<int64_t>((int64_t) lm_chunks * tmax, rem / tmax * tmax);
+                const int64_t tail = rem - ns;
+                if (tail > hybrid_t && tail < tmax && ns + tail <= (int64_t) lm_chunks * tmax) ns += (int) tail;
+                forward_lm(ns, pos, toks + i, i + ns == n);
+                if (m->has_mtp && mtp_d > 0) forward_mtp_lm(ns, pos);
+                CK(cudaMemcpyAsync(hlast, lm_H + (size_t) (ns - 1) * N, (size_t) N * 4, cudaMemcpyDeviceToDevice, st));
+                pos += ns;
+                i += ns;
+                CK(cudaStreamSynchronize(st));
+                if (!on_chunk(i)) {
+                    if (m->hybrid) { rebalance(hybrid_swaps_after_prompt, false); prompt_decay(n); }
+                    return i;
+                }
+                continue;
+            }
             const int T = (int) std::min<int64_t>(tmax, n - i);
             CK(cudaStreamSynchronize(st));
             hpin[1] = (int32_t) pos;
@@ -3638,6 +4050,7 @@ struct Engine {
                 if (m->hybrid) { rebalance(hybrid_swaps_after_prompt, false); prompt_decay(n); }
                 return i + T;
             }
+            i += T;
         }
         if (m->hybrid) { rebalance(hybrid_swaps_after_prompt, false); prompt_decay(n); }
         return n;

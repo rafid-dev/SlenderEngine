@@ -866,6 +866,8 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
 
     add_executable(tune_rocblas tools/hip/tune_rocblas.cpp)
     target_link_libraries(tune_rocblas PRIVATE hip::host roc::rocblas)
+    add_executable(tune_attn_rocblas tools/hip/tune_attn_rocblas.cpp)   # the 35B's prompt-attention GEMMs
+    target_link_libraries(tune_attn_rocblas PRIVATE hip::host roc::rocblas)
   endif()
 
   # DFlash2 drafter tools (not built by default: cmake --build <dir> --target dflash2_parity dflash2_gemm_bench dflash2_attn_bench): the drafter against
