@@ -362,12 +362,23 @@ struct Pack {
     std::vector<std::pair<uint8_t*, size_t>> maps;   // file -> its read-only mapping (map(): the experts in place)
     std::vector<os::fd_t> dfds;   // (gguf) file -> unbuffered (os::open_direct; kBadFd: buffered reads only)
     std::vector<os::fd_t> pfds;   // (gguf) file -> for reads from many threads at once (os::open_par)
+    // DS4_EXPERTS_MIRROR=<dir> (SlenderEngine, opt-in): copies of the model's files on another drive, same names, same sizes.
+    // file -> the copy opened unbuffered (kBadFd: no copy of that file).  Each unbuffered read job then goes to the next drive in
+    // turn (dfd_pick), so both drives serve the experts' reads; the bytes are the same either way.
+    std::vector<os::fd_t> mdfds;
+    mutable std::atomic<uint64_t> mirror_rr{0};
+    os::fd_t dfd_pick(int file) const {
+        const os::fd_t d = (size_t) file < dfds.size() ? dfds[(size_t) file] : os::kBadFd;
+        if (d == os::kBadFd || (size_t) file >= mdfds.size() || mdfds[(size_t) file] == os::kBadFd) return d;
+        return (mirror_rr.fetch_add(1, std::memory_order_relaxed) & 1) ? mdfds[(size_t) file] : d;
+    }
 
     ~Pack() {
         for (auto& m : maps) os::unmap(m.first, m.second);
         for (os::fd_t fd : fds) os::close_fd(fd);
         for (os::fd_t fd : dfds) os::close_fd(fd);
         for (os::fd_t fd : pfds) os::close_fd(fd);
+        for (os::fd_t fd : mdfds) if (fd != os::kBadFd) os::close_fd(fd);
     }
     // file i mapped whole, read-only (once; not thread-safe: called while loading)
     const uint8_t* map(int file) {
@@ -452,6 +463,24 @@ struct Pack {
                 dfds.push_back(os::open_direct(model_dir + "/" + files[i]));
                 pfds.push_back(os::open_par(model_dir + "/" + files[i]));
             }
+        if (const char* md = std::getenv("DS4_EXPERTS_MIRROR"); gguf && md != nullptr && *md != 0) {
+            int n_copies = 0;
+            for (size_t i = 0; i < files.size(); ++i) {
+                os::fd_t m = os::kBadFd;
+                if (dfds[i] != os::kBadFd) {
+                    const std::string mp = std::string(md) + "/" + files[i];
+                    const os::fd_t probe = os::open_ro(mp);
+                    if (probe != os::kBadFd) {
+                        if (os::file_size(probe) == os::file_size(fds[i])) m = os::open_direct(mp);
+                        os::close_fd(probe);
+                    }
+                }
+                mdfds.push_back(m);
+                n_copies += m != os::kBadFd ? 1 : 0;
+            }
+            std::fprintf(stderr, "ds4: DS4_EXPERTS_MIRROR: %d of %zu model files have a copy of the same size in %s; their unbuffered "
+                                 "reads alternate between the two drives\n", n_copies, files.size(), md);
+        }
         // the Engram tables
         std::FILE* e = std::fopen((d + "/engram.bin").c_str(), "rb");
         if (e == nullptr) {
@@ -4790,7 +4819,7 @@ struct Model::Impl {
                     j = IoQueue::Job{};
                     const os::fd_t pf = pk.pfds.empty() ? os::kBadFd : pk.pfds[(size_t) l.mx_file[q]];
                     j.fd = pf != os::kBadFd ? pf : pk.fds[(size_t) l.mx_file[q]];
-                    j.dfd = pk.dfds.empty() ? os::kBadFd : pk.dfds[(size_t) l.mx_file[q]];
+                    j.dfd = pk.dfds.empty() ? os::kBadFd : pk.dfd_pick(l.mx_file[q]);   // (DS4_EXPERTS_MIRROR: the next drive)
                     j.off = l.mx_off[q] + (uint64_t) it.e * l.mx_stride[q];
                     j.len = mx_part_bytes(l, q);
                     j.dst = dst + lay.trellis[q];
@@ -4833,7 +4862,7 @@ struct Model::Impl {
                     IoQueue::Job& j = jobs[nj++];
                     const os::fd_t pf = pk.pfds.empty() ? os::kBadFd : pk.pfds[(size_t) l.mx_file[r]];
                     j.fd = pf != os::kBadFd ? pf : pk.fds[(size_t) l.mx_file[r]];
-                    j.dfd = pk.dfds.empty() || c.buffered ? os::kBadFd : pk.dfds[(size_t) l.mx_file[r]];
+                    j.dfd = pk.dfds.empty() || c.buffered ? os::kBadFd : pk.dfd_pick(l.mx_file[r]);   // (DS4_EXPERTS_MIRROR: the next drive)
                     j.off = l.mx_off[r] + (uint64_t) it.e * l.mx_stride[r] + mx_read_off(l, it.mi, r);
                     j.len = mx_read_len(l, r);
                     j.dst = sb;
@@ -6615,6 +6644,7 @@ struct Model::Impl {
             std::fprintf(stderr, "ds4: --ssd-cache: the store could not start\n");
             return;
         }
+        if (!pk.mdfds.empty()) st->set_mirror(pk.mdfds);   // DS4_EXPERTS_MIRROR: the slots' reads alternate between the drives
         store = std::move(st);
         // (the router lookahead's guesses are not read ahead with the store: measured 4.5 against 4.7 tok/s, 62% of the guesses are right and
         // the SSD is the narrow part; DS4_AHEAD=1 turns them on)
@@ -12341,7 +12371,7 @@ struct Model::Impl {
                     IoQueue::Job j;
                     const os::fd_t pf = pk.pfds.empty() ? os::kBadFd : pk.pfds[(size_t) l.mx_file[r]];
                     j.fd = pf != os::kBadFd ? pf : pk.fds[(size_t) l.mx_file[r]];
-                    j.dfd = pk.dfds.empty() ? os::kBadFd : pk.dfds[(size_t) l.mx_file[r]];
+                    j.dfd = pk.dfds.empty() ? os::kBadFd : pk.dfd_pick(l.mx_file[r]);   // (DS4_EXPERTS_MIRROR: the next drive)
                     j.off = l.mx_off[r] + (uint64_t) cold[(size_t) i] * l.mx_stride[r];
                     j.len = mx_part_bytes(l, r);
                     j.dst = sb;

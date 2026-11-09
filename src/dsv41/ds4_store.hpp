@@ -71,6 +71,9 @@ public:
     };
 
     void set_pfds(const std::vector<os::fd_t>& pfds) { pfds_ = pfds; }   // (the fallback handles were reopened)
+    // DS4_EXPERTS_MIRROR (SlenderEngine): file -> its copy on another drive, opened unbuffered (kBadFd: none).  A slot's three reads
+    // then go to the two drives in turn; the bytes are the same.
+    void set_mirror(const std::vector<os::fd_t>& m) { mdfds_ = m; }
     bool init(const Cfg& c, const std::vector<LayerGeo>& layers, const std::vector<os::fd_t>& dfds, const std::vector<os::fd_t>& pfds) {
         cfg_ = c;
         geo_ = layers;
@@ -493,6 +496,9 @@ private:
             IoQueue::Job& j = jobs[r];
             j.fd = pfds_[(size_t) g.file[r]];
             j.dfd = dfds_[(size_t) g.file[r]];
+            if (j.dfd != os::kBadFd && (size_t) g.file[r] < mdfds_.size() && mdfds_[(size_t) g.file[r]] != os::kBadFd &&
+                (mirror_rr_.fetch_add(1, std::memory_order_relaxed) & 1))
+                j.dfd = mdfds_[(size_t) g.file[r]];
             j.off = off;
             j.len = g.bytes[r];
             j.dst = dst;
@@ -573,7 +579,8 @@ private:
 
     Cfg cfg_;
     std::vector<LayerGeo> geo_;
-    std::vector<os::fd_t> dfds_, pfds_;
+    std::vector<os::fd_t> dfds_, pfds_, mdfds_;
+    std::atomic<uint64_t> mirror_rr_{0};
     size_t slot_bytes_ = 0, nmax_ = 0, nalloc_ = 0, free_hint_ = 0, arena_bytes_ = 0;
     uint8_t* arena_ = nullptr;
     size_t shrunk_ = 0;
