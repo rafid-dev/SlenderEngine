@@ -3359,7 +3359,10 @@ static void apply_fork_defaults(int argc, char** argv) {
     def("STRATA_ROUTE_TAIL_SKIP", "0");
     def("STRATA_PREFILL_CPU_SHARE_MAX", "1024");
     def("STRATA_PF_SMALL", "0");
-#if defined(_WIN32) && !defined(STRATA_USE_HIP) && !defined(STRATA_GPU_METAL)
+    // The pack defaults: NVIDIA (CUDA) builds on Windows and, since the linux-support branch, Linux. Measured on Windows; on Linux every
+    // switch below has its own code (O_DIRECT + kernel async reads for the file tier, cudaHostRegister for the pinned tier) and was
+    // checked for correct answers in WSL 2 (docs/fork/LINUX-PLAN.md). HIP and Metal keep upstream's defaults.
+#if (defined(_WIN32) || defined(__linux__)) && !defined(STRATA_USE_HIP) && !defined(STRATA_GPU_METAL)
     bool pack = false;
     double budget = 0.0;
     for (int i = 1; i + 1 < argc; ++i) {
@@ -3403,9 +3406,8 @@ static void apply_fork_defaults(int argc, char** argv) {
             def("STRATA_MTP_ROOM_HEAD", "1");
             strata::platform::g_fork_mtp_room = !by_hand;
         }
-        MEMORYSTATUSEX ms{};
-        ms.dwLength = sizeof ms;
-        if (budget > 0.0 && GlobalMemoryStatusEx(&ms) && ms.ullTotalPhys >= 28ull * 1000 * 1000 * 1000) def("STRATA_PREFILL_AUTO_MAX", "16384");
+        // total_physical_memory: GlobalMemoryStatusEx on Windows, sysconf on Linux
+        if (budget > 0.0 && strata::platform::total_physical_memory() >= 28ull * 1000 * 1000 * 1000) def("STRATA_PREFILL_AUTO_MAX", "16384");
     }
 #else
     (void) argc;

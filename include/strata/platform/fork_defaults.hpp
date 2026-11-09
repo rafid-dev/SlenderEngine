@@ -12,7 +12,7 @@ inline bool fork_defaults_on() noexcept {
     return v == nullptr || v[0] != '0';
 }
 
-/// Set by main() when the measured case applies (Windows, NVIDIA, an IQ pack: --pack): the defaults that live in code
+/// Set by main() when the measured case applies (Windows or Linux, NVIDIA, an IQ pack: --pack): the defaults that live in code
 /// rather than in a variable (the prompt path's lend cap, the stager's thread count) read this.
 inline bool g_fork_pack_defaults = false;
 
