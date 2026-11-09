@@ -2,7 +2,7 @@
 rem One-click setup of this fork: installs and builds on the first run, then tunes for a 32 GB PC and offers dual SSD streaming.
 setlocal
 set "PYTHONUTF8=1"
-title Strata fast setup
+title SlenderEngine fast setup
 cd /d "%~dp0"
 if exist "strata-iq3_s.json" goto tune
 echo.

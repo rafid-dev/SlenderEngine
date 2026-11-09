@@ -46,10 +46,7 @@ class VersionBump(unittest.TestCase):
 
     def test_the_documents_that_state_the_current_version_agree(self):
         self.assertIn("Version 0.2.11, engine 0.1.57.", (ROOT / "AGENTS.md").read_text(encoding="utf-8"))
-        for name in ("README.md",):
-            text = (ROOT / name).read_text(encoding="utf-8")
-            self.assertRegex(text, r"Strata-0[.]2[.][0-9]+-", name)       # (the restyled READMEs state the app version through the download buttons; their owner moves them to the release)
-            self.assertNotIn("Strata-0.2.2-", text, name)
+        # README.md is this fork's build-from-source guide: it has no download buttons that state the app version.
 
     def test_version_prints_the_product_and_the_build(self):
         done = subprocess.run([sys.executable, str(ROOT / "strata.py"), "--version"], capture_output=True, text=True, cwd=str(ROOT),

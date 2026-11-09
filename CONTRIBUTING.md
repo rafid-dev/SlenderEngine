@@ -1,6 +1,6 @@
 # Contributing
 
-This fork is based on [Niko1221/Strata](https://github.com/Niko1221/Strata). A problem that is also in upstream
+SlenderEngine is a fork of [Niko1221/Strata](https://github.com/Niko1221/Strata). A problem that is also in upstream
 Strata, or a change that would help every Strata user, belongs there first.
 
 **AI assistance is welcome. The contributor is responsible for understanding the change and supplying real evidence.**
@@ -10,8 +10,8 @@ You should be able to explain every changed line and answer review questions abo
 
 ## Before starting
 
-1. Search [issues](https://github.com/rafid-dev/Strata-32GB/issues) and
-   [pull requests](https://github.com/rafid-dev/Strata-32GB/pulls), including closed discussions. Add new evidence to an
+1. Search [issues](https://github.com/rafid-dev/SlenderEngine/issues) and
+   [pull requests](https://github.com/rafid-dev/SlenderEngine/pulls), including closed discussions. Add new evidence to an
    existing thread when it covers your problem.
 2. Read [AGENTS.md](AGENTS.md) and the documentation for the component you want to change.
 3. Get maintainer agreement on scope before substantial features, refactors, architecture changes, or changes to
@@ -24,7 +24,7 @@ the situation, bring it to the original discussion and let a maintainer decide w
 
 ## Report a problem people can investigate
 
-Use the matching [issue form](https://github.com/rafid-dev/Strata-32GB/issues/new/choose). A bug report should include:
+Use the matching [issue form](https://github.com/rafid-dev/SlenderEngine/issues/new/choose). A bug report should include:
 
 - The smallest steps or command that reproduce the problem, and the expected and actual behavior.
 - The commit, OS, GPU and VRAM, and relevant model, quantization, and configuration.

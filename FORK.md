@@ -1,11 +1,11 @@
-# What this fork changes
+# What SlenderEngine changes
 
 This is a fork of [Niko1221/Strata](https://github.com/Niko1221/Strata). Since 2026-11-06 it's based on upstream `v0.2.11` (engine 0.1.57); before that it was based on commit `c62d5e3` (engine 0.1.55). It makes Qwen3.8-Flash-Next IQ3_S
 generate faster on one PC by changing software only: same model, quant, context and RAM tier size.
 
 **The move to 0.2.11** is a merge of upstream `v0.2.11` into this branch, with this fork's engine commits replayed on top. The first merge left some out; they're back, all still off by default: PR #1 (`771cd474`, `effb88b9`, `382c3f11`), the engine part of `f0c9a5b3` (`STRATA_ROUTE_TAIL_SKIP_FILE`, `STRATA_PARK_TAIL_MAX`, `STRATA_TIER_*_MIB`) and `STRATA_SPEC_CUM_MIN`, which now only cuts the MTP's min-p window, never DFlash2's. With the MTP drafter, the 0.2.11 build measured the same as the 0.1.55 one (3 runs each, worklog).
 
-**See every changed line:** [compare with upstream](https://github.com/Niko1221/Strata/compare/main...rafid-dev:Strata-32GB:speed-fork).
+**See every changed line:** [compare with upstream v0.2.11](https://github.com/rafid-dev/SlenderEngine/compare/c3b3f50...speed-fork).
 **See every test, including what failed:** [docs/fork/WORKLOG.md](docs/fork/WORKLOG.md).
 **How long prompts read in fewer passes (the prompt room):** [docs/fork/PROMPT-ROOM.md](docs/fork/PROMPT-ROOM.md).
 

@@ -4,7 +4,7 @@ rem It starts the model with your settings (or uses the one already running), ta
 rem Options: --clients 4 (several requests at once), --long (a 32K prompt), --compare <older results folder>.
 rem This is the quick speed check. The standard benchmark (docs/BENCHMARK_PROTOCOL.md), whose results other people can compare with, is `strata bench run`.
 setlocal
-title Strata - benchmark
+title SlenderEngine - benchmark
 cd /d "%~dp0"
 if not exist ".venv\Scripts\python.exe" (
   echo  Strata is not set up here yet: run START-HERE.bat first.

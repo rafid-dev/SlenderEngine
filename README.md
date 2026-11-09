@@ -1,6 +1,8 @@
-# Strata for 32 GB
+# SlenderEngine
 
-Run **Qwen3.8-Flash-Next IQ3_S locally on a Windows PC with 32 GB of RAM**. This fork of [Strata](https://github.com/Niko1221/Strata) tunes how the model uses your GPU, RAM and SSD, with an optional second SSD for faster reads. The model files are unchanged.
+**Big models, lean hardware.**
+
+Run **Qwen3.8-Flash-Next IQ3_S locally on a Windows PC with 32 GB of RAM**. SlenderEngine is a speed fork of [Strata](https://github.com/Niko1221/Strata) that tunes how the model uses your GPU, RAM and SSD, with an optional second SSD for faster reads. The model files are unchanged.
 
 **Start here:** [Requirements](#what-you-need) · [Setup](#easy-setup) · [Troubleshooting](#troubleshooting) · [Measurements](docs/fork/PERFORMANCE.md)
 
@@ -25,8 +27,8 @@ This guide builds the fork from source. For AMD, Mac, Linux or the upstream desk
 Open a folder on the SSD with enough space. Right-click inside it and choose **Open in Terminal** (PowerShell), then paste:
 
 ```powershell
-git clone --branch speed-fork --single-branch https://github.com/rafid-dev/Strata-32GB.git
-cd Strata-32GB
+git clone --branch speed-fork --single-branch https://github.com/rafid-dev/SlenderEngine.git
+cd SlenderEngine
 .\FAST-SETUP.bat
 ```
 
@@ -71,7 +73,7 @@ See [performance, memory measurements and updates](docs/fork/PERFORMANCE.md) for
 | Problem | What to do |
 |---|---|
 | `git` is not recognized | Install Git for Windows, then open a new terminal. |
-| PowerShell cannot find the batch file | Make sure you are inside `Strata-32GB` and include `.\`, as in `.\FAST-SETUP.bat`. |
+| PowerShell cannot find the batch file | Make sure you are inside `SlenderEngine` and include `.\`, as in `.\FAST-SETUP.bat`. |
 | `FAST-SETUP.bat` is missing | Check `git branch --show-current`. This guide needs `speed-fork`; download it with the command above. |
 | Python could not be installed | Install [64-bit Python 3.12](https://www.python.org/downloads/windows/), enable **Add python.exe to PATH**, and rerun setup. |
 | Build tools or CUDA could not be installed | See the manual installation steps below, then rerun setup. |
@@ -139,11 +141,21 @@ Written by Qwen3.8-Flash-Next IQ3_S through OpenCode on the PC described above. 
 
 </details>
 
-## More details and credit
+## More details
 
 - [FORK.md](FORK.md): engine changes, switches and measurements.
 - [Worklog](docs/fork/WORKLOG.md): recorded tests, including failed experiments.
 - [The prompt room](docs/fork/PROMPT-ROOM.md): how long prompts read in fewer passes, and how it was found and checked.
 - [RTX 4060 8 GB laptop report](docs/fork/LAPTOP-RTX4060.md): optional switches contributed by [Gamination](https://github.com/Gamination).
 
-Built on the work of [Niko1221 and the Strata contributors](https://github.com/Niko1221/Strata). Code is [MIT licensed](LICENSE); model weights and optional components have their own licenses.
+## Credits
+
+SlenderEngine is [Strata](https://github.com/Niko1221/Strata), by Niko1221 and the Strata contributors, with speed changes for 32 GB PCs on top. The engine, the server, the setup and almost all of the code are theirs.
+
+- **Where it started.** This repository began on 2026-11-03 as a GitHub fork of Niko1221/Strata, from commit `c62d5e3` (engine 0.1.55), under the name Strata-32GB. On 2026-11-06 it moved to upstream `v0.2.11` (engine 0.1.57). It has since left GitHub's fork network and was renamed SlenderEngine; the full git history, including every upstream commit, is kept.
+- **Still Strata underneath.** The program is still `strata`, its switches are still `STRATA_*` and its config files are still `strata-*.json`, so Strata's documentation applies. [FORK.md](FORK.md) lists what this fork changes, and [compare with upstream v0.2.11](https://github.com/rafid-dev/SlenderEngine/compare/c3b3f50...speed-fork) shows every changed line.
+- **Upstream's credits** for the model, llama.cpp / ggml and the projects Strata learned from are in [docs/HOW_IT_WORKS.md](docs/HOW_IT_WORKS.md#credits).
+- **Contributors to this fork:** [Gamination](https://github.com/Gamination), the 8 GB card switches and the RTX 4060 laptop measurements.
+- **The model:** [Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next) by the Qwen team.
+
+Code is [MIT licensed](LICENSE), keeping Niko1221's copyright alongside this fork's; model weights and optional components have their own licenses. SlenderEngine is not made or endorsed by the Strata project. Problems with this fork belong in [this repository's issues](https://github.com/rafid-dev/SlenderEngine/issues), not upstream's.

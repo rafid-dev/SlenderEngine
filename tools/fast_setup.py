@@ -318,7 +318,7 @@ def set_arg(args, name, value):
 
 def launcher(cfg_path, env):
     py = HOME / ".venv" / "Scripts" / "python.exe"
-    lines = ["@echo off", "rem Written by FAST-SETUP.bat. Chat page and API: http://127.0.0.1:8080", "title Strata (32 GB tuned)"]
+    lines = ["@echo off", "rem Written by FAST-SETUP.bat. Chat page and API: http://127.0.0.1:8080", "title SlenderEngine (32 GB tuned)"]
     lines += [f'set "{k}={v}"' for k, v in env.items()]
     lines += ['set "PYTHONUTF8=1"', f'cd /d "{HOME}"', f'"{py}" "{HOME / "serve" / "server.py"}" --engine strata --config "{cfg_path}" --port 8080 --open %*', "if errorlevel 1 pause", ""]
     return "\r\n".join(lines)

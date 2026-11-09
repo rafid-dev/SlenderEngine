@@ -5,7 +5,7 @@ rem each installed model's settings and draft subset. The model files are not to
 rem START-HERE.bat. Options are passed on to setup.py. The bundled Python (python\ beside this file) is used when
 rem there is one: START-HERE.bat, which this file runs, picks it.
 setlocal
-title Strata - update
+title SlenderEngine - update
 cd /d "%~dp0"
 rem All of it in one block: cmd reads a .bat file while it runs it, and the git pull can change this very file.
 (
@@ -16,7 +16,7 @@ rem All of it in one block: cmd reads a .bat file while it runs it, and the git 
       pause
       exit /b 1
     )
-    echo  Getting the newest Strata ^(git pull^) ...
+    echo  Getting the newest SlenderEngine ^(git pull^) ...
     git pull --ff-only
     if errorlevel 1 (
       rem The history was rewritten on 2026-10-06, see #1276: a clone from before has no commit in common with origin/main.
@@ -70,8 +70,8 @@ rem All of it in one block: cmd reads a .bat file while it runs it, and the git 
       )
     )
   ) else (
-    echo  This copy of Strata was not made with git, so it cannot fetch new files itself. Download the newest one:
-    echo    https://github.com/Niko1221/Strata/archive/refs/heads/main.zip
+    echo  This copy of SlenderEngine was not made with git, so it cannot fetch new files itself. Download the newest one:
+    echo    https://github.com/rafid-dev/SlenderEngine/archive/refs/heads/speed-fork.zip
     echo  unzip it anywhere and run START-HERE.bat ^(or UPDATE.bat^) in it: it finds the model files in Strata-data
     echo  and sets itself up the same way - nothing big is downloaded again.
     echo  Checking this copy's engine and settings meanwhile ...
