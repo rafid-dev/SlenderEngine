@@ -4780,6 +4780,7 @@ class Service:
         self.keep_awake = None                        # #1727 (opt-in): serve.keepawake.KeepAwake, the config's "prevent_sleep"
         self.fifo = threading.Lock()
         self.slot_save_path = None                    # --slot-save-path: /slots/0?action=save|restore (off when None)
+        self.parker = None                            # --park-dir: disk parking (serve/park.py), off when None
         self.embeddings = threading.local()           # the current request's image embeddings file (GENI)
         self.api_key = ""                              # when set, /v1/* needs it (Bearer or x-api-key)
         # #458 (opt-in, the config's "effort_position": "end"): a non-default reasoning effort goes in a short system
@@ -4948,6 +4949,21 @@ class Service:
                 if active:
                     self.client_disconnect_cancels += 1
 
+    def _solo_acquire(self, pk, key, timeout: float) -> bool:
+        """The single turn for a request (solo engine).  Without disk parking: the plain lock, as before.  With it
+        (rules 10-11): the request that continues the held conversation goes first, then the one with the least to
+        read; past park wait_cap_s plain arrival order, and a turn left free for a second goes to whoever asks."""
+        if pk is None:
+            return self.fifo.acquire(timeout=timeout)
+        end = time.monotonic() + timeout
+        while True:
+            if pk.is_next(key) and self.fifo.acquire(timeout=0.05):
+                return True
+            rem = end - time.monotonic()
+            if rem <= 0:
+                return False
+            pk.wait(min(0.1, rem))
+
     @contextlib.contextmanager
     def _inference_fifo(self, deadline: float | None, cancel: threading.Event | None = None):
         if deadline is None:
@@ -5059,6 +5075,8 @@ class Service:
             if waiting:                                     # never reached the FIFO (an exception while waiting)
                 with self.status_lock:
                     self.status["queued"] -= 1
+        if action == "restore" and self.parker is not None:
+            self.parker.forget()
         if action == "save":
             return 200, {"id_slot": 0, "filename": filename, "n_saved": r["tokens"], "n_written": r["bytes"],
                          "timings": {"save_ms": r["ms"]}}
@@ -5692,6 +5710,7 @@ class Service:
         parked = self.conv_log.poll(getattr(self.engine, "log_path", None), getattr(self.engine, "log_start", None))
         return {"engine": engine, "live": live, "requests": hist[::-1][:None if all_requests else 12],
                 "conversation_cache": conversation_cache_view(engine, hist, totals, parked),
+                **({"park": self.parker.stats()} if self.parker is not None else {}),
                 "requests_kept": len(hist), "totals": totals, "hardware": tel["now"],
                 "hardware_static":
                 tel["static"], "history": tel["history"], "time": now}
@@ -6312,28 +6331,40 @@ class Service:
         try:
             # --batch: the engine runs several requests at once (StrataEngine.generate_batched orders them)
             turn = contextlib.ExitStack()
+            # disk parking (serve/park.py, opt-in --park-dir): one conversation at a time, cheap to switch
+            pk = self.parker if not par else None
+            park_space = getattr(cancel, "_strata_park_space", "host")
+            park_key = object()
             if not par:
                 # #1619: a request waiting for the single turn sends a keep-alive every QUEUE_BEAT_S, so a client with
                 # a stream idle timeout does not abort a healthy queued request (and its retry read the prompt again);
                 # a client that left while queued gives its place up instead of taking the turn only to cancel there
                 got = False
-                while not got:
-                    if cancel.is_set():
-                        raise QueueCancelled("the client disconnected while waiting for the engine")
-                    left = deadline - time.monotonic() if deadline is not None else QUEUE_BEAT_S
-                    if left <= 0:
-                        raise QueueWaitExpired("the inference queue wait deadline expired; retry later")
-                    got = self.fifo.acquire(timeout=min(QUEUE_BEAT_S, left))
-                    if got:
+                if pk is not None:
+                    pk.enter(park_key, ids, park_space)
+                try:
+                    while not got:
                         if cancel.is_set():
-                            self.fifo.release()
                             raise QueueCancelled("the client disconnected while waiting for the engine")
-                        if deadline is not None and time.monotonic() >= deadline:
-                            self.fifo.release()
+                        left = deadline - time.monotonic() if deadline is not None else QUEUE_BEAT_S
+                        if left <= 0:
                             raise QueueWaitExpired("the inference queue wait deadline expired; retry later")
-                        turn.callback(self.fifo.release)
-                    else:
-                        yield "ping", None
+                        got = self._solo_acquire(pk, park_key, min(QUEUE_BEAT_S, left))
+                        if got:
+                            if cancel.is_set():
+                                self.fifo.release()
+                                raise QueueCancelled("the client disconnected while waiting for the engine")
+                            if deadline is not None and time.monotonic() >= deadline:
+                                self.fifo.release()
+                                raise QueueWaitExpired("the inference queue wait deadline expired; retry later")
+                            if pk is not None:
+                                turn.callback(pk.notify)        # (runs after the release below: LIFO)
+                            turn.callback(self.fifo.release)
+                        else:
+                            yield "ping", None
+                finally:
+                    if pk is not None:
+                        pk.leave(park_key)
             with turn:
                 try:
                     with self.status_lock:
@@ -6377,6 +6408,11 @@ class Service:
                     while True:
                         segment_before = getattr(self.engine, "last", None)
                         segments_before = len(segments)     # (#879: a pass sent again leaves no segment)
+                        if pk is not None:
+                            try:
+                                pk.before(prompt, park_space, images=bool(emb), cancel=cancel)
+                            except Exception as e:  # noqa: BLE001 - parking never fails a request
+                                print(f"[strata] park: skipped for this request ({type(e).__name__}: {e})", flush=True)
                         gen = self.engine.generate(prompt, max_new - n, sampling, cancel, embeddings=emb) if emb \
                             else self.engine.generate(prompt, max_new - n, sampling, cancel)
                         recover_prompt = None
@@ -6495,6 +6531,14 @@ class Service:
                             segment_done = getattr(self.engine, "last", None)
                             if segment_done is not None and segment_done is not segment_before:
                                 segments.append(dict(segment_done))
+                            if pk is not None:
+                                try:
+                                    if nonfinite or finish == "error":
+                                        pk.forget()         # the engine dropped its state (#879) or may have ended
+                                    else:
+                                        pk.after(prompt, seg, park_space, images=bool(emb))
+                                except Exception as e:  # noqa: BLE001
+                                    print(f"[strata] park: could not note the pass ({e})", flush=True)
                         if nonfinite and not cancel.is_set():
                             # #879: the engine emitted none of the poisoned window's tokens and reads its next prompt
                             # from token 0.  Nothing sent yet: the same request once more, unseen by the client
@@ -7676,6 +7720,9 @@ def make_handler(svc: Service):
             request is HTTP/1.0 and fully read here, so no later bytes are expected - data is not a hang-up."""
             done = self.watch_done = threading.Event()
             self.cancel_event = cancel
+            # disk parking's namespace: the sandbox's gate replaces any client copy of this header with its own
+            space = str(self.headers.get("X-Strata-Park-Space") or "").strip().lower()
+            setattr(cancel, "_strata_park_space", "sandbox" if space == "sandbox" else "host")
             with svc.status_lock:
                 svc.active_cancels.add(cancel)
             sock = self.connection
@@ -8076,6 +8123,13 @@ def make_handler(svc: Service):
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
                 self.wfile.write(body)
+            elif path == "/v1/park":                      # disk parking: what is kept (sizes, ages; never text)
+                if svc.parker is None:
+                    self._json(404, {"error": {"message": "disk parking is off (start the server with --park-dir)"}})
+                else:
+                    with svc.parker.lock:
+                        files = svc.parker.store.listing()
+                    self._json(200, {"park": svc.parker.stats(), "files": files})
             elif path in ("/health", "/api/health"):
                 self._json(200, {"status": "ok", "max_context": svc.reported_ctx(), "model": svc.model,
                                  "images": svc.vision is not None, "api_key": bool(svc.api_key),
@@ -8250,6 +8304,25 @@ def make_handler(svc: Service):
                             svc.fifo.release()
                         result = "loaded"
                     self._json(200, {"status": result, **svc.v1_status()})
+                    return
+                if path in ("/v1/park/clear", "/v1/park/delete"):   # disk parking: delete kept conversations
+                    if svc.parker is None:
+                        self._json(404, {"error": {"message": "disk parking is off (start the server with --park-dir)"}})
+                        return
+                    if not self._own_page("kept conversations can be deleted"):
+                        return
+                    with svc.parker.lock:
+                        if path == "/v1/park/clear":
+                            n = svc.parker.store.clear()
+                        else:
+                            fid = str(req.get("id") or "")
+                            n = 1 if fid in svc.parker.store.files else 0
+                            svc.parker.store.drop(fid, count=False)
+                            svc.parker.store.save_index()
+                        h = svc.parker.held
+                        if h is not None and h.get("file") not in svc.parker.store.files:
+                            h["file"], h["saved_len"] = None, 0
+                    self._json(200, {"deleted": n})
                     return
                 if path == "/v1/vram":                       # #533: give VRAM back to other programs, or take it
                     if not self._own_page("the VRAM reserve can be changed"):
@@ -9941,6 +10014,10 @@ def _main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> i
     ap.add_argument("--slot-save-path", default=None, metavar="DIR",
                     help="enable POST /slots/0?action=save|restore {\"filename\": NAME} (llama-server's API): the "
                          "conversation the engine holds, to or from DIR/NAME (also \"slot_save_path\" in the config)")
+    ap.add_argument("--park-dir", default=None, metavar="DIR",
+                    help="disk parking (opt-in): conversations the engine lets go of (a subagent, a second chat, a "
+                         "restart) are kept in DIR/<model> as session files and restored instead of read again; "
+                         "also \"park_dir\" in the config.  Not with --parallel")
     ap.add_argument("--replicas", type=int, default=None, metavar="N",
                     help="data-parallel replicas (opt-in): cut the \"gpu\" list into N equal groups and run one engine on "
                          "each, requests spread over them (also \"replicas\" in the config: a number, or "
@@ -10315,6 +10392,47 @@ def _main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> i
             raise SystemExit(f"[strata] {e}")
         print(f"[strata] slot save/restore on: {svc.slot_save_path} (session files are kept until deleted: "
               "about 1.2 GB per 63K-token conversation; restore only files this server wrote)", flush=True)
+    park_dir = a.park_dir or cfg.get("park_dir")
+    if park_dir:
+        if getattr(engine, "batch", 0) or not hasattr(engine, "session_file"):
+            print("[strata] disk parking is off: it needs one request at a time and an engine with session files "
+                  "(not --parallel)", flush=True)
+        else:
+            try:
+                from serve.park import ParkStore, Parker
+
+                def num(key, default):
+                    v = cfg.get(key, default)
+                    if isinstance(v, bool) or not isinstance(v, (int, float)) or v < 0:
+                        raise ValueError(f"config {key} must be a number >= 0, not {v!r}")
+                    return float(v)
+                private = cfg.get("park_private") is True
+                store = ParkStore(park_dir if os.path.isabs(str(park_dir)) else
+                                  os.path.join(cfg.get("cwd") or os.getcwd(), str(park_dir)),
+                                  cfg.get("model_name") or svc.model,
+                                  budget_gib=num("park_budget_gib", 24), min_free_gb=num("park_min_free_gb", 50),
+                                  write_cap_gb=num("park_write_cap_gb", 200),
+                                  ttl_scale=0.5 if private else 1.0, clear_on_stop=private)
+
+                def magic_ok(path):
+                    try:
+                        with open(path, "rb") as f:
+                            return f.read(8) == b"STRSESS\x01"
+                    except OSError:
+                        return False
+                swept = store.sweep(magic_ok)
+                turn = svc.tok.encode("<|im_start|>", parse_special=True)
+                svc.parker = Parker(svc, store, idle_s=num("park_idle_s", 60),
+                                    turn_token=turn[0] if len(turn) == 1 else None)
+                svc.parker.start()
+                if not getattr(engine, "session_save_reclaim", False):
+                    print("[strata] disk parking: the engine runs without --session-save-reclaim, so a save is refused "
+                          "whenever free RAM is under its floor; add it to the config's args", flush=True)
+                print(f"[strata] disk parking on: {store.dir} ({len(store.files)} kept, {swept} removed at start; "
+                      f"budget {store.budget / 2**30:.0f} GiB{', private: half lifetimes, cleared on stop' if private else ''})",
+                      flush=True)
+            except (ValueError, OSError) as e:
+                raise SystemExit(f"[strata] disk parking: {e}")
     mode = str(cfg.get("anthropic_thinking") or "model")   # #278: "on_request" = only when the request asks
     if mode not in ("model", "on_request"):
         raise SystemExit(f"[strata] config anthropic_thinking must be \"model\" or \"on_request\", not {mode!r}")
@@ -10457,7 +10575,7 @@ def _main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> i
                 svc.wait_for_drain(5)
                 drained = False
         closers = [httpd.shutdown, getattr(engine, "close", None), vision.shutdown if vision else None,
-                   hub.close if hub is not None else None]
+                   hub.close if hub is not None else None, svc.parker.close if svc.parker is not None else None]
         try:
             for close in filter(None, closers):
                 try:
