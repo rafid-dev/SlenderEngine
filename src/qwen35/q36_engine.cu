@@ -692,6 +692,220 @@ __global__ void k_seg_gather(int8_t* const* ktab, int8_t* const* vtab, int s0, i
 // model's attention is broad, so a large exact fraction, ranked by an estimate of each page's attention mass)
 constexpr int kSpPage = 32;                         // cells a page
 constexpr int kSpPagesSeg = 4096 / kSpPage;         // pages a KV_RAM segment
+// ---- STRATA_Q36_KVR6: KVarN-6 records for the sealed far cells (KVarN, BeeLlama arXiv 2606.03458; the format of
+// junkinfer's features/kvarn6-kv-cache.md). A tile is 128 cells of one KV head of K or V. Each 128-cell x 128-channel
+// slice is balanced (row and column RMS equalised alternately, 16 rounds), then coded with 6-bit codes:
+//   K[t][c] = Ck[s][t] * (Ak[c] * x + Bk[c])      (a per-token scale, a per-channel affine code)
+//   V[t][c] = Cv[c] * (Av[s][t] * x + Bv[s][t])   (a per-channel scale, a per-token affine code)
+// A record replaces the tile's q8 values in place (208 of 272 bytes a cell): codes 128 rows x 192 B (channel c at bit
+// 6c of its row), then 2048 B of axes:
+//   K: Ak f32[256] | Bk f16[256] | Ck f16[2][128]      V: Av f16[2][128] | Bv f16[2][128] | Cv f32[256]
+constexpr int kR6Tile = 128, kR6Codes = kR6Tile * 192, kR6Bytes = kR6Codes + 2048;
+/// the tile's values region in a q8 segment (HKV heads of 4096 cells, 256 B a cell): 32 KB, the record's place
+__device__ __forceinline__ uint8_t* r6_tile(int8_t* seg, int kvh, int tile_in_seg) {
+    return (uint8_t*) seg + ((size_t) kvh * 4096 + (size_t) tile_in_seg * kR6Tile) * 256;
+}
+/// value (t, c) of a record (kind 0: K, 1: V)
+__device__ __forceinline__ float r6_value(const uint8_t* rec, int kind, int t, int c) {
+    const int bit = 6 * c;
+    const uint8_t* row = rec + (size_t) t * 192;
+    const int x = (int) (((unsigned) row[bit >> 3] | ((unsigned) row[(bit >> 3) + 1] << 8)) >> (bit & 7)) & 63;
+    const uint8_t* ax = rec + kR6Codes;
+    const int sl = c >> 7;
+    if (kind == 0) {
+        const float A = ((const float*) ax)[c];
+        const float B = __half2float(((const __half*) (ax + 1024))[c]);
+        const float C = __half2float(((const __half*) (ax + 1536))[sl * 128 + t]);
+        return C * (A * (float) x + B);
+    }
+    const float A = __half2float(((const __half*) ax)[sl * 128 + t]);
+    const float B = __half2float(((const __half*) (ax + 512))[sl * 128 + t]);
+    const float C = ((const float*) (ax + 1024))[c];
+    return C * (A * (float) x + B);
+}
+/// Seal: tiles [t0, t0 + n) (absolute tile indices, 128 cells each) of one state: each (tile, head, kind, slice) read from
+/// its q8 cells, balanced and coded into tmp (record (j, kvh, kind) at ((j * HKV + kvh) * 2 + kind) * kR6Bytes; the
+/// copy into place follows, so no workgroup reads a tile another is writing).  grid (n * HKV, 2 kinds, 2 slices),
+/// block 256.
+__global__ void __launch_bounds__(256) k_r6_seal(int8_t* const* ktab, int8_t* const* vtab, int t0, int HKV, int qb,
+                                                 uint8_t* tmp) {
+    __shared__ __half M[kR6Tile][kR6Tile + 2];   // the slice, then divided by the scales
+    __shared__ float rs[kR6Tile], cs[kR6Tile], red[256];
+    const int j = blockIdx.x / HKV, kvh = blockIdx.x % HKV, kind = blockIdx.y, sl = blockIdx.z, tid = threadIdx.x;
+    const int tile = t0 + j, seg = tile / (4096 / kR6Tile), tis = tile % (4096 / kR6Tile);
+    int8_t* sp = (kind ? vtab : ktab)[seg];
+    const uint8_t* vals = r6_tile(sp, kvh, tis);
+    const __half* scl = (const __half*) (sp + (size_t) HKV * 4096 * 256) + ((size_t) kvh * 4096 + (size_t) tis * kR6Tile) * (256 / qb);
+    for (int i = tid; i < kR6Tile * kR6Tile; i += 256) {
+        const int t = i / kR6Tile, c = i % kR6Tile, cc = sl * 128 + c;
+        M[t][c] = __float2half(__half2float(scl[t * (256 / qb) + cc / qb]) * (float) (int8_t) vals[(size_t) t * 256 + cc]);
+    }
+    if (tid < kR6Tile) { rs[tid] = 1.f; cs[tid] = 1.f; }
+    __syncthreads();
+    for (int it = 0; it < 16; ++it) {   // rows, then columns: RMS of the slice divided by the other axis' scales
+        if (tid < kR6Tile) {
+            float a = 0.f;
+            for (int c = 0; c < kR6Tile; ++c) { const float v = __half2float(M[tid][c]) / cs[c]; a += v * v; }
+            rs[tid] = fmaxf(sqrtf(a / kR6Tile), 1e-6f);
+        }
+        __syncthreads();
+        if (tid < kR6Tile) {
+            float a = 0.f;
+            for (int t = 0; t < kR6Tile; ++t) { const float v = __half2float(M[t][tid]) / rs[t]; a += v * v; }
+            cs[tid] = fmaxf(sqrtf(a / kR6Tile), 1e-6f);
+        }
+        __syncthreads();
+    }
+    uint8_t* rec = tmp + ((size_t) (j * HKV + kvh) * 2 + kind) * kR6Bytes;
+    uint8_t* ax = rec + kR6Codes;
+    // y = the slice divided by the token scale (K) or the channel scale (V); then the affine code along the other axis
+    if (kind == 0) {
+        if (tid < kR6Tile) ((__half*) (ax + 1536))[sl * 128 + tid] = __float2half(rs[tid]);
+        __syncthreads();
+        if (tid < kR6Tile) {   // a channel: lo / step over the tokens (with the scale as stored)
+            const int c = tid;
+            float lo = INFINITY, hi = -INFINITY;
+            for (int t = 0; t < kR6Tile; ++t) {
+                const float y = __half2float(M[t][c]) / __half2float(((__half*) (ax + 1536))[sl * 128 + t]);
+                lo = fminf(lo, y); hi = fmaxf(hi, y);
+            }
+            const float A = hi > lo ? (hi - lo) / 63.f : 1.f;
+            ((float*) ax)[sl * 128 + c] = A;
+            ((__half*) (ax + 1024))[sl * 128 + c] = __float2half(lo);
+        }
+    } else {
+        if (tid < kR6Tile) ((float*) (ax + 1024))[sl * 128 + tid] = cs[tid];
+        __syncthreads();
+        if (tid < kR6Tile) {   // a token: lo / step over the slice's channels
+            const int t = tid;
+            float lo = INFINITY, hi = -INFINITY;
+            for (int c = 0; c < kR6Tile; ++c) {
+                const float y = __half2float(M[t][c]) / cs[c];
+                lo = fminf(lo, y); hi = fmaxf(hi, y);
+            }
+            const float A = hi > lo ? (hi - lo) / 63.f : 1.f;
+            ((__half*) ax)[sl * 128 + t] = __float2half(A);
+            ((__half*) (ax + 512))[sl * 128 + t] = __float2half(lo);
+        }
+    }
+    __syncthreads();
+    // codes: 4 channels (24 bits, 3 bytes) a thread-step; this slice owns bytes 96 sl .. 96 sl + 95 of every row
+    (void) red;
+    for (int i = tid; i < kR6Tile * 32; i += 256) {
+        const int t = i / 32, g = i % 32;
+        unsigned bits = 0;
+        for (int k = 0; k < 4; ++k) {
+            const int c = g * 4 + k, cc = sl * 128 + c;
+            float A, B, y;
+            if (kind == 0) {
+                A = ((float*) ax)[cc];
+                B = __half2float(((__half*) (ax + 1024))[cc]);
+                y = __half2float(M[t][c]) / __half2float(((__half*) (ax + 1536))[sl * 128 + t]);
+            } else {
+                A = __half2float(((__half*) ax)[sl * 128 + t]);
+                B = __half2float(((__half*) (ax + 512))[sl * 128 + t]);
+                y = __half2float(M[t][c]) / ((float*) (ax + 1024))[cc];
+            }
+            const int x = min(63, max(0, (int) rintf((y - B) / A)));
+            bits |= (unsigned) x << (6 * k);
+        }
+        uint8_t* o = rec + (size_t) t * 192 + sl * 96 + g * 3;
+        o[0] = (uint8_t) bits; o[1] = (uint8_t) (bits >> 8); o[2] = (uint8_t) (bits >> 16);
+    }
+}
+/// The sealed records from tmp into their tiles (the q8 values region), n tiles of one state.  grid (n * HKV * 2), block 256.
+__global__ void k_r6_place(int8_t* const* ktab, int8_t* const* vtab, int t0, int HKV, const uint8_t* tmp) {
+    const int b = blockIdx.x, kind = b % 2, kvh = (b / 2) % HKV, j = b / (2 * HKV);
+    const int tile = t0 + j;
+    uint8_t* dst = r6_tile((kind ? vtab : ktab)[tile / (4096 / kR6Tile)], kvh, tile % (4096 / kR6Tile));
+    const uint4* src = (const uint4*) (tmp + ((size_t) (j * HKV + kvh) * 2 + kind) * kR6Bytes);
+    for (int i = threadIdx.x; i < kR6Bytes / 16; i += blockDim.x) ((uint4*) dst)[i] = src[i];
+}
+/// rows [r0, r0 + n) of a record (in pinned memory) and its axes into shared memory, laid out as a record with
+/// codes at sh (row r0 at row 0) and the axes at sh + kR6Codes. 16-byte loads: one PCIe round trip per wavefront.
+__device__ __forceinline__ void r6_load(const uint8_t* rec, int r0, int n, uint8_t* sh) {
+    const uint4* src = (const uint4*) (rec + (size_t) r0 * 192);
+    for (int i = threadIdx.x; i < n * 192 / 16; i += blockDim.x) ((uint4*) sh)[i] = src[i];
+    const uint4* ax = (const uint4*) (rec + kR6Codes);
+    for (int i = threadIdx.x; i < 2048 / 16; i += blockDim.x) ((uint4*) (sh + kR6Codes))[i] = ax[i];
+    __syncthreads();
+}
+/// value (t, c) of a shared-memory record loaded from row r0 (t relative to r0 for the codes, absolute for the axes)
+__device__ __forceinline__ float r6_value_sh(const uint8_t* sh, int kind, int tr, int t, int c) {
+    const int bit = 6 * c;
+    const uint8_t* row = sh + (size_t) tr * 192;
+    const int x = (int) (((unsigned) row[bit >> 3] | ((unsigned) row[(bit >> 3) + 1] << 8)) >> (bit & 7)) & 63;
+    const uint8_t* ax = sh + kR6Codes;
+    const int sl = c >> 7;
+    if (kind == 0)
+        return __half2float(((const __half*) (ax + 1536))[sl * 128 + t]) *
+               (((const float*) ax)[c] * (float) x + __half2float(((const __half*) (ax + 1024))[c]));
+    return ((const float*) (ax + 1024))[c] *
+           (__half2float(((const __half*) ax)[sl * 128 + t]) * (float) x + __half2float(((const __half*) (ax + 512))[sl * 128 + t]));
+}
+/// One cell row of a shared-memory record back to q8_0 (32-value blocks; wave32: a warp a block). 256 threads.
+__device__ __forceinline__ void r6_row_q8_sh(const uint8_t* sh, int kind, int tr, int t, int8_t* qv, __half* qs) {
+    const int c = threadIdx.x;
+    const float v = r6_value_sh(sh, kind, tr, t, c);
+    float a = fabsf(v);
+    for (int o = 16; o > 0; o >>= 1) a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, o, 32));
+    const float d = a / 127.f, id = d > 0.f ? 1.f / d : 0.f;
+    qv[c] = (int8_t) rintf(v * id);
+    if ((c & 31) == 0) qs[c >> 5] = __float2half(d);
+}
+/// One cell row (t of a sealed tile) back to q8_0 (32-value blocks; wave32: a warp a block): out values + scales.
+/// Called by 256 threads, thread c = channel.
+__device__ __forceinline__ void r6_row_q8(const uint8_t* rec, int kind, int t, int8_t* qv, __half* qs) {
+    const int c = threadIdx.x;
+    const float v = r6_value(rec, kind, t, c);
+    float a = fabsf(v);
+    for (int o = 16; o > 0; o >>= 1) a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, o, 32));
+    const float d = a / 127.f, id = d > 0.f ? 1.f / d : 0.f;
+    qv[c] = (int8_t) rintf(v * id);
+    if ((c & 31) == 0) qs[c >> 5] = __float2half(d);
+}
+/// Unseal: tiles [t0, t0 + n) of one state back to q8 cells (a reused prompt moved the position below them); the q8 rows
+/// go to tmp first (values then scales per (tile, head, kind)), then k_r6_unplace writes them.  grid (n * HKV * 2), block 256.
+__global__ void k_r6_unseal(int8_t* const* ktab, int8_t* const* vtab, int t0, int HKV, uint8_t* tmp) {
+    const int b = blockIdx.x, kind = b % 2, kvh = (b / 2) % HKV, j = b / (2 * HKV);
+    const int tile = t0 + j;
+    const uint8_t* rec = r6_tile((kind ? vtab : ktab)[tile / (4096 / kR6Tile)], kvh, tile % (4096 / kR6Tile));
+    uint8_t* o = tmp + (size_t) b * (kR6Tile * (256 + 16));
+    for (int t = 0; t < kR6Tile; ++t)
+        r6_row_q8(rec, kind, t, (int8_t*) o + (size_t) t * 256, (__half*) (o + kR6Tile * 256) + t * 8);
+}
+__global__ void k_r6_unplace(int8_t* const* ktab, int8_t* const* vtab, int t0, int HKV, const uint8_t* tmp) {
+    const int b = blockIdx.x, kind = b % 2, kvh = (b / 2) % HKV, j = b / (2 * HKV);
+    const int tile = t0 + j, seg = tile / (4096 / kR6Tile), tis = tile % (4096 / kR6Tile);
+    int8_t* sp = (kind ? vtab : ktab)[seg];
+    const uint8_t* src = tmp + (size_t) b * (kR6Tile * (256 + 16));
+    uint8_t* dv = r6_tile(sp, kvh, tis);
+    __half* dsc = (__half*) (sp + (size_t) HKV * 4096 * 256) + ((size_t) kvh * 4096 + (size_t) tis * kR6Tile) * 8;
+    for (int i = threadIdx.x; i < kR6Tile * 256 / 16; i += blockDim.x) ((uint4*) dv)[i] = ((const uint4*) src)[i];
+    for (int i = threadIdx.x; i < kR6Tile * 8; i += blockDim.x) dsc[i] = ((const __half*) (src + kR6Tile * 256))[i];
+}
+/// k_seg_gather for segments that may hold sealed tiles: q8 tiles copied, sealed ones decoded back to q8 (cells below
+/// `sealed`).  grid (32 tiles * HKV, 2 n), block 256.
+__global__ void k_seg_gather_r6(int8_t* const* ktab, int8_t* const* vtab, int s0, int n, int nwin, int HKV, int sealed,
+                                int8_t* stage, size_t segbytes) {
+    const int j = blockIdx.y % n, kind = blockIdx.y >= n;
+    const int tis = blockIdx.x / HKV, kvh = blockIdx.x % HKV;
+    int8_t* src = (kind ? vtab : ktab)[s0 + j];
+    int8_t* dst = stage + (size_t) ((kind ? nwin : 0) + j) * segbytes;
+    const int cell0 = (s0 + j) * 4096 + tis * kR6Tile;
+    uint8_t* dv = r6_tile(dst, kvh, tis);
+    __half* dsc = (__half*) (dst + (size_t) HKV * 4096 * 256) + ((size_t) kvh * 4096 + (size_t) tis * kR6Tile) * 8;
+    const uint8_t* sv = r6_tile(src, kvh, tis);
+    if (cell0 + kR6Tile <= sealed) {
+        __shared__ __align__(16) uint8_t rsh[kR6Bytes];
+        r6_load(sv, 0, kR6Tile, rsh);
+        for (int t = 0; t < kR6Tile; ++t) r6_row_q8_sh(rsh, kind, t, t, (int8_t*) dv + (size_t) t * 256, dsc + t * 8);
+    } else {
+        const __half* ssc = (const __half*) (src + (size_t) HKV * 4096 * 256) + ((size_t) kvh * 4096 + (size_t) tis * kR6Tile) * 8;
+        for (int i = threadIdx.x; i < kR6Tile * 256 / 16; i += blockDim.x) ((uint4*) dv)[i] = ((const uint4*) sv)[i];
+        for (int i = threadIdx.x; i < kR6Tile * 8; i += blockDim.x) dsc[i] = ssc[i];
+    }
+}
 /// Page statistics: the mean and the variance of each of K's 256 dims and the mean of V's over the page's 32 cells
 /// (dequantized), as f16 at stab[seg][(page_in_seg * HKV + kvh) * kSpStat + {0: K mean, 256: K var, 512: V mean} + d].
 /// Pages [pb, pb + n).  grid (n, HKV), block 256 (one thread a dim).
@@ -766,10 +980,23 @@ __global__ void k_sp_score_pf(const float* q, int H, int HKV, int R, int stride,
 /// The sparse prompt's compact block in FP16 ([HKV][P][256], P = (S + nr) * 32): slot j < S the selected page sel[kvh][j],
 /// then the nr pages from page rp (the local cells), each 32 cells dequantized from the segments.  grid (S + nr, HKV),
 /// block 256.
-__global__ void k_sp_gather_f16(KvTab kt, const int* sel, int S, int rp, int nr, int HKV, int qb, __half* k16, __half* v16) {
+__global__ void k_sp_gather_f16(KvTab kt, const int* sel, int S, int rp, int nr, int HKV, int qb, __half* k16, __half* v16,
+                                int sealed = 0) {
     const int j = blockIdx.x, kvh = blockIdx.y, d = threadIdx.x;
     const int page = j < S ? sel[(size_t) kvh * S + j] : rp + (j - S);
     const int P = (S + nr) * kSpPage;
+    if ((page + 1) * kSpPage <= sealed) {   // KVarN-6: from the tile's record
+        const int cell = page * kSpPage, tile = cell / kR6Tile, t_in = cell % kR6Tile;
+        __shared__ __align__(16) uint8_t rsh[kSpPage * 192 + 2048 + kR6Codes];
+        for (int kind = 0; kind < 2; ++kind) {
+            r6_load(r6_tile((kind ? kt.v : kt.k)[tile / (4096 / kR6Tile)], kvh, tile % (4096 / kR6Tile)), t_in, kSpPage, rsh);
+            __half* dst = kind ? v16 : k16;
+            for (int c = 0; c < kSpPage; ++c)
+                dst[((size_t) kvh * P + (size_t) j * kSpPage + c) * 256 + d] = __float2half(r6_value_sh(rsh, kind, c, t_in + c, d));
+            __syncthreads();
+        }
+        return;
+    }
     for (int c = 0; c < kSpPage; ++c) {
         __half *sk, *sv;
         const int8_t* rk = kv_row(nullptr, kt.k, kt.shift, kvh, page * kSpPage + c, HKV, 0, 256, qb, &sk);
@@ -859,10 +1086,25 @@ __global__ void k_sp_select(const float* score, int n, int S, int pb, int* sel) 
 /// The compact cache: per KV head, slots 0 .. S - 1 the selected pages (sel[kvh][j]), then the recent pages from
 /// page rp (nr of them), each 32 cells copied from the segments (values, then the scales) into a contiguous cache of
 /// cap cells (the layout k_attn_part_q8 reads with ctx = cap).  grid (S + nr, HKV), block 256.
-__global__ void k_sp_gather(KvTab kt, const int* sel, int S, int rp, int HKV, int qb, int cap, int8_t* ck, int8_t* cv) {
+__global__ void k_sp_gather(KvTab kt, const int* sel, int S, int rp, int HKV, int qb, int cap, int8_t* ck, int8_t* cv,
+                            int sealed = 0) {
     const int j = blockIdx.x, kvh = blockIdx.y, tid = threadIdx.x;
     const int page = j < S ? sel[(size_t) kvh * S + j] : rp + (j - S);
     const int nb = 256 / qb;
+    if ((page + 1) * kSpPage <= sealed) {   // KVarN-6: the page's 32 rows decoded from its tile's record
+        const int cell = page * kSpPage, tile = cell / kR6Tile, t_in = cell % kR6Tile;
+        __shared__ __align__(16) uint8_t rsh[kSpPage * 192 + 2048 + kR6Codes];   // (codes rows, the axes at kR6Codes)
+        for (int kind = 0; kind < 2; ++kind) {
+            const uint8_t* rec = r6_tile((kind ? kt.v : kt.k)[tile / (4096 / kR6Tile)], kvh, tile % (4096 / kR6Tile));
+            int8_t* dst = kind ? cv : ck;
+            r6_load(rec, t_in, kSpPage, rsh);
+            for (int c = 0; c < kSpPage; ++c)
+                r6_row_q8_sh(rsh, kind, c, t_in + c, dst + ((size_t) kvh * cap + (size_t) j * kSpPage + c) * 256,
+                             (__half*) (dst + (size_t) HKV * cap * 256) + ((size_t) kvh * cap + (size_t) j * kSpPage + c) * nb);
+            __syncthreads();
+        }
+        return;
+    }
     for (int kind = 0; kind < 2; ++kind) {
         int8_t* const* tab = kind ? kt.v : kt.k;
         int8_t* dst = kind ? cv : ck;
@@ -2315,6 +2557,12 @@ struct Engine {
         // STRATA_Q36_KVR_GATHER (default on): a GPU kernel reads the host segments through their mapped pointers with
         // 16-byte loads (6.8 GB/s on this PCIe 3.0 x8 link, tools/hip/pcie_gather_bench; the DMA copies ran at ~3-4)
         static const bool gk = [] { const char* v = std::getenv("STRATA_Q36_KVR_GATHER"); return !(v && v[0] == '0'); }();
+        if (r6_on && s1 > s0) {   // KVarN-6: sealed tiles decoded back to q8 on the way (k_seg_gather_r6)
+            k_seg_gather_r6<<<dim3(32 * (unsigned) m->g.n_head_kv, 2 * (s1 - s0)), 256, 0, st>>>(
+                d_kvtab + (li * 2) * (size_t) kvr_nseg, d_kvtab + (li * 2 + 1) * (size_t) kvr_nseg, s0, s1 - s0, kvr_nwin,
+                (int) m->g.n_head_kv, r6_sealed, kvr_stage, kvr_segbytes);
+            return;
+        }
         if (gk && s1 > s0) {
             k_seg_gather<<<dim3(64, 2 * (s1 - s0)), 256, 0, st>>>(d_kvtab + (li * 2) * (size_t) kvr_nseg,
                 d_kvtab + (li * 2 + 1) * (size_t) kvr_nseg, s0, s1 - s0, kvr_nwin, (int) (kvr_segbytes / 16), kvr_stage);
@@ -2331,6 +2579,54 @@ struct Engine {
     // attention layer: the window's cells and the most recent STRATA_Q36_SP_RECENT (4096) cells exactly, plus the
     // fraction STRATA_Q36_SP_FRAC (0.5) of the pages in between with the highest estimated attention mass (k_sp_score
     // from per-page K statistics), gathered from pinned memory into a compact cache. Prompts stay dense.
+    // ---- STRATA_Q36_KVR6=1 (opt-in, with KV_RAM and a q8_0 cache): KVarN-6 records for the far cells. Tiles of 128
+    // cells below r6_sealed (and past the window) hold records in place of their q8 values (k_r6_seal); everything that
+    // reads far cells decodes them (the gather into the staging block, the sparse gathers). Sealed at the start of a
+    // decode step and after a prompt, up to 4 cells below the position (speculative drafts never reach a record).
+    bool r6_on = false;
+    int r6_sealed = 0;                     // cells below it (from the window's end) are records, in whole tiles
+    uint8_t* r6_tmp = nullptr;
+    static constexpr int kR6Batch = 64;    // tiles a seal / unseal launch
+    int8_t* const* ktab_of(size_t li) const { return d_kvtab + (li * 2) * (size_t) kvr_nseg; }
+    int8_t* const* vtab_of(size_t li) const { return d_kvtab + (li * 2 + 1) * (size_t) kvr_nseg; }
+    /// the tiles below `limit` (cells) sealed, every attention state
+    void r6_seal_upto(int64_t limit) {
+        if (!r6_on) return;
+        if (sp_on) limit = std::min<int64_t>(limit, (int64_t) sp_built_min * kSpPage);   // (the page statistics read q8)
+        const int t_new = (int) (limit / kR6Tile);
+        int t = r6_sealed / kR6Tile;
+        const int HKV = (int) m->g.n_head_kv;
+        for (; t < t_new; t += kR6Batch) {
+            const int n = std::min(kR6Batch, t_new - t);
+            for (size_t li = 0; li < sess[0].kc.size(); ++li) {
+                if (!sess[0].kc[li]) continue;
+                k_r6_seal<<<dim3(n * HKV, 2, 2), 256, 0, st>>>(ktab_of(li), vtab_of(li), t, HKV, kv_qb(), r6_tmp);
+                k_r6_place<<<n * HKV * 2, 256, 0, st>>>(ktab_of(li), vtab_of(li), t, HKV, r6_tmp);
+            }
+        }
+        if (t_new * kR6Tile > r6_sealed) r6_sealed = t_new * kR6Tile;
+    }
+    /// the position went back to p (a reused or new prompt): the tile it falls in decoded back to q8 (its cells below p
+    /// stay readable), the boundary moved down; the tiles above are rewritten cell by cell before anything reads them
+    void r6_rewind(int64_t p) {
+        if (!r6_on || p >= r6_sealed) return;
+        const int W = kvr_nwin * KvRam::kSeg;
+        const int t = (int) (std::max<int64_t>(p, W) / kR6Tile);
+        const int HKV = (int) m->g.n_head_kv;
+        if (p % kR6Tile && (int64_t) t * kR6Tile >= W)
+            for (size_t li = 0; li < sess[0].kc.size(); ++li) {
+                if (!sess[0].kc[li]) continue;
+                k_r6_unseal<<<HKV * 2, 256, 0, st>>>(ktab_of(li), vtab_of(li), t, HKV, r6_tmp);
+                k_r6_unplace<<<HKV * 2, 256, 0, st>>>(ktab_of(li), vtab_of(li), t, HKV, r6_tmp);
+            }
+        r6_sealed = std::max(W, t * kR6Tile);
+    }
+    /// after a prompt: the page statistics, then the tiles the prompt passed sealed (KVarN-6)
+    void r6_after_prompt() {
+        if (!r6_on) return;
+        sp_build(pos);
+        r6_seal_upto(pos - 4);
+    }
     bool sp_on = false, sp_pf = false;
     float sp_frac = 0.5f, sp_pf_frac = 0.5f;
     int sp_recent = 4096, sp_maxsel = 0, sp_cap = 0;
@@ -2430,7 +2726,7 @@ struct Engine {
             sp_stats_h.assign(ns * (size_t) kvr_nseg, nullptr);
             CK(cudaMalloc(&d_sp_stab, sp_stats_h.size() * sizeof(__half*)));
             CK(cudaMemset(d_sp_stab, 0, sp_stats_h.size() * sizeof(__half*)));
-            sp_built.assign(ns, kvr_nwin * kSpPagesSeg);
+            sp_built.assign(ns, kvr_nwin * kSpPagesSeg);   // (KVarN-6 below reads sp_built_min)
             sp_built_min = kvr_nwin * kSpPagesSeg;
             sp_on = true;
             if (const char* pv = std::getenv("STRATA_Q36_SP_PREFILL"); pv && pv[0] == '1') {
@@ -2442,6 +2738,17 @@ struct Engine {
             std::fprintf(stderr, "strata-q36: STRATA_Q36_SPARSE=1: decode past the window reads the recent %d cells and %.0f%% of the "
                          "other far pages (by estimated attention mass); compact cache %.0f MiB\n", sp_recent, sp_frac * 100.0,
                          (double) kv_bytes((size_t) g.n_head_kv * sp_cap * g.head_dim) * 2 / (1 << 20));
+        }
+        if (const char* rv = std::getenv("STRATA_Q36_KVR6"); rv && rv[0] == '1' && kvr_nseg > kvr_nwin) {
+            if (kv_qb() != 32) {
+                std::fprintf(stderr, "strata-q36: STRATA_Q36_KVR6=1 needs STRATA_Q36_KV=q8_0\n");
+                std::exit(1);
+            }
+            r6_on = true;
+            r6_sealed = kvr_nwin * KvRam::kSeg;
+            CK(cudaMalloc(&r6_tmp, (size_t) kR6Batch * g.n_head_kv * 2 * std::max(kR6Bytes, kR6Tile * (256 + 16))));
+            std::fprintf(stderr, "strata-q36: STRATA_Q36_KVR6=1: far cells sealed into KVarN-6 records (208 of 272 bytes a "
+                         "cell) as the context passes them\n");
         }
         size_t n_attn = 0;
         for (size_t li = 0; li < ns; ++li) n_attn += sess[0].kc[li] ? 1 : 0;
@@ -3268,7 +3575,8 @@ struct Engine {
             const int ldp = (Pb + 7) / 8 * 8;
             const int tq = (int) std::max<int64_t>(1, std::min<int64_t>(T, (int64_t) (kAttScoreFloats / ((size_t) H * ldp))));
             if (sparse_pf && bi == 1) {
-                k_sp_gather_f16<<<dim3(sp_S + sp_nr, HKV), 256, 0, st>>>(kt, sp_sel, sp_S, sp_rp, sp_nr, HKV, kv_qb(), k16, v16);
+                k_sp_gather_f16<<<dim3(sp_S + sp_nr, HKV), 256, 0, st>>>(kt, sp_sel, sp_S, sp_rp, sp_nr, HKV, kv_qb(), k16, v16,
+                                                                         r6_on ? r6_sealed : 0);
             } else {
                 KvTab kb = kt;   // a block past the window: its host segments staged in VRAM first (see stage_copy)
                 if (b0 >= kvr_nwin * KvRam::kSeg) {
@@ -3537,7 +3845,7 @@ struct Engine {
                                     sp.n_cand, nt, H, HKV, n_chunk - 1, n_chunk, pacc, pm, pl);
                             }
                             k_sp_gather<<<dim3(sp.S + sp.nr, HKV), 256, 0, st>>>(kt, sp_sel, sp.S, sp.rp, HKV, kv_qb(), sp_cap,
-                                                                                    sp_ck, sp_cv);
+                                                                                    sp_ck, sp_cv, r6_on ? r6_sealed : 0);
                             const int cc = (p0 + t0 + nt + sp.bias + kChunkCells - 1) / kChunkCells;
                             if (kv_dot8())
                                 k_attn_part_q8<true><<<dim3(cc, nt * H), kChunkCells, 0, st>>>(q, sp_ck, sp_cv, dpos, t0, H, HKV,
@@ -3680,6 +3988,7 @@ struct Engine {
         const int nsub = (ns + T - 1) / T;
         auto rows = [&](int j) { return std::min(T, ns - j * T); };
         kvr_ensure(p0 + ns);
+        r6_rewind(p0);
         ensure_set(T);
         CK(cudaStreamSynchronize(st));   // (the pinned words are reused)
         for (int j = 0; j < nsub; ++j) hpin[16 + j] = (int32_t) (p0 + (int64_t) j * T);
@@ -3761,7 +4070,11 @@ struct Engine {
         const int N = (int) g.n_embd;
         ensure_set(T);
         kvr_ensure(p0 + T);   // KV_RAM: memory for the cells this forward writes
-        if (T <= kGemmT) sp_build(p0);   // sparse decode: the statistics of the pages completed so far
+        r6_rewind(p0);        // KVarN-6: cells below p0 readable as q8 or records, nothing sealed at or above it
+        if (T <= kGemmT) {
+            sp_build(p0);          // sparse decode: the statistics of the pages completed so far
+            r6_seal_upto(p0 - 4);  // KVarN-6: the tiles the context has passed
+        }
         const bool streamed = main_hybrid && T > hybrid_t && use_mmq;
         const auto prof_t0 = Clock::now();
         // STRATA_Q36_PROF=3: the small forwards' (decode, verify) GPU timeline split by stage, summed over the run and
@@ -3882,6 +4195,7 @@ struct Engine {
         const auto& g = m->g;
         const int N = (int) g.n_embd;
         kvr_ensure(p0 + T);
+        r6_rewind(p0);
         if (T <= kGemmT) sp_build(p0);
         ensure_set(T);
         if (main_hybrid && lhy(m->layers.size()) && T > hybrid_t && use_mmq && (!lm_active || lm_first)) {
@@ -4383,7 +4697,7 @@ struct Engine {
                 i += ns;
                 CK(cudaStreamSynchronize(st));
                 if (!on_chunk(i)) {
-                    if (m->hybrid) { rebalance(hybrid_swaps_after_prompt, false); prompt_decay(n); }
+                    if (m->hybrid) { rebalance(hybrid_swaps_after_prompt, false); prompt_decay(n); } r6_after_prompt();
                     return i;
                 }
                 continue;
@@ -4410,12 +4724,12 @@ struct Engine {
             mtab_now = nullptr;
             map_on = false;
             if (!on_chunk(i + T)) {
-                if (m->hybrid) { rebalance(hybrid_swaps_after_prompt, false); prompt_decay(n); }
+                if (m->hybrid) { rebalance(hybrid_swaps_after_prompt, false); prompt_decay(n); } r6_after_prompt();
                 return i + T;
             }
             i += T;
         }
-        if (m->hybrid) { rebalance(hybrid_swaps_after_prompt, false); prompt_decay(n); }
+        if (m->hybrid) { rebalance(hybrid_swaps_after_prompt, false); prompt_decay(n); } r6_after_prompt();
         return n;
     }
     /// STRATA_Q36_PROMPT_DECAY=1 (opt-in): after a prompt of more than a few hundred tokens, its routing counts are
