@@ -214,6 +214,18 @@ but 3x slower than the GEMMs here. rocBLAS's own solutions run the values GEMM 1
   the new kernel everywhere, short answers fell 37.0 -> 33.9). KL against the old kernel at a 20K prompt: 0.00000 on
   the first 4 forced tokens, 0.0092 over 128 (reading the same prompt in other chunk sizes gives 0.052).
 
+**Long prompts, the attention GEMMs** (opt-in, HIP, with `STRATA_Q36_ATT_F16=1`):
+
+- **`STRATA_Q36_ATT_TUNING=<table>`:** the prompt attention's two GEMMs run rocBLAS solutions from a table made on
+  the card by `tools/hip/tune_attn_rocblas` (`tools/hip/gfx1032-q36-attn-rocblas-5.8.0.efafc1c1.txt` for an RX 6600
+  with this ROCm). rocBLAS's default kernel is 1.2-8x slower than its best one at many of the engine's shapes, worst
+  past 40K cells. A solution run on a shape it cannot handle can fault the GPU, so the engine first asks rocBLAS
+  (`rocblas_gemm_flags_check_solution_index`, which runs nothing) and runs the solution only where rocBLAS says it can;
+  otherwise, or with a table made for another card or rocBLAS build, it runs the default. The tool checks every
+  solution against the default's output at ~25 shapes per bucket. RX 6600, 262K context: a 24K-token prompt 735 -> 816
+  tok/s, a 54K one 414 -> 580; decode unchanged. KL against the default kernels at a 20K prompt: 0.013 (reading the
+  same prompt in 1024-token chunks: 0.016). Remake the table after a ROCm update.
+
 Measured and not kept: `--mtp 3` (fewer steps, each 15% dearer: slower); `--draft-vocab` (now works with a Q6_K head;
 acceptance falls, no gain); pool workers 6 / 7 / 10, rebalance every 16 / 64, 4 swaps (all within noise); more slots
 from the q8_0 cache (9 -> 13 a layer: hit rate 52.5% -> 53.5%).

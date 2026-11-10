@@ -1,0 +1,40 @@
+# rocBLAS solution indices for q36_engine.cu's prompt-attention GEMMs (STRATA_Q36_ATT_F16=1); this architecture
+# and rocBLAS build only. rows: kind P_hi solution (s: scores K^T Q, v: values V P16; FP16 in / out, FP32
+# compute); a row applies to P in (the previous row's P_hi, P_hi]; `default`: rocBLAS's own pick.
+# Made by tools/hip/tune_attn_rocblas (each solution checked at ~20 shapes per bucket; called with
+# rocblas_gemm_flags_check_solution_index, so a shape a solution cannot run falls back to the default).
+STRATA_Q36_ATT_TUNING_V1 gfx1032 5.8.0.efafc1c1
+s 2048 -1086852524   # 2.06464 -> 1.32194 ms
+s 4096 default   # 1.30098 ms
+s 8192 -1086852531   # 10.1909 -> 1.27892 ms
+s 12288 -1086852524   # 1.97224 -> 1.42034 ms
+s 16384 default   # 1.4192 ms
+s 20480 default   # 1.85 ms
+s 24576 -1086852603   # 2.74244 -> 1.80022 ms
+s 28672 default   # 2.16234 ms
+s 32768 -1086852531   # 10.8537 -> 1.30156 ms
+s 36864 -1086852547   # 11.2411 -> 1.62772 ms
+s 40960 -1086852547   # 3.22092 -> 1.74824 ms
+s 45056 -1086852524   # 3.52952 -> 1.88396 ms
+s 49152 -1086852524   # 3.85166 -> 2.03068 ms
+s 53248 -1086852547   # 4.16434 -> 2.21136 ms
+s 57344 -1086852547   # 4.4895 -> 2.39702 ms
+s 61440 -1086852547   # 4.82832 -> 2.59136 ms
+s 65536 -1086852595   # 5.07474 -> 2.04972 ms
+v 2048 -1086850670   # 1.41978 -> 1.2088 ms
+v 4096 -1086850753   # 2.40398 -> 1.2737 ms
+v 8192 -1086850483   # 1.99124 -> 1.41708 ms
+v 12288 -1086850476   # 1.733 -> 0.98364 ms
+v 16384 -1086850483   # 1.80076 -> 1.47794 ms
+v 20480 -1086850481   # 1.87942 -> 1.65664 ms
+v 24576 -1086850527   # 2.28738 -> 1.6592 ms
+v 28672 default   # 1.92536 ms
+v 32768 default   # 1.73376 ms
+v 36864 default   # 1.78662 ms
+v 40960 -1086850483   # 3.43442 -> 1.87164 ms
+v 45056 -1086850483   # 3.61022 -> 2.0474 ms
+v 49152 -1086850481   # 3.638 -> 2.1845 ms
+v 53248 -1086850483   # 3.92732 -> 2.30142 ms
+v 57344 -1086850481   # 4.22458 -> 2.44076 ms
+v 61440 -1086850481   # 4.52296 -> 2.60638 ms
+v 65536 -1086850485   # 4.82478 -> 1.76022 ms

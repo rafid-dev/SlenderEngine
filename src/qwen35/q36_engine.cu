@@ -36,6 +36,10 @@
 #include <cublas_v2.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
+#if defined(__HIPCC__) && defined(STRATA_ROCBLAS_AVAILABLE)
+#define ROCBLAS_BETA_FEATURES_API
+#include <rocblas/rocblas.h>
+#endif
 
 #include <algorithm>
 #include <cctype>
@@ -56,6 +60,7 @@
 #include <memory>
 #include <mutex>
 #include <random>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <tuple>
@@ -3652,11 +3657,91 @@ struct Engine {
         static const bool on = [] { const char* v = std::getenv("STRATA_Q36_ATT_F16"); return v && v[0] == '1'; }();
         return on;
     }
-    /// The attention values GEMM (FP16 out): out [nt][H * HD] per query head of KV head kvh = V . P16. (rocBLAS's own
-    /// solutions run it 1.2-2.3x faster than its default past 8K cells - tools/hip/tune_attn_rocblas - but some of them
-    /// fault on shapes they accept, so the default stays until a checked table exists.)
+    /// STRATA_Q36_ATT_TUNING=<table> (opt-in; HIP, rocBLAS): the prompt attention's FP16-out GEMMs (STRATA_Q36_ATT_F16)
+    /// run rocBLAS solutions from a table tools/hip/tune_attn_rocblas made on this card (rows: kind P_hi solution, for
+    /// P in (the previous P_hi, P_hi]): rocBLAS's default kernel is up to 8x off its best one at some shapes. Each
+    /// (GEMM, P, nt, solution) is first asked with rocblas_gemm_flags_check_solution_index (rocBLAS answers whether that
+    /// kernel can run the shape and runs nothing; the answer is kept) and runs only where it can: run as given on a
+    /// shape it cannot handle, a solution faulted the GPU. A refused shape, a failed call, or a table made for another
+    /// card or rocBLAS build runs the default. The tool checked each solution against the default's output at ~25
+    /// shapes per bucket (relative L2 <= 5e-5, within 1 FP16 step of the largest output).  kind 0: scores, 1: values.
+    /// Returns false where the caller runs the default (cuBLAS / hipBLAS) call.
+    bool att_tuned(int kind, int P, int nt, int ldp, int H, int HD, int G, float alpha, const __half* A, const __half* B,
+                   __half* C) {
+#if defined(__HIPCC__) && defined(STRATA_ROCBLAS_AVAILABLE)
+        struct Table { std::vector<std::pair<int, int>> rows[2]; rocblas_handle rb = nullptr; bool on = false; };
+        static Table t = [] {
+            Table r;
+            const char* path = std::getenv("STRATA_Q36_ATT_TUNING");
+            if (!path || !*path) return r;
+            std::ifstream f(path);
+            char rver[128] = {0};
+            hipDeviceProp_t prop{};
+            if (!f || rocblas_get_version_string(rver, sizeof rver) != rocblas_status_success ||
+                hipGetDeviceProperties(&prop, 0) != hipSuccess) {
+                std::fprintf(stderr, "strata-q36: STRATA_Q36_ATT_TUNING: cannot read %s; default kernels\n", path);
+                return r;
+            }
+            std::string dev(prop.gcnArchName), line, arch, ver;
+            if (const auto k = dev.find(':'); k != std::string::npos) dev.resize(k);
+            bool header = false;
+            while (std::getline(f, line)) {
+                if (const auto h = line.find('#'); h != std::string::npos) line.resize(h);
+                std::istringstream in(line);
+                std::string a, b, c;
+                if (!(in >> a)) continue;
+                if (!header) {
+                    if (a != "STRATA_Q36_ATT_TUNING_V1" || !(in >> arch >> ver) || arch != dev || ver != rver) {
+                        std::fprintf(stderr, "strata-q36: STRATA_Q36_ATT_TUNING: %s was made for %s / rocBLAS %s, this is "
+                                     "%s / %s; default kernels\n", path, arch.c_str(), ver.c_str(), dev.c_str(), rver);
+                        return r;
+                    }
+                    header = true;
+                    continue;
+                }
+                if (!(in >> b >> c) || (a != "s" && a != "v")) continue;
+                r.rows[a == "v"].push_back({std::atoi(b.c_str()), c == "default" ? 0 : std::atoi(c.c_str())});
+            }
+            for (auto& v : r.rows) std::sort(v.begin(), v.end());
+            if (!header || rocblas_create_handle(&r.rb) != rocblas_status_success) return r;
+            r.on = true;
+            std::fprintf(stderr, "strata-q36: attention GEMM table %s: %zu scores rows, %zu values rows\n", path,
+                         r.rows[0].size(), r.rows[1].size());
+            return r;
+        }();
+        if (!t.on) return false;
+        const auto& rows = t.rows[kind];
+        const auto it = std::lower_bound(rows.begin(), rows.end(), std::make_pair(P, INT32_MIN));
+        if (it == rows.end() || !it->second) return false;
+        const int sol = it->second;
+        static std::map<std::tuple<int, int, int, int>, bool> can;   // (kind, P, nt, solution) -> rocBLAS's answer
+        const float zero = 0.0f;
+        const auto f16t = rocblas_datatype_f16_r;
+        rocblas_set_stream(t.rb, st);
+        auto call = [&](uint32_t flags) {
+            if (kind == 0)
+                return rocblas_gemm_strided_batched_ex(t.rb, rocblas_operation_transpose, rocblas_operation_none, P, nt, HD,
+                    &alpha, A, f16t, HD, 0, B, f16t, H * HD, HD, &zero, C, f16t, ldp, (rocblas_stride) nt * ldp, C, f16t, ldp,
+                    (rocblas_stride) nt * ldp, G, rocblas_datatype_f32_r, rocblas_gemm_algo_solution_index, sol, flags);
+            return rocblas_gemm_strided_batched_ex(t.rb, rocblas_operation_none, rocblas_operation_none, HD, nt, P, &alpha,
+                A, f16t, HD, 0, B, f16t, ldp, (rocblas_stride) nt * ldp, &zero, C, f16t, H * HD, HD, C, f16t, H * HD, HD, G,
+                rocblas_datatype_f32_r, rocblas_gemm_algo_solution_index, sol, flags);
+        };
+        const auto key = std::make_tuple(kind, P, nt, sol);
+        auto c = can.find(key);
+        if (c == can.end())
+            c = can.emplace(key, call(rocblas_gemm_flags_check_solution_index) == rocblas_status_success).first;
+        return c->second && call(0) == rocblas_status_success;
+#else
+        (void) kind; (void) P; (void) nt; (void) ldp; (void) H; (void) HD; (void) G; (void) alpha; (void) A; (void) B; (void) C;
+        return false;
+#endif
+    }
+    /// The attention values GEMM (FP16 out): out [nt][H * HD] per query head of KV head kvh = V . P16 (the table's
+    /// solution where STRATA_Q36_ATT_TUNING names one).
     void attn_values16(const __half* V, const __half* P16, __half* out, int P, int nt, int ldp, int H, int HD, int G) {
         const float one = 1.0f, zero = 0.0f;
+        if (att_tuned(1, P, nt, ldp, H, HD, G, one, V, P16, out)) return;
         if (cublasGemmStridedBatchedEx(blas, CUBLAS_OP_N, CUBLAS_OP_N, HD, nt, P, &one, V, CUDA_R_16F, HD, 0, P16, CUDA_R_16F,
                                        ldp, (long long) nt * ldp, &zero, out, CUDA_R_16F, H * HD, HD, G, CUBLAS_COMPUTE_32F,
                                        CUBLAS_GEMM_DEFAULT) != CUBLAS_STATUS_SUCCESS) {
@@ -3740,6 +3825,9 @@ struct Engine {
                 for (int t0 = 0; t0 < T; t0 += tq) {
                     const int nt = std::min(tq, T - t0);
                     for (int kvh = 0; kvh < HKV; ++kvh) {
+                        if (att_tuned(0, Pb, nt, ldp, H, HD, G, scale, k16 + (size_t) kvh * kv_head,
+                                      q16 + ((size_t) t0 * H + kvh * G) * HD, att_p16 + (size_t) kvh * G * nt * ldp))
+                            continue;
                         if (cublasGemmStridedBatchedEx(blas, CUBLAS_OP_T, CUBLAS_OP_N, Pb, nt, HD, &scale, k16 + (size_t) kvh * kv_head,
                                 CUDA_R_16F, HD, 0, q16 + ((size_t) t0 * H + kvh * G) * HD, CUDA_R_16F, H * HD, HD, &zero,
                                 att_p16 + (size_t) kvh * G * nt * ldp, CUDA_R_16F, ldp, (long long) nt * ldp, G,
@@ -3910,6 +3998,9 @@ struct Engine {
                     for (int t0 = 0; t0 < T; t0 += tq) {
                         const int nt = std::min(tq, T - t0);
                         for (int kvh = 0; kvh < HKV; ++kvh) {
+                            if (att_tuned(0, P, nt, ldp, H, HD, G, sc, kbase + (size_t) kvh * kv_head,
+                                          q16 + ((size_t) t0 * H + kvh * G) * HD, att_p16 + (size_t) kvh * G * nt * ldp))
+                                continue;
                             if (cublasGemmStridedBatchedEx(blas, CUBLAS_OP_T, CUBLAS_OP_N, P, nt, HD, &sc, kbase + (size_t) kvh * kv_head,
                                     CUDA_R_16F, HD, 0, q16 + ((size_t) t0 * H + kvh * G) * HD, CUDA_R_16F, H * HD, HD, &zero,
                                     att_p16 + (size_t) kvh * G * nt * ldp, CUDA_R_16F, ldp, (long long) nt * ldp, G,
