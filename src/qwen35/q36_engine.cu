@@ -523,6 +523,143 @@ __global__ void k_attn_part_q8(const float* q, const int8_t* kc, const int8_t* v
         pl[o] = l;
     }
 }
+/// STRATA_Q36_ATT_GQA=1 (opt-in): k_attn_part_q8<true> with one block per (chunk, KV head) instead of per (chunk,
+/// query row). The query heads sharing a KV head (8) times the rows (verify windows: 3) re-read the same K / V in the
+/// old grid; here each cell is read once: its K row stays in registers (thread = cell) and is scored against all the
+/// rows with int8 dot products (the queries as int8 blocks in shared memory, amax / 127 as the old kernel), then each
+/// V row is read once for all of them (4 channels a thread, 8 rows a pass, the 4 channel groups summed in shared
+/// memory). The same partials (pacc / pm / pl, the same slots), sums in another order. Rows in groups of kGqaR.
+/// The old kernel was bound by its shared-memory reads more than by the re-reads (they mostly hit the Infinity
+/// Cache), hence dp4a and the wider value loop. RX 6600, 54K prompt: decode 22.7 -> 26.1 tok/s (attention ~38 -> ~28
+/// ms a step); 4K-14K even; below STRATA_Q36_ATT_GQA_MIN chunks the old grid (too few blocks). Wider value rows
+/// (8 channels x 8 rows) ran out of registers: a launch failure that left the GPU runtime wedged until a reboot.
+/// grid (chunks, HKV), block 256.
+constexpr int kGqaR = 16;   // query rows scored at once (16: ~28 KB of shared memory, two blocks a CU) (the probabilities of all of them stay in shared memory)
+__global__ void __launch_bounds__(256) k_attn_part_q8g(const float* q, const int8_t* kc, const int8_t* vc, const int32_t* pos0,
+        int t0, int nt, int H, int HKV, int ctx, float scale, int n_chunk, float* pacc, float* pm, float* pl, int qb,
+        KvTab kt, int c_base, int npos_bias, int slot_base) {
+    constexpr int HD = 256;
+    __shared__ __align__(16) int8_t qs[kGqaR][HD];
+    __shared__ float qd[kGqaR][8];
+    __shared__ __align__(16) float S[kGqaR][kChunkCells];
+    __shared__ float rm[kGqaR], rl[kGqaR];
+    __shared__ float red[8][HD];
+    const int c = blockIdx.x + c_base, kvh = blockIdx.y, tid = threadIdx.x, lane = tid & 31, w = tid >> 5;
+    const int G = H / HKV, R = nt * G;
+    const int cabs = c * kChunkCells;                       // the chunk's first cell (compact index with a bias)
+    const int npos_last = *pos0 + t0 + nt + npos_bias;      // the last row sees cells [0, npos_last)
+    if (cabs >= npos_last) return;
+    const int nmax = min(kChunkCells, npos_last - cabs);    // cells any row of this block sees
+    int p0 = cabs;
+    if (kt.k) {
+        const int seg = 1 << kt.shift;
+        kc = kt.k[p0 >> kt.shift];
+        vc = kt.v[p0 >> kt.shift];
+        ctx = seg;
+        p0 &= seg - 1;
+    }
+    const int nb = HD / qb;
+    const __half* ks = (const __half*) (kc + (size_t) HKV * ctx * HD);
+    const __half* vs = (const __half*) (vc + (size_t) HKV * ctx * HD);
+    const size_t cell0 = (size_t) kvh * ctx + p0;
+    // this thread's cell: its K row (64 words) and its 8 block scales, in registers
+    int kr[64];
+    float kd[8];
+    if (tid < nmax) {
+        const int4* src = (const int4*) (kc + (cell0 + tid) * HD);
+        for (int i = 0; i < 16; ++i) {
+            const int4 v = src[i];
+            kr[i * 4] = v.x; kr[i * 4 + 1] = v.y; kr[i * 4 + 2] = v.z; kr[i * 4 + 3] = v.w;
+        }
+        for (int b = 0; b < 8; ++b) kd[b] = __half2float(ks[(cell0 + tid) * nb + b * 32 / qb]);
+    }
+    for (int r0 = 0; r0 < R; r0 += kGqaR) {
+        const int rn = min(kGqaR, R - r0);
+        // the queries as int8 blocks of 32 (a warp a row, a lane 8 values, 4 lanes a block), as k_attn_part_q8
+        for (int r = w; r < rn; r += 8) {
+            const int rr = r0 + r, t = t0 + rr / G, h = kvh * G + rr % G;
+            const float* qp = q + ((size_t) t * H + h) * HD + lane * 8;
+            float qv[8], amax = 0.f;
+            for (int i = 0; i < 8; ++i) { qv[i] = qp[i]; amax = fmaxf(amax, fabsf(qv[i])); }
+            amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 1, 32));
+            amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 2, 32));
+            const float dq = amax / 127.f, id = dq != 0.f ? 1.f / dq : 0.f;
+            for (int i = 0; i < 8; ++i) qs[r][lane * 8 + i] = (int8_t) roundf(qv[i] * id);
+            if ((lane & 3) == 0) qd[r][lane >> 2] = dq;
+        }
+        __syncthreads();
+        // scores: thread = cell; the query words 16 bytes a shared read
+        for (int r = 0; r < rn; ++r) {
+            const int t = t0 + (r0 + r) / G;
+            float a = -INFINITY;
+            if (tid < nmax && cabs + tid < *pos0 + t + 1 + npos_bias) {
+                const int4* qw = (const int4*) qs[r];
+                float sacc = 0.f;
+                for (int b = 0; b < 8; ++b) {
+                    const int4 x = qw[b * 2], y = qw[b * 2 + 1];
+                    int dot = __dp4a(kr[b * 8], x.x, 0);
+                    dot = __dp4a(kr[b * 8 + 1], x.y, dot); dot = __dp4a(kr[b * 8 + 2], x.z, dot);
+                    dot = __dp4a(kr[b * 8 + 3], x.w, dot); dot = __dp4a(kr[b * 8 + 4], y.x, dot);
+                    dot = __dp4a(kr[b * 8 + 5], y.y, dot); dot = __dp4a(kr[b * 8 + 6], y.z, dot);
+                    dot = __dp4a(kr[b * 8 + 7], y.w, dot);
+                    sacc += (float) dot * qd[r][b] * kd[b];
+                }
+                a = sacc * scale;
+            }
+            S[r][tid] = a;
+        }
+        __syncthreads();
+        // the rows' max and sum (a warp a row), S becomes the unnormalized probabilities
+        for (int r = w; r < rn; r += 8) {
+            float mx = -INFINITY;
+            for (int i = lane; i < kChunkCells; i += 32) mx = fmaxf(mx, S[r][i]);
+            for (int o = 16; o > 0; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, o, 32));
+            float l = 0.f;
+            for (int i = lane; i < kChunkCells; i += 32) {
+                const float e = S[r][i] == -INFINITY ? 0.f : expf(S[r][i] - mx);
+                S[r][i] = e;
+                l += e;
+            }
+            for (int o = 16; o > 0; o >>= 1) l += __shfl_xor_sync(0xffffffffu, l, o, 32);
+            if (lane == 0) { rm[r] = mx; rl[r] = l; }
+        }
+        __syncthreads();
+        // values, 8 rows a pass: a thread 4 channels (one 32-bit load a cell) x a quarter of the cells, every
+        // probability read used for 4 products; the quarters summed in shared memory
+        const int cq = tid & 63, cg = tid >> 6;
+        const int k_lo = cg * 64, k_hi = min(nmax, k_lo + 64);
+        for (int pr = 0; pr < rn; pr += 8) {
+            const int pn = min(8, rn - pr);
+            for (int i = tid; i < 8 * HD; i += 256) red[i / HD][i % HD] = 0.f;
+            __syncthreads();
+            float acc[8][4];
+            for (int r = 0; r < 8; ++r) acc[r][0] = acc[r][1] = acc[r][2] = acc[r][3] = 0.f;
+            for (int k = k_lo; k < k_hi; ++k) {
+                const unsigned vq = *(const unsigned*) (vc + (cell0 + k) * HD + 4 * cq);
+                const float sc = __half2float(vs[(cell0 + k) * nb + 4 * cq / qb]);
+                const float v0 = (float) (int8_t) vq * sc, v1 = (float) (int8_t) (vq >> 8) * sc;
+                const float v2 = (float) (int8_t) (vq >> 16) * sc, v3 = (float) (int8_t) (vq >> 24) * sc;
+#pragma unroll
+                for (int r = 0; r < 8; ++r) {
+                    if (r < pn) {
+                        const float pk = S[pr + r][k];
+                        acc[r][0] += pk * v0; acc[r][1] += pk * v1; acc[r][2] += pk * v2; acc[r][3] += pk * v3;
+                    }
+                }
+            }
+            for (int r = 0; r < pn; ++r)
+                for (int i = 0; i < 4; ++i) atomicAdd(&red[r][4 * cq + i], acc[r][i]);
+            __syncthreads();
+            for (int r = 0; r < pn; ++r) {
+                const int rr = r0 + pr + r, orow = (rr / G) * H + kvh * G + rr % G;
+                const size_t o = (size_t) orow * n_chunk + slot_base + c;
+                pacc[o * HD + tid] = red[r][tid];
+                if (tid == 0) { pm[o] = rm[pr + r]; pl[o] = rl[pr + r]; }
+            }
+            __syncthreads();
+        }
+    }
+}
 /// The chunks merged, times sigmoid(gate): grid (n_rows), block HD.
 __global__ void k_attn_merge(const float* pacc, const float* pm, const float* pl, const float* gate,
                              const int32_t* pos0, int t0, int H, int n_chunk, float* out, RowSel rs,
@@ -3500,6 +3637,17 @@ struct Engine {
     }
     /// STRATA_Q36_ATT_F16=1 (opt-in): the prompt attention's two GEMMs write FP16 (FP32 compute): rocBLAS's tuned kernel
     /// family on RDNA2 (FP16 in, FP32 out ran at ~3.3 TFLOPS there, FP16 out at ~9-13)
+    /// STRATA_Q36_ATT_GQA=1 (opt-in): decode attention reads each cell once per KV head (k_attn_part_q8g)
+    static bool gqa_on() {
+        static const bool on = [] { const char* v = std::getenv("STRATA_Q36_ATT_GQA"); return v && v[0] == '1'; }();
+        return on;
+    }
+    /// STRATA_Q36_ATT_GQA_MIN (chunks of 256 cells, default 16): below it the old grid - (chunks x HKV) blocks leave
+    /// most of the GPU idle at short contexts (1-3 chunks: 2-6 blocks on 28 CUs; 37.0 -> 33.9 t/s on short answers)
+    static int gqa_min() {
+        static const int n = [] { const char* v = std::getenv("STRATA_Q36_ATT_GQA_MIN"); return v ? std::atoi(v) : 16; }();
+        return n;
+    }
     static bool att16_on() {
         static const bool on = [] { const char* v = std::getenv("STRATA_Q36_ATT_F16"); return v && v[0] == '1'; }();
         return on;
@@ -3822,8 +3970,15 @@ struct Engine {
                         const int8_t* kq = rows_mode ? nullptr : (const int8_t*) kc[li];
                         const int8_t* vq = rows_mode ? nullptr : (const int8_t*) vc[li];
                         const KvTab kt = rows_mode ? KvTab() : kvtab(li);
+                        // the KV-head-shared kernel: eager steps with enough chunks (graph mode: the grid is fixed)
+                        const bool gqa_use = gqa_on() && kv_dot8() && !rows_mode && !graph_mode && nc >= gqa_min();
                         auto part = [&](const KvTab& tb, int c0, int c1) {   // chunks [c0, c1)
                             if (c1 <= c0) return;
+                            if (gqa_use) {
+                                k_attn_part_q8g<<<dim3(c1 - c0, HKV), 256, 0, st>>>(q, kq, vq, dpos, t0, nt, H, HKV, ctx,
+                                    1.0f / sqrtf((float) HD), n_chunk, pacc, pm, pl, kv_qb(), tb, c0, 0, 0);
+                                return;
+                            }
                             if (kv_dot8())
                                 k_attn_part_q8<true><<<dim3(c1 - c0, nt * H), kChunkCells, 0, st>>>(q, kq, vq, dpos, t0, H, HKV,
                                     ctx, 1.0f / sqrtf((float) HD), n_chunk, pacc, pm, pl, rs, kv_qb(), tb, c0);
@@ -3847,7 +4002,10 @@ struct Engine {
                             k_sp_gather<<<dim3(sp.S + sp.nr, HKV), 256, 0, st>>>(kt, sp_sel, sp.S, sp.rp, HKV, kv_qb(), sp_cap,
                                                                                     sp_ck, sp_cv, r6_on ? r6_sealed : 0);
                             const int cc = (p0 + t0 + nt + sp.bias + kChunkCells - 1) / kChunkCells;
-                            if (kv_dot8())
+                            if (gqa_use)
+                                k_attn_part_q8g<<<dim3(cc, HKV), 256, 0, st>>>(q, sp_ck, sp_cv, dpos, t0, nt, H, HKV, sp_cap,
+                                    1.0f / sqrtf((float) HD), n_chunk, pacc, pm, pl, kv_qb(), KvTab(), 0, sp.bias, win_c);
+                            else if (kv_dot8())
                                 k_attn_part_q8<true><<<dim3(cc, nt * H), kChunkCells, 0, st>>>(q, sp_ck, sp_cv, dpos, t0, H, HKV,
                                     sp_cap, 1.0f / sqrtf((float) HD), n_chunk, pacc, pm, pl, rs, kv_qb(), KvTab(), 0, sp.bias, win_c);
                             else
@@ -3875,10 +4033,12 @@ struct Engine {
                         k_attn_part<float><<<dim3(nc, nt * H), kChunkCells, 0, st>>>(q, rows_mode ? nullptr : kc[li],
                             rows_mode ? nullptr : vc[li], dpos, t0, H, HKV, ctx, 1.0f / sqrtf((float) HD), n_chunk, pacc, pm,
                             pl, rs);
+                    pmark("attention: decode partials");
                     k_attn_merge<<<nt * H, HD, 0, st>>>(pacc, pm, pl, gate, dpos, t0, H, n_chunk, att, rs, m_win, m_bias,
                                                         m_win >= 0 && sp_lm ? n_chunk - 1 : -1);
                 }
             }
+            pmark("attention: merge (decode) / prompt attention");
             mm(L.wo, att, y, T);
         }
         pmark(L.attn ? "attention layer: projections + attention" : "delta-net layer: projections + recurrence");

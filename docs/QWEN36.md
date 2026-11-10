@@ -204,6 +204,16 @@ on short questions and 30.7 -> 30.0 after the prompt. A fused flash-attention ke
 but 3x slower than the GEMMs here. rocBLAS's own solutions run the values GEMM 1.2-2.3x faster than its default past
 8K cells, but one of them faulted the GPU on a shape it accepted; they need a table checked at every engine shape first.
 
+**Long-context decode** (opt-in, measured on the same PC, 262K context, `STRATA_Q36_KV_WINDOW=65536`):
+
+- **`STRATA_Q36_ATT_GQA=1`:** the decode attention reads each KV cell once for the 8 query heads that share it (and
+  for every row of a verify window), instead of once per head and row. A thread holds one cell's K row and scores it
+  against all the rows with int8 dot products; each V row is then read once for all of them. Decode after a 54K-token
+  prompt: 22.7 -> 26.1 tok/s (greedy, `--mtp 2`, 2 runs each). Even at 3K-14K. Below `STRATA_Q36_ATT_GQA_MIN`
+  chunks of 256 cells (16) the old kernel runs, because a short context gives too few blocks to fill the GPU (with
+  the new kernel everywhere, short answers fell 37.0 -> 33.9). KL against the old kernel at a 20K prompt: 0.00000 on
+  the first 4 forced tokens, 0.0092 over 128 (reading the same prompt in other chunk sizes gives 0.052).
+
 Measured and not kept: `--mtp 3` (fewer steps, each 15% dearer: slower); `--draft-vocab` (now works with a Q6_K head;
 acceptance falls, no gain); pool workers 6 / 7 / 10, rebalance every 16 / 64, 4 swaps (all within noise); more slots
 from the q8_0 cache (9 -> 13 a layer: hit rate 52.5% -> 53.5%).
