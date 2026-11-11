@@ -60,7 +60,7 @@
   function colors() {
     if (ink) return ink;
     const cs = getComputedStyle(document.documentElement);
-    ink = {accent: cs.getPropertyValue("--accent").trim() || "#8e97f2", warn: cs.getPropertyValue("--warn").trim() || "#f4c97c",
+    ink = {accent: cs.getPropertyValue("--chart").trim() || "#7ab7ff", warn: cs.getPropertyValue("--warn").trim() || "#f4c97c",
            line: cs.getPropertyValue("--line").trim() || "#252948"};
     return ink;
   }
@@ -228,6 +228,8 @@
   }
   function start() { if (!timer) poll(); }
   function stop() { if (timer) { clearTimeout(timer); timer = 0; } }
+  // a new theme: read its chart colour again and redraw every graph on the next reading
+  document.addEventListener("slender:theme", () => { ink = null; for (const c of cards.values()) c.stamp = ""; });
   document.addEventListener("slender:tab", (e) => { open = e.detail === "analytics"; if (open) start(); else stop(); });
   document.addEventListener("visibilitychange", () => { if (open && !document.hidden) start(); else stop(); });
 })();

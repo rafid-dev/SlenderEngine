@@ -23,7 +23,7 @@ const ls = {
 // ------------------------------------------------------------------ settings
 const DEFAULTS = {system: "", effort: "high", enterSends: true, card: true, temperature: 1.0, top_p: 0.95, top_k: 20,
                   max: "", seed: "", mcp: true, typing: true, thinkOpen: true, math: true, search: false,
-                  autoCompact: true, compactAt: 80};
+                  autoCompact: true, compactAt: 80, theme: "black", font: "system", corners: "soft", textSize: "normal"};
 let settings = {...DEFAULTS, ...ls.get("settings", {})};
 const saveSettings = () => ls.set("settings", settings);
 // the classic page's key is taken over once, so a server with a key keeps working after the switch
@@ -1169,7 +1169,39 @@ function setSwitch(id, on) { $(id).setAttribute("aria-checked", String(!!on)); }
 function bindSwitch(id, key, after) {
   $(id).onclick = () => { settings[key] = !settings[key]; setSwitch(id, settings[key]); saveSettings(); if (after) after(); };
 }
+// ------------------------------------------------------------------ appearance: theme, font, corners, text size
+// (index.html applies the saved look before the first paint; this keeps it in step with the settings)
+const lightScheme = matchMedia("(prefers-color-scheme: light)");
+function applyAppearance() {
+  const d = document.documentElement;
+  const theme = settings.theme === "system" ? (lightScheme.matches ? "light" : "black") : settings.theme;
+  const changed = d.dataset.theme !== theme;
+  d.dataset.theme = theme;
+  d.dataset.font = settings.font;
+  d.dataset.corners = settings.corners;
+  d.dataset.size = settings.textSize;
+  if (changed) document.dispatchEvent(new CustomEvent("slender:theme", {detail: theme}));
+}
+lightScheme.addEventListener("change", () => { if (settings.theme === "system") applyAppearance(); });
+function markChoice(id, value) {
+  for (const b of $(id).querySelectorAll("[data-v]")) b.setAttribute("aria-checked", String(b.dataset.v === value));
+}
+function bindChoice(id, key) {
+  $(id).addEventListener("click", (e) => {
+    const b = e.target.closest("[data-v]");
+    if (!b) return;
+    settings[key] = b.dataset.v; saveSettings(); markChoice(id, settings[key]); applyAppearance();
+  });
+}
+bindChoice("s-theme", "theme");
+bindChoice("s-font", "font");
+bindChoice("s-corners", "corners");
+bindChoice("s-size", "textSize");
 function fillSettings() {
+  markChoice("s-theme", settings.theme);
+  markChoice("s-font", settings.font);
+  markChoice("s-corners", settings.corners);
+  markChoice("s-size", settings.textSize);
   $("s-system").value = settings.system;
   setSwitch("s-enter", settings.enterSends);
   setSwitch("s-card", settings.card);
@@ -1334,6 +1366,7 @@ document.addEventListener("keydown", (e) => {
 // ------------------------------------------------------------------ start
 async function start() {
   SlenderIcons.fill();
+  applyAppearance();
   if (ls.get("sideCollapsed", false)) $("app").classList.add("side-collapsed");
   renderEffort();
   await store.start();

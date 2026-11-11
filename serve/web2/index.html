@@ -1,9 +1,21 @@
 <!doctype html>
-<html lang="en" data-theme="dark">
+<html lang="en" data-theme="black" data-font="system" data-corners="soft" data-size="normal">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<meta name="color-scheme" content="dark">
+<meta name="color-scheme" content="dark light">
+<script>
+// the saved look, before the first paint (no flash of another theme); app.js keeps it in step afterwards
+(function () {
+  try {
+    var s = JSON.parse(localStorage.getItem("slender.settings") || "{}"), d = document.documentElement;
+    var t = s.theme || "black";
+    if (t === "system") t = matchMedia("(prefers-color-scheme: light)").matches ? "light" : "black";
+    d.dataset.theme = t; d.dataset.font = s.font || "system";
+    d.dataset.corners = s.corners || "soft"; d.dataset.size = s.textSize || "normal";
+  } catch (e) { /* storage blocked: the defaults in the tag stay */ }
+})();
+</script>
 <title>SlenderEngine</title>
 <link rel="icon" href="web2/favicon.svg" type="image/svg+xml">
 <link rel="stylesheet" href="web2/app.css">
@@ -139,6 +151,7 @@
     <div class="settings__body">
       <nav class="settings__nav" id="settings-nav" role="tablist" aria-label="Settings sections">
         <button type="button" role="tab" data-pane="general" aria-selected="true"><span data-icon="settings"></span>General</button>
+        <button type="button" role="tab" data-pane="appearance" aria-selected="false"><span data-icon="palette"></span>Appearance</button>
         <button type="button" role="tab" data-pane="model" aria-selected="false"><span data-icon="sliders"></span>Model</button>
         <button type="button" role="tab" data-pane="search" aria-selected="false"><span data-icon="globe"></span>Search</button>
         <button type="button" role="tab" data-pane="context" aria-selected="false"><span data-icon="layers"></span>Context</button>
@@ -156,6 +169,41 @@
           <div class="row-toggle">
             <span><b>Send with Enter</b><small>Shift+Enter makes a new line. Off: Ctrl+Enter sends.</small></span>
             <button type="button" class="switch" id="s-enter" role="switch" aria-checked="true" aria-label="Send with Enter"></button>
+          </div>
+        </section>
+
+        <section class="pane" data-pane="appearance" hidden>
+          <div class="field">
+            <span class="field__label">Theme</span>
+            <div class="choice-grid" id="s-theme" role="radiogroup" aria-label="Theme">
+              <button type="button" role="radio" data-v="black"><span class="swatch" style="--a:#000;--b:#171717;--c:#ececec"></span><span>Black</span></button>
+              <button type="button" role="radio" data-v="graphite"><span class="swatch" style="--a:#212121;--b:#303030;--c:#ececec"></span><span>Graphite</span></button>
+              <button type="button" role="radio" data-v="periwinkle"><span class="swatch" style="--a:#0c0d18;--b:#1c1f3d;--c:#8e97f2"></span><span>Periwinkle</span></button>
+              <button type="button" role="radio" data-v="light"><span class="swatch" style="--a:#fff;--b:#ececec;--c:#0d0d0d"></span><span>Light</span></button>
+              <button type="button" role="radio" data-v="system"><span class="swatch swatch--split" style="--a:#000;--b:#fff;--c:#7ab7ff"></span><span>Match system</span></button>
+            </div>
+          </div>
+          <div class="field">
+            <span class="field__label">Font</span>
+            <div class="font-list" id="s-font" role="radiogroup" aria-label="Font">
+              <button type="button" role="radio" data-v="system" style="font-family:'Segoe UI Variable Text','Segoe UI',ui-sans-serif,system-ui,sans-serif"><b>System</b><small>Segoe UI on Windows, San Francisco on a Mac. Clean and familiar.</small></button>
+              <button type="button" role="radio" data-v="roboto" style="font-family:Roboto,'Segoe UI',sans-serif"><b>Roboto</b><small>Even and compact, easy on long answers.</small></button>
+              <button type="button" role="radio" data-v="arial" style="font-family:Arial,Helvetica,sans-serif"><b>Arial</b><small>The classic neutral sans-serif.</small></button>
+              <button type="button" role="radio" data-v="outfit" style="font-family:Outfit,sans-serif"><b>Outfit</b><small>Round and friendly; the earlier look.</small></button>
+              <button type="button" role="radio" data-v="georgia" style="font-family:Georgia,serif"><b>Georgia</b><small>A serif for reading long texts.</small></button>
+              <button type="button" role="radio" data-v="mono" style="font-family:'Cascadia Code',Consolas,monospace"><b>Monospace</b><small>Every letter the same width, like a terminal.</small></button>
+            </div>
+            <span class="field__note">Fonts come from this PC (Outfit comes with the app); one that is missing falls back to the system font.</span>
+          </div>
+          <div class="field-pair">
+            <div class="field"><span class="field__label">Corners</span>
+              <div class="seg" id="s-corners" role="radiogroup" aria-label="Corners">
+                <button type="button" role="radio" data-v="sharp">Sharp</button><button type="button" role="radio" data-v="soft">Soft</button><button type="button" role="radio" data-v="round">Round</button>
+              </div></div>
+            <div class="field"><span class="field__label">Text size in chats</span>
+              <div class="seg" id="s-size" role="radiogroup" aria-label="Text size in chats">
+                <button type="button" role="radio" data-v="small">Small</button><button type="button" role="radio" data-v="normal">Normal</button><button type="button" role="radio" data-v="large">Large</button>
+              </div></div>
           </div>
         </section>
 
