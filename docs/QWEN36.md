@@ -226,6 +226,14 @@ but 3x slower than the GEMMs here. rocBLAS's own solutions run the values GEMM 1
   tok/s, a 54K one 414 -> 580; decode unchanged. KL against the default kernels at a 20K prompt: 0.013 (reading the
   same prompt in 1024-token chunks: 0.016). Remake the table after a ROCm update.
 
+- **`STRATA_Q36_ATT_FAST=1`** (opt-in, with `STRATA_Q36_ATT_F16=1`): each query slice's attention GEMMs and softmax
+  cover only the cells its last row can see, and the softmax runs in two vectorized passes instead of three (also in
+  the blocked path past the VRAM window). RX 6600, 262K context: a 24K-token prompt 818 -> 851 tok/s, a 150K one
+  355 -> 378; decode unchanged. KL against the plain path 0.028 (24K-path test) and 0.031 (blocked path), below the
+  chunk-size floor (0.084 / 0.033).
+- `STRATA_Q36_GDN_CHUNK=1` (opt-in, not faster yet): the prompt's delta rule in blocks of 64 tokens; correct (KL at
+  the chunk-size floor) but 402 + 603 ms against 962 ms for the token walk per 8K tokens. A starting point.
+
 Measured and not kept: `--mtp 3` (fewer steps, each 15% dearer: slower); `--draft-vocab` (now works with a Q6_K head;
 acceptance falls, no gain); pool workers 6 / 7 / 10, rebalance every 16 / 64, 4 swaps (all within noise); more slots
 from the q8_0 cache (9 -> 13 a layer: hit rate 52.5% -> 53.5%).
