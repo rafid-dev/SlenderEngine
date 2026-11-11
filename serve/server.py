@@ -4840,6 +4840,7 @@ class Service:
         self.status_lock = threading.Lock()
         self.admission_changed = threading.Condition(self.status_lock)
         self.mcp = None                                  # serve/mcp.py's McpHub when MCP servers are configured
+        self.builtins = None                             # serve/builtin_tools.py: web search, web pages, attached files
         self.offline = False                             # no image URL fetch or MCP subprocess in strict local mode
         self.telemetry_key = ""                         # optional read-only key, valid only on /v1/telemetry
         # sharing the GPU with other programs (all off by default): unload the engine after this many idle seconds,
@@ -5656,9 +5657,22 @@ class Service:
                     | {"wallclock_s": r.get("wallclock_s", round(time.perf_counter() - r["_clock"], 3))}
                     for r in reversed(records)]
 
-    def metrics(self, all_requests=False) -> dict:
+    def live_view(self) -> dict:
+        """GET /v1/live: what the web app's Analytics tab polls each second - what the engine is doing, the last
+        request's speeds and the hardware with its minute of history.  Cheap: no log reading, no request list."""
+        live = self.metrics(live_only=True)
+        tel = self.telemetry.snapshot() if getattr(self, "telemetry", None) else {"now": {}, "history": {}, "static": {}}
+        with self.status_lock:
+            last = dict(self.last_timings) if self.last_timings else None
+            t = dict(self.totals)
+        return {"live": live, "last": last, "model": self.model, "max_context": self.reported_ctx(),
+                "totals": {k: t.get(k) for k in ("requests", "output_tokens", "prompt_tokens", "reused", "prompt_ms",
+                                                 "decode_ms")},
+                "hardware": tel["now"], "history": tel["history"], "static": tel["static"], "time": time.time()}
+
+    def metrics(self, all_requests=False, live_only=False) -> dict:
         """GET /metrics: what the Monitor tab shows - the engine's facts, what it is doing, the last requests, and
-        the hardware (with a minute of history per series)."""
+        the hardware (with a minute of history per series).  `live_only`: just the "live" part (live_view)."""
         with self.status_lock:
             s = dict(self.status)
             if self.live_reqs:                          # parallel requests: the newest one's status
@@ -5704,6 +5718,8 @@ class Service:
             live["replicas"] = self.engine.replica_view()
         if hasattr(self.engine, "split_view"):          # opt-in split serving: the hand-overs so far (serve/split.py)
             live["split_serve"] = self.engine.split_view()
+        if live_only:
+            return live
         engine = {"model": self.model, "max_context": self.reported_ctx(), "images": self.vision is not None,
                   **dict(getattr(self.engine, "info", {}) or {})}
         tel = self.telemetry.snapshot() if getattr(self, "telemetry", None) else {"now": {}, "history": {}, "static": {}}
@@ -8114,6 +8130,26 @@ def make_handler(svc: Service):
                 if self._authorized():
                     self._json(200, svc.mcp.status() if svc.mcp else {"servers": [], "tools": 0})
                 return
+            if path == "/v1/live":                           # the web app's Analytics tab, once a second
+                if self._authorized():
+                    self._json(200, svc.live_view())
+                return
+            if path == "/v1/search":                         # is web search (SearXNG) running? (the web app's switch)
+                if self._authorized():
+                    b = svc.builtins
+                    self._json(200, b.searx.status() if b is not None and b.searx is not None
+                               else {"url": None, "up": False, "can_start": False, "starting": False, "error": None})
+                return
+            if path.startswith("/v1/files/"):                # an attached file's facts (never its text)
+                if self._authorized():
+                    b = svc.builtins
+                    doc = b.files.get(path[len("/v1/files/"):]) if b is not None and b.files is not None else None
+                    if doc is None:
+                        self._json(404, {"error": {"message": "no such file"}})
+                    else:
+                        from serve.builtin_tools import FileStore
+                        self._json(200, FileStore.summary(doc))
+                return
             if path in ("", "/classic") or (path == "/api-monitor" and svc.api_monitor):
                 # "" is the SlenderEngine app (serve/web2); /classic keeps the Strata app (serve/web) until it is retired.
                 # The classic page's relative links (web/app.js, health, ...) resolve to the root from /classic as well.
@@ -8329,6 +8365,38 @@ def make_handler(svc: Service):
                         if h is not None and h.get("file") not in svc.parker.store.files:
                             h["file"], h["saved_len"] = None, 0
                     self._json(200, {"deleted": n})
+                    return
+                if path == "/v1/files":                      # a file attached in the web app: its text, kept here
+                    b = svc.builtins
+                    if b is None or b.files is None:
+                        self._json(404, {"error": {"message": "attached files are not set up on this server"}})
+                        return
+                    if not self._own_page("files can be attached"):
+                        return
+                    from serve.builtin_tools import ExtractError, FileStore
+                    try:
+                        data = base64.b64decode(str(req.get("data") or ""), validate=True)
+                    except ValueError:
+                        raise ValueError("data: the file's bytes in base64") from None
+                    try:
+                        doc = b.files.put(str(req.get("name") or "file"), data)
+                    except ExtractError as e:
+                        self._json(422, {"error": {"type": "invalid_request_error", "message": str(e)}})
+                        return
+                    inline = req.get("inline_chars")
+                    inline = inline if isinstance(inline, int) and not isinstance(inline, bool) and inline > 0 else 0
+                    print(f"[strata] attached {doc['name']}: {doc['kind']}, {len(doc['pages'])} part(s), "
+                          f"{doc['chars']:,} characters", flush=True)
+                    self._json(200, FileStore.summary(doc, inline_chars=min(inline, 200000)))
+                    return
+                if path == "/v1/search/start":               # the web app switched web search on: start SearXNG
+                    b = svc.builtins
+                    if b is None or b.searx is None:
+                        self._json(404, {"error": {"message": "web search is not set up on this server"}})
+                        return
+                    if not self._own_page("web search can be started"):
+                        return
+                    self._json(200, b.searx.start())
                     return
                 if path == "/v1/vram":                       # #533: give VRAM back to other programs, or take it
                     if not self._own_page("the VRAM reserve can be changed"):
@@ -8695,12 +8763,20 @@ def make_handler(svc: Service):
                                      f"(0..{n_vocab - 1})")
             bias_api.validate_request(req, svc.engine, len(getattr(svc.tok, "tokens", ())) or None)
             use_mcp = req.get("strata_mcp") is True and svc.mcp is not None      # the web app's opt-in (serve/mcp.py)
+            # the web app's own tools (serve/builtin_tools.py): web search, web pages, attached files - asked for by name
+            wanted = req.get("strata_builtin")
+            builtin = [n for n in wanted if isinstance(n, str)] if isinstance(wanted, list) and svc.builtins else []
             own = {t.get("name") for t in tools or [] if isinstance(t, dict)}   # #592: a second line of defence
-            if use_mcp:
+            hub = svc.mcp
+            if use_mcp or builtin:
                 if not self._own_page("MCP tools can be used"):   # tools run with the user's rights on this PC
                     return
-                svc.mcp.wait(10)                                  # servers still starting (only right after start)
-                extra = svc.mcp.template_tools(exclude=own)       # the request's own tools win a name clash
+                if use_mcp:
+                    svc.mcp.wait(10)                              # servers still starting (only right after start)
+                if builtin:
+                    from serve.builtin_tools import ToolRouter
+                    hub = ToolRouter(svc.mcp, svc.builtins, builtin, external=use_mcp)
+                extra = hub.template_tools(exclude=own)           # the request's own tools win a name clash
                 use_mcp = bool(extra)
                 tools = (tools or []) + extra or None
             if force and use_mcp:
@@ -8712,7 +8788,7 @@ def make_handler(svc: Service):
             self._watch_client(cancel)                       # #430 #431 (#1999: before prepare, which can take long)
             ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, force=force, req=req, cancel=cancel)
             _debug_req("openai", req, messages, tools, max_new, thinking, len(ids))
-            run = run_with_mcp(svc, svc.mcp, messages, tools, kw, ids, thinking, max_new, max_req, req, cancel,
+            run = run_with_mcp(svc, hub, messages, tools, kw, ids, thinking, max_new, max_req, req, cancel,
                                {t["name"] for t in extra}) if use_mcp else None
             chunks = openai_chunks(svc, req, ids, thinking, tools, max_new, cancel, run=run, force=force)
             if validator is not None:
@@ -10499,6 +10575,17 @@ def _main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> i
                       ", ".join(f"{k}={v}" for k, v in svc.shared.items()), flush=True)
         except (OSError, ValueError):
             svc.shared = {}
+    # the web app's own tools (serve/builtin_tools.py): attached files' text is kept next to the run config; web search
+    # asks SearXNG ("searxng_url"), started by "searxng_start" (a command) when the page switches search on
+    from serve.builtin_tools import Builtins, FileStore, Searx
+    start_cmd = cfg.get("searxng_start")
+    if start_cmd is not None and not (isinstance(start_cmd, str) or (isinstance(start_cmd, list)
+                                                                     and all(isinstance(x, str) for x in start_cmd))):
+        raise SystemExit("[strata] config \"searxng_start\": a command, as a string or a list of strings")
+    if cfg.get("searxng_url") is not None and not isinstance(cfg["searxng_url"], str):
+        raise SystemExit("[strata] config \"searxng_url\": an address like http://127.0.0.1:8888")
+    files_dir = cfg.get("files_dir") if isinstance(cfg.get("files_dir"), str) else         str(Path(a.config).with_suffix(".files")) if a.config else str(Path.cwd() / ".web-files")
+    svc.builtins = Builtins(FileStore(files_dir), Searx(cfg.get("searxng_url") or "http://127.0.0.1:8888", start_cmd))
     if hub is not None:
         import atexit
         svc.mcp = hub

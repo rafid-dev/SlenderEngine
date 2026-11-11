@@ -15,6 +15,8 @@ requests==2.34.2
 pillow==13.0.0; python_version >= "3.11"
 pillow==12.3.0; python_version < "3.11"
 psutil==7.2.2
+# the web app's attached PDFs (serve/builtin_tools.py); without it a PDF is refused with a note saying so
+pypdf==6.1.3
 
 # their dependencies
 markupsafe==3.0.3

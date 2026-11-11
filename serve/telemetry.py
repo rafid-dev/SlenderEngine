@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import collections
 import ctypes
+import json
 import os
 import platform
 from strata_control import sysinfo
@@ -532,6 +533,187 @@ class _CpuRamFallback:
             return None, None
 
 
+# ------------------------------------------------------------------------------------------------ disks, one by one
+def _win_disk_number(letter: str):
+    """The physical disk number of a Windows volume ("C:"), through IOCTL_STORAGE_GET_DEVICE_NUMBER (no admin needed)."""
+    k32 = ctypes.windll.kernel32
+    k32.CreateFileW.restype = ctypes.c_void_p
+    h = k32.CreateFileW(f"\\\\.\\{letter}", 0, 3, None, 3, 0, None)
+    if h in (None, ctypes.c_void_p(-1).value):
+        return None
+    try:
+        buf, ret = (ctypes.c_ulong * 3)(), ctypes.c_ulong()
+        if k32.DeviceIoControl(ctypes.c_void_p(h), 0x2D1080, None, 0, buf, ctypes.sizeof(buf), ctypes.byref(ret), None):
+            return int(buf[1])
+        return None
+    finally:
+        k32.CloseHandle(ctypes.c_void_p(h))
+
+
+def _win_disk_model(n: int):
+    """A physical disk's product name (IOCTL_STORAGE_QUERY_PROPERTY, StorageDeviceProperty), or None."""
+    k32 = ctypes.windll.kernel32
+    k32.CreateFileW.restype = ctypes.c_void_p
+    h = k32.CreateFileW(f"\\\\.\\PhysicalDrive{n}", 0, 3, None, 3, 0, None)
+    if h in (None, ctypes.c_void_p(-1).value):
+        return None
+    try:
+        query = (ctypes.c_ulong * 3)(0, 0, 0)               # PropertyId 0, QueryType 0, AdditionalParameters
+        out, ret = ctypes.create_string_buffer(1024), ctypes.c_ulong()
+        if not k32.DeviceIoControl(ctypes.c_void_p(h), 0x2D1400, query, ctypes.sizeof(query), out, 1024,
+                                   ctypes.byref(ret), None):
+            return None
+        raw = out.raw
+
+        def at(off):
+            o = int.from_bytes(raw[off:off + 4], "little")
+            return raw[o:raw.index(b"\0", o)].decode("ascii", "replace").strip() if 0 < o < len(raw) else ""
+        name = " ".join(x for x in (at(12), at(16)) if x)
+        return name or None
+    except (OSError, ValueError):
+        return None
+    finally:
+        k32.CloseHandle(ctypes.c_void_p(h))
+
+
+class _Disks:
+    """Each physical disk's read and write rate and how busy it is, with its drive letters, model and fill (Windows
+    names them PhysicalDrive0, 1, ...; psutil's per-disk counters).  Busy is the share of the second the disk spent
+    on reads and writes (capped at 100: a fast SSD with many reads in flight counts as fully busy)."""
+
+    def __init__(self, ps):
+        self.ps, self.prev, self.layout, self.layout_at = ps, None, {}, 0.0
+
+    def _refresh_layout(self):
+        layout = {}
+        try:
+            parts = self.ps.disk_partitions(all=False)
+        except (OSError, RuntimeError):
+            parts = []
+        for p in parts:
+            letter = p.device.rstrip("\\/")
+            if os.name == "nt":
+                if "cdrom" in p.opts or not re.fullmatch(r"[A-Z]:", letter):
+                    continue
+                n = _win_disk_number(letter)
+                if n is None:
+                    continue
+                key = f"PhysicalDrive{n}"
+            else:
+                key = os.path.basename(p.device)
+            try:
+                u = self.ps.disk_usage(p.mountpoint)
+                used, total = u.used, u.total
+            except (OSError, RuntimeError):
+                used = total = None
+            d = layout.setdefault(key, {"letters": [], "used": 0, "total": 0})
+            d["letters"].append(letter if os.name == "nt" else p.mountpoint)
+            if used is not None:
+                d["used"] += used
+                d["total"] += total
+        if os.name == "nt":
+            for key, d in layout.items():
+                d["model"] = _win_disk_model(int(key[len("PhysicalDrive"):]))
+        self.layout, self.layout_at = layout, time.time()
+
+    def read(self):
+        if not self.ps:
+            return None
+        try:
+            c = self.ps.disk_io_counters(perdisk=True)
+        except (OSError, RuntimeError):
+            return None
+        if not c:
+            return None
+        t = time.time()
+        if t - self.layout_at > 30:
+            try:
+                self._refresh_layout()
+            except Exception:  # noqa: BLE001 - a layout that cannot be read leaves the rates
+                self.layout_at = t
+        prev, self.prev = self.prev, (t, c)
+        if prev is None or t <= prev[0]:
+            return None
+        dt, out = t - prev[0], []
+        keys = [k for k in c if os.name == "nt" and k.startswith("PhysicalDrive")] or \
+            [k for k in c if k in self.layout] or list(c)
+        for k in sorted(keys, key=lambda x: (len(x), x)):
+            a, b = prev[1].get(k), c[k]
+            if a is None:
+                continue
+            busy_ms = (b.read_time - a.read_time) + (b.write_time - a.write_time)
+            lay = self.layout.get(k, {})
+            num = k[len("PhysicalDrive"):] if k.startswith("PhysicalDrive") else k
+            out.append({"key": k, "name": f"Disk {num}", "model": lay.get("model"), "letters": lay.get("letters", []),
+                        "read_mb": round((b.read_bytes - a.read_bytes) / dt / 2**20, 2),
+                        "write_mb": round((b.write_bytes - a.write_bytes) / dt / 2**20, 2),
+                        "busy": round(max(0.0, min(100.0, busy_ms / (dt * 10))), 1),
+                        "used": lay.get("used") or None, "total": lay.get("total") or None})
+        return out
+
+
+# ------------------------------------------------------------------------------------------------ CPU temperature
+class _CpuTemp:
+    """The CPU's temperature.  Windows has no reading without administrator rights, so it comes from
+    LibreHardwareMonitor (or OpenHardwareMonitor) when that runs with its web server on (Options > Remote Web Server,
+    http://127.0.0.1:8085/data.json; STRATA_LHM_URL changes the address).  Linux: psutil's sensors.  Read every 3 s; an
+    address that does not answer is tried again after 30 s.  None when there is no source."""
+
+    PREFER = ("cpu package", "core (tctl/tdie)", "tctl", "package", "core max", "core average", "cpu")
+
+    def __init__(self, ps):
+        self.ps = ps
+        self.url = os.environ.get("STRATA_LHM_URL", "http://127.0.0.1:8085/data.json")
+        self.value, self.source, self.next_at = None, None, 0.0
+
+    @classmethod
+    def _from_tree(cls, node):
+        found = []
+
+        def walk(n, in_cpu):
+            sid = str(n.get("SensorId") or n.get("id") or "")
+            img = str(n.get("ImageURL") or "")
+            cpu = in_cpu or "cpu" in img.lower() or "/amdcpu/" in sid or "/intelcpu/" in sid
+            val = str(n.get("Value") or "")
+            if cpu and ("°C" in val or "/temperature/" in sid) and not n.get("Children"):
+                m = re.search(r"-?\d+(?:[.,]\d+)?", val)
+                if m:
+                    found.append((str(n.get("Text") or "").lower(), float(m.group(0).replace(",", "."))))
+            for ch in n.get("Children") or []:
+                walk(ch, cpu)
+        walk(node, False)
+        if not found:
+            return None
+        for want in cls.PREFER:
+            for name, v in found:
+                if name.startswith(want):
+                    return v
+        return max(v for _, v in found)
+
+    def read(self):
+        now = time.time()
+        if now < self.next_at:
+            return self.value
+        self.next_at = now + 3
+        if os.name != "nt" and self.ps and hasattr(self.ps, "sensors_temperatures"):
+            try:
+                temps = self.ps.sensors_temperatures()
+                for chip in ("coretemp", "k10temp", "zenpower", "cpu_thermal"):
+                    if temps.get(chip):
+                        self.value, self.source = max(t.current for t in temps[chip]), chip
+                        return self.value
+            except (OSError, RuntimeError, AttributeError):
+                pass
+        try:
+            import urllib.request
+            with urllib.request.urlopen(self.url, timeout=0.6) as r:
+                self.value = self._from_tree(json.loads(r.read(4 << 20).decode("utf-8", "replace")))
+                self.source = "LibreHardwareMonitor" if self.value is not None else None
+        except Exception:  # noqa: BLE001 - not running, refused, a page that is not its JSON
+            self.value, self.source, self.next_at = None, None, now + 30
+        return self.value
+
+
 # ------------------------------------------------------------------------------------------------ the sampler
 class Telemetry:
     def __init__(self, extra=None, gpu_index=0, gpu_indices=None, amd=False):
@@ -585,6 +767,8 @@ class Telemetry:
             "psutil": self.ps is not None,
         }
         self._disk_prev = None
+        self.disks = _Disks(self.ps)
+        self.cpu_temp = _CpuTemp(self.ps)
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
@@ -635,6 +819,12 @@ class Telemetry:
             s["cpu"] = self.fallback.cpu()
             s["ram_used"], s["ram_total"] = self.fallback.ram()
         s["disk_read_mb"], s["disk_write_mb"] = self._disk()
+        try:                                       # the Analytics tab's per-disk cards and CPU temperature
+            s["disks"] = self.disks.read()
+            s["cpu_temp"] = self.cpu_temp.read()
+            s["cpu_temp_source"] = self.cpu_temp.source
+        except Exception:  # noqa: BLE001 - telemetry must never take the server down
+            pass
         if self.extra:
             try:
                 s.update(self.extra())
@@ -667,9 +857,12 @@ class Telemetry:
             with self.lock:
                 self.now = s
                 for k in ("gpu_util", "gpu_mem_used", "gpu_temp", "gpu_power", "gpu_pcie_rx_mb", "cpu", "ram_used",
-                          "disk_read_mb", "tok_s", "prefill_tok_s_mean"):
+                          "disk_read_mb", "tok_s", "prefill_tok_s_mean", "cpu_temp", "disk_write_mb"):
                     v = s.get(k)
                     self.hist[k].append(round(v, 2) if isinstance(v, float) else v)
+                for d in s.get("disks") or []:     # per disk: busy share and read + write rate
+                    self.hist[f"disk_busy:{d['key']}"].append(d["busy"])
+                    self.hist[f"disk_rw:{d['key']}"].append(round(d["read_mb"] + d["write_mb"], 1))
             self._stop.wait(1.0)
 
     def snapshot(self):

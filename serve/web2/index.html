@@ -71,9 +71,14 @@
           <textarea id="input" rows="1" placeholder="Ask anything" aria-label="Message"></textarea>
           <div class="composer__row">
             <div class="composer__left">
-              <button class="icon-btn" id="attach-btn" type="button" aria-label="Attach files" title="Attach files" data-icon="plus"></button>
+              <button class="icon-btn" id="attach-btn" type="button" aria-label="Attach files" title="Attach files: text, PDF, Word, Excel, PowerPoint, pictures" data-icon="plus"></button>
+              <button class="tool-toggle" id="search-btn" type="button" aria-pressed="false" title="Web search" hidden><span data-icon="globe"></span><span>Search</span></button>
             </div>
             <div class="composer__right">
+              <button class="ctx" id="ctx-btn" type="button" aria-haspopup="menu" title="Context used" hidden>
+                <svg viewBox="0 0 36 36" aria-hidden="true"><circle class="ctx__track" cx="18" cy="18" r="15"/><circle class="ctx__fill" id="ctx-fill" cx="18" cy="18" r="15"/></svg>
+                <span class="ctx__pct" id="ctx-pct"></span>
+              </button>
               <div class="effort" id="effort">
                 <button class="effort__btn" id="effort-btn" type="button" aria-haspopup="listbox" aria-expanded="false" title="Reasoning effort">
                   <span data-icon="brain"></span><span id="effort-label">High</span><span data-icon="chevron-down"></span>
@@ -91,11 +96,34 @@
     </section>
 
     <section class="view view--analytics" id="view-analytics" role="tabpanel" aria-labelledby="tab-analytics" hidden>
-      <div class="soon">
-        <span class="soon__icon" data-icon="chart"></span>
-        <h2>Analytics</h2>
-        <p>Speed dials and hardware readings arrive in the next milestone.</p>
-        <p>Until then the old monitor is on the <a href="classic">classic page</a>.</p>
+      <div class="an" id="an">
+        <div class="an__strip">
+          <span class="an-state" id="an-state"><span class="dot"></span><span id="an-state-text">Connecting…</span></span>
+          <span class="an__facts" id="an-facts"></span>
+        </div>
+        <div class="an__gauges">
+          <div class="gauge-card" id="g-decode">
+            <div class="gauge-card__head"><span>Decode</span><small>tokens per second while writing</small></div>
+            <div class="gauge"><svg viewBox="0 0 200 116" aria-hidden="true"><path class="gauge__track" d="M20 106 A80 80 0 0 1 180 106"/><path class="gauge__arc" pathLength="100" d="M20 106 A80 80 0 0 1 180 106"/><g class="gauge__ticks"></g></svg>
+              <div class="gauge__needle"></div><div class="gauge__hub"></div>
+              <div class="gauge__value"><b>0</b><span>tok/s</span></div>
+              <div class="gauge__scale"><span>0</span><span class="gauge__max">60</span></div></div>
+            <div class="gauge-card__foot"></div>
+          </div>
+          <div class="gauge-card" id="g-prefill">
+            <div class="gauge-card__head"><span>Prefill</span><small>tokens per second while reading the prompt</small></div>
+            <div class="gauge"><svg viewBox="0 0 200 116" aria-hidden="true"><path class="gauge__track" d="M20 106 A80 80 0 0 1 180 106"/><path class="gauge__arc" pathLength="100" d="M20 106 A80 80 0 0 1 180 106"/><g class="gauge__ticks"></g></svg>
+              <div class="gauge__needle"></div><div class="gauge__hub"></div>
+              <div class="gauge__value"><b>0</b><span>tok/s</span></div>
+              <div class="gauge__scale"><span>0</span><span class="gauge__max">1000</span></div></div>
+            <div class="gauge-card__foot"></div>
+          </div>
+        </div>
+        <h3 class="an__h">Hardware</h3>
+        <div class="an__cards" id="an-cards"></div>
+        <h3 class="an__h" id="an-disks-h">Disks</h3>
+        <div class="an__cards" id="an-disks"></div>
+        <p class="an__note" id="an-note"></p>
       </div>
     </section>
   </main>
@@ -112,6 +140,8 @@
       <nav class="settings__nav" id="settings-nav" role="tablist" aria-label="Settings sections">
         <button type="button" role="tab" data-pane="general" aria-selected="true"><span data-icon="settings"></span>General</button>
         <button type="button" role="tab" data-pane="model" aria-selected="false"><span data-icon="sliders"></span>Model</button>
+        <button type="button" role="tab" data-pane="search" aria-selected="false"><span data-icon="globe"></span>Search</button>
+        <button type="button" role="tab" data-pane="context" aria-selected="false"><span data-icon="layers"></span>Context</button>
         <button type="button" role="tab" data-pane="interface" aria-selected="false"><span data-icon="sparkle"></span>Interface</button>
         <button type="button" role="tab" data-pane="connection" aria-selected="false"><span data-icon="key"></span>Connection</button>
         <button type="button" role="tab" data-pane="data" aria-selected="false"><span data-icon="database"></span>Data</button>
@@ -154,6 +184,25 @@
           </div>
         </section>
 
+        <section class="pane" data-pane="search" hidden>
+          <div class="row-toggle">
+            <span><b>Web search</b><small>Lets the model search the web and read pages, through SearXNG on this PC. Off by default; switching it on starts SearXNG when the server knows how.</small></span>
+            <button type="button" class="switch" id="s-search" role="switch" aria-checked="false" aria-label="Web search"></button>
+          </div>
+          <p class="status-line" id="search-status">Checking…</p>
+          <p class="field__note">Searches go out from SearXNG to the search engines it is set up for; the model can also read public web pages it finds. Pages on this PC or your local network are never read.</p>
+        </section>
+
+        <section class="pane" data-pane="context" hidden>
+          <div class="row-toggle">
+            <span><b>Compact long chats automatically</b><small>When a chat fills the context, older messages are summarised for the model. You still see them; the model reads the summary.</small></span>
+            <button type="button" class="switch" id="s-compact" role="switch" aria-checked="true" aria-label="Compact long chats automatically"></button>
+          </div>
+          <label class="field field--slider"><span class="field__label">Compact at <output id="o-compact"></output></span>
+            <input type="range" id="s-compact-at" min="50" max="95" step="5"></label>
+          <p class="field__note">Each compaction is one short request, then the next answer reads the shorter conversation once. The ring next to the effort menu shows how full the context is; click it to compact by hand.</p>
+        </section>
+
         <section class="pane" data-pane="interface" hidden>
           <div class="row-toggle">
             <span><b>Typing effect</b><small>New words fade in with a small wobble as the model writes.</small></span>
@@ -180,7 +229,15 @@
         </section>
 
         <section class="pane" data-pane="data" hidden>
-          <p class="field__note">Chats and projects are kept in this browser (IndexedDB). The server never stores them.</p>
+          <p class="field__note">Chats and projects are kept in this browser (IndexedDB). The server never stores them. Attached documents' text is kept by the server next to its run config, so the model can read them.</p>
+          <div class="row-toggle">
+            <span><b>Export</b><small>Every chat and project as one JSON file.</small></span>
+            <button type="button" class="btn" id="s-export">Export</button>
+          </div>
+          <div class="row-toggle">
+            <span><b>Import</b><small>A file exported here. Chats already in this browser are kept; newer copies replace older ones.</small></span>
+            <button type="button" class="btn" id="s-import">Import</button>
+          </div>
           <div class="row-toggle">
             <span><b>Delete every chat</b><small>Projects stay. This cannot be undone.</small></span>
             <button type="button" class="btn btn--danger" id="s-wipe">Delete chats</button>
@@ -191,9 +248,28 @@
   </form>
 </dialog>
 
+<dialog class="settings settings--small" id="proj-dialog" aria-labelledby="proj-title">
+  <form method="dialog" class="settings__frame" id="proj-form">
+    <div class="settings__head">
+      <h2 id="proj-title">Project</h2>
+      <button class="icon-btn" type="button" data-close aria-label="Close" title="Close" data-icon="x"></button>
+    </div>
+    <div class="settings__panes">
+      <div class="pane">
+        <label class="field"><span class="field__label">Name</span><input type="text" id="proj-name" maxlength="80" required></label>
+        <label class="field"><span class="field__label">Instructions</span>
+          <textarea id="proj-instr" rows="8" placeholder="Optional. How the model should work in this project's chats, background it should know, the style to answer in."></textarea>
+          <span class="field__note">Added after the system prompt in every chat of this project.</span></label>
+        <div class="dialog-actions"><button class="btn" type="button" data-close>Cancel</button><button class="btn btn--primary" value="save" id="proj-save">Save</button></div>
+      </div>
+    </div>
+  </form>
+</dialog>
+
 <div class="menu ctx-menu" id="ctx-menu" role="menu" hidden></div>
 <div class="toasts" id="toasts" aria-live="polite"></div>
 <input type="file" id="file-input" multiple hidden>
+<input type="file" id="import-input" accept="application/json,.json" hidden>
 
 <script src="web2/icons.js"></script>
 <script src="web2/math.js"></script>
@@ -202,5 +278,6 @@
 <script src="web2/store.js"></script>
 <script src="web2/typing.js"></script>
 <script src="web2/app.js"></script>
+<script src="web2/analytics.js"></script>
 </body>
 </html>

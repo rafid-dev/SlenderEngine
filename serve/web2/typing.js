@@ -71,5 +71,14 @@
   const reduced = root.matchMedia ? root.matchMedia("(prefers-reduced-motion: reduce)") : {matches: false};
   const allowed = (setting) => !!setting;
 
-  root.SlenderTyping = {apply, newState, allowed, LIFE, systemReduced: () => reduced.matches};
+  // the visible text length of a node, counted as apply() counts it
+  function textLength(node) { let n = 0; for (const t of textNodes(node)) n += t.nodeValue.length; return n; }
+  // `moved` characters left the front of the container (a finished paragraph moved out of the live tail)
+  function shift(state, moved) {
+    if (!moved) return;
+    state.len = Math.max(0, state.len - moved);
+    state.births = state.births.map((b) => ({start: Math.max(0, b.start - moved), t: b.t}));
+  }
+
+  root.SlenderTyping = {apply, newState, allowed, LIFE, textLength, shift, systemReduced: () => reduced.matches};
 })(typeof globalThis !== "undefined" ? globalThis : this);
