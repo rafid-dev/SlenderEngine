@@ -1274,6 +1274,30 @@ __global__ void k_kv_q8_f16_tab(KvTab kt, __half* k16, __half* v16, int pb, int 
     k16[i] = __float2half(__half2float(ks[d / qb]) * (float) kr[d]);
     v16[i] = __float2half(__half2float(vs[d / qb]) * (float) vr[d]);
 }
+/// STRATA_Q36_ATT_FAST: k_kv_q8_f16_tab with 8 cells' values a thread (one segment lookup, an 8-byte load, a 16-byte
+/// store each for K and V): the same arithmetic.  HD % 8 == 0 and qb % 8 == 0.
+__global__ void k_kv_q8_f16_tab8(KvTab kt, __half* k16, __half* v16, int pb, int P, int HD, int HKV, int qb) {
+    const int64_t i8 = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i8 * 8 >= (int64_t) HKV * P * HD) return;
+    const int64_t per = (int64_t) P * HD, i = i8 * 8;
+    const int kvh = (int) (i / per), rest = (int) (i % per);
+    const int p = pb + rest / HD, d = rest % HD;
+    __half *ks, *vs;
+    const int8_t* kr = kv_row(nullptr, kt.k, kt.shift, kvh, p, HKV, 0, HD, qb, &ks);
+    const int8_t* vr = kv_row(nullptr, kt.v, kt.shift, kvh, p, HKV, 0, HD, qb, &vs);
+    const float kd = __half2float(ks[d / qb]), vd = __half2float(vs[d / qb]);
+    const int2 kq = *reinterpret_cast<const int2*>(kr + d), vq = *reinterpret_cast<const int2*>(vr + d);
+    const int8_t* kb = reinterpret_cast<const int8_t*>(&kq);
+    const int8_t* vb = reinterpret_cast<const int8_t*>(&vq);
+    __align__(16) __half ko[8], vo[8];
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        ko[j] = __float2half(kd * (float) kb[j]);
+        vo[j] = __float2half(vd * (float) vb[j]);
+    }
+    *reinterpret_cast<uint4*>(k16 + i) = *reinterpret_cast<const uint4*>(ko);
+    *reinterpret_cast<uint4*>(v16 + i) = *reinterpret_cast<const uint4*>(vo);
+}
 /// The blocked prompt attention (a context past the FP16 operands' room, STRATA_Q36_KV_RAM): one block of cells
 /// [b0, b0 + Pb) of row (h, t): S16 = exp(S * scale - m_b) over the cells the row sees (0 past them), and the row's
 /// m_b / l_b (max, sum; -inf / 0 when it sees none of the block).  grid (T, H), block 256.
@@ -1495,6 +1519,69 @@ __global__ void k_attn_softmax16_h(__half* S16, int ld, int T, int P, int pos0) 
     sum = block_sum(sum, sh);
     const float inv = 1.0f / sum;
     for (int p = threadIdx.x; p < P; p += blockDim.x) row[p] = __float2half(p < n ? expf(__half2float(row[p]) - mx) * inv : 0.f);
+}
+/// STRATA_Q36_ATT_FAST: k_attn_softmax16_h in two passes instead of three - one read for the row's max and sum (online:
+/// a running max, the sum rescaled when it grows), one read + write of the probabilities - 8 halves a load.  The same
+/// probabilities up to the rounding of the sum.  ld % 8 == 0 (rows 16-byte aligned).  grid (T, H), block 256.
+__device__ __forceinline__ void ms_merge(float& m, float& s, float m2, float s2) {
+    const float mn = fmaxf(m, m2);
+    s = (m == -INFINITY ? 0.f : s * __expf(m - mn)) + (m2 == -INFINITY ? 0.f : s2 * __expf(m2 - mn));
+    m = mn;
+}
+__global__ void __launch_bounds__(256) k_attn_softmax16_h8(__half* S16, int ld, int T, int P, int pos0) {
+    __shared__ float shm[8], shs[8];
+    const int t = blockIdx.x, h = blockIdx.y, tid = threadIdx.x;
+    __half* row = S16 + ((size_t) h * T + t) * ld;
+    const int n = min(P, pos0 + t + 1);
+    float m = -INFINITY, sm = 0.f;
+    for (int p0 = tid * 8; p0 < n; p0 += 256 * 8) {
+        const uint4 raw = *reinterpret_cast<const uint4*>(row + p0);
+        const __half* hv = reinterpret_cast<const __half*>(&raw);
+        float x[8], lm = -INFINITY;
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            x[j] = p0 + j < n ? __half2float(hv[j]) : -INFINITY;
+            lm = fmaxf(lm, x[j]);
+        }
+        float ls = 0.f;
+#pragma unroll
+        for (int j = 0; j < 8; ++j) ls += x[j] == -INFINITY ? 0.f : __expf(x[j] - lm);
+        ms_merge(m, sm, lm, ls);
+    }
+    for (int o = 16; o > 0; o >>= 1) {
+        const float m2 = __shfl_xor_sync(0xffffffffu, m, o, 32), s2 = __shfl_xor_sync(0xffffffffu, sm, o, 32);
+        ms_merge(m, sm, m2, s2);
+    }
+    if ((tid & 31) == 0) { shm[tid >> 5] = m; shs[tid >> 5] = sm; }
+    __syncthreads();
+    if (tid < 32) {
+        m = tid < 8 ? shm[tid] : -INFINITY;
+        sm = tid < 8 ? shs[tid] : 0.f;
+        for (int o = 4; o > 0; o >>= 1) {
+            const float m2 = __shfl_xor_sync(0xffffffffu, m, o, 32), s2 = __shfl_xor_sync(0xffffffffu, sm, o, 32);
+            ms_merge(m, sm, m2, s2);
+        }
+        if (tid == 0) { shm[0] = m; shs[0] = sm; }
+    }
+    __syncthreads();
+    const float mx = shm[0], inv = 1.0f / shs[0];
+    for (int p0 = tid * 8; p0 < P; p0 += 256 * 8) {
+        __align__(16) __half out[8];
+        if (p0 < n) {
+            const uint4 raw = *reinterpret_cast<const uint4*>(row + p0);
+            const __half* hv = reinterpret_cast<const __half*>(&raw);
+#pragma unroll
+            for (int j = 0; j < 8; ++j) out[j] = __float2half(p0 + j < n ? __expf(__half2float(hv[j]) - mx) * inv : 0.f);
+        } else {
+#pragma unroll
+            for (int j = 0; j < 8; ++j) out[j] = __float2half(0.f);
+        }
+        if (p0 + 8 <= P) {
+            *reinterpret_cast<uint4*>(row + p0) = *reinterpret_cast<const uint4*>(out);
+        } else {
+            for (int j = 0; j < 8 && p0 + j < P; ++j) row[p0 + j] = out[j];
+        }
+    }
 }
 /// The blocked variant (KV_RAM): the block's softmax over the cells the row sees, normalized within the block (an FP16
 /// output stays in range), and m_b / l_b; k_h2f_rows multiplies the block's output by l_b again before the merge.
@@ -3845,6 +3932,12 @@ struct Engine {
         static const bool on = [] { const char* v = std::getenv("STRATA_Q36_GDN_CHUNK"); return v && v[0] == '1'; }();
         return on;
     }
+    /// STRATA_Q36_ATT_FAST=1 (opt-in): the FP16 prompt attention trimmed per query slice (a slice's GEMMs and softmax
+    /// cover only the cells its last row sees), a two-pass vectorized softmax, a vectorized q8 -> FP16 cell copy
+    static bool att_fast_on() {
+        static const bool on = [] { const char* v = std::getenv("STRATA_Q36_ATT_FAST"); return v && v[0] == '1'; }();
+        return on;
+    }
     static bool att16_on() {
         static const bool on = [] { const char* v = std::getenv("STRATA_Q36_ATT_F16"); return v && v[0] == '1'; }();
         return on;
@@ -4180,7 +4273,10 @@ struct Engine {
                 const float one = 1.0f, zero = 0.0f;
                 // f16 cache: the GEMMs read its cells in place (a KV head's cells are contiguous, ctx rows apart per head)
                 const bool in_place = kv16();
-                if (kvq8() && kvr_on)
+                if (kvq8() && kvr_on && att_fast_on() && HD % 8 == 0 && kv_qb() % 8 == 0)
+                    k_kv_q8_f16_tab8<<<grid1((int64_t) HKV * P * HD / 8), kThreads, 0, st>>>(kvtab(li), k16, v16, 0, P, HD,
+                                                                                              HKV, kv_qb());
+                else if (kvq8() && kvr_on)
                     k_kv_q8_f16_tab<<<grid1((int64_t) HKV * P * HD), kThreads, 0, st>>>(kvtab(li), k16, v16, 0, P, HD, HKV,
                                                                                          kv_qb());
                 else if (kvq8())
@@ -4192,6 +4288,7 @@ struct Engine {
                 const __half* vbase = in_place ? (const __half*) vc[li] : v16;
                 const size_t kv_head = in_place ? (size_t) ctx * HD : (size_t) P * HD;
                 k_to_f16<<<grid1((int64_t) T * H * HD), kThreads, 0, st>>>(q, q16, (int64_t) T * H * HD);
+                pmark("prompt attention: q / k / v projections, prep, FP16 copies");
                 if (fa_ok()) {   // STRATA_Q36_FA: the fused kernel (the gate in its epilogue)
                     k_fa_prompt<true><<<dim3((T + kFaQ - 1) / kFaQ, HKV), 256, 0, st>>>(q16, kbase, vbase, T, H, P,
                         (int) (kv_head / HD), 0, (int) p0, 1.0f / sqrtf((float) HD), gate, att, nullptr, nullptr);
@@ -4200,11 +4297,13 @@ struct Engine {
                     __half* o16b = ensure_o16((size_t) T * H * HD);
                     for (int t0 = 0; t0 < T; t0 += tq) {
                         const int nt = std::min(tq, T - t0);
+                        // STRATA_Q36_ATT_FAST: the cells this slice's last row sees (the rest were masked to 0 anyway)
+                        const int Ps = att_fast_on() ? (int) std::min<int64_t>(P, p0 + t0 + nt) : P;
                         for (int kvh = 0; kvh < HKV; ++kvh) {
-                            if (att_tuned(0, P, nt, ldp, H, HD, G, sc, kbase + (size_t) kvh * kv_head,
+                            if (att_tuned(0, Ps, nt, ldp, H, HD, G, sc, kbase + (size_t) kvh * kv_head,
                                           q16 + ((size_t) t0 * H + kvh * G) * HD, att_p16 + (size_t) kvh * G * nt * ldp))
                                 continue;
-                            if (cublasGemmStridedBatchedEx(blas, CUBLAS_OP_T, CUBLAS_OP_N, P, nt, HD, &sc, kbase + (size_t) kvh * kv_head,
+                            if (cublasGemmStridedBatchedEx(blas, CUBLAS_OP_T, CUBLAS_OP_N, Ps, nt, HD, &sc, kbase + (size_t) kvh * kv_head,
                                     CUDA_R_16F, HD, 0, q16 + ((size_t) t0 * H + kvh * G) * HD, CUDA_R_16F, H * HD, HD, &zero,
                                     att_p16 + (size_t) kvh * G * nt * ldp, CUDA_R_16F, ldp, (long long) nt * ldp, G,
                                     CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT) != CUBLAS_STATUS_SUCCESS) {
@@ -4212,10 +4311,16 @@ struct Engine {
                                 std::exit(1);
                             }
                         }
-                        k_attn_softmax16_h<<<dim3(nt, H), kThreads, 0, st>>>(att_p16, ldp, nt, P, (int) p0 + t0);
+                        pmark("prompt attention: scores GEMM");
+                        if (att_fast_on())
+                            k_attn_softmax16_h8<<<dim3(nt, H), 256, 0, st>>>(att_p16, ldp, nt, Ps, (int) p0 + t0);
+                        else
+                            k_attn_softmax16_h<<<dim3(nt, H), kThreads, 0, st>>>(att_p16, ldp, nt, P, (int) p0 + t0);
+                        pmark("prompt attention: softmax");
                         for (int kvh = 0; kvh < HKV; ++kvh)
                             attn_values16(vbase + (size_t) kvh * kv_head, att_p16 + (size_t) kvh * G * nt * ldp,
-                                          o16b + ((size_t) t0 * H + kvh * G) * HD, P, nt, ldp, H, HD, G);
+                                          o16b + ((size_t) t0 * H + kvh * G) * HD, Ps, nt, ldp, H, HD, G);
+                        pmark("prompt attention: values GEMM");
                     }
                     k_h2f_gate<<<grid1((int64_t) T * H * HD), kThreads, 0, st>>>(o16b, gate, att, (int64_t) T * H * HD);
                 } else {
