@@ -494,10 +494,23 @@ inline void row_dot_x(const uint8_t* row, int nblocks, const block_q8_K* const* 
         }
         __m512i acci[NT];
         for (int t = 0; t < NT; ++t) acci[t] = _mm512_setzero_si512();
+        // fork: STRATA_IQ3_VBMI's whole-block grid decode here too (the same grid bytes, signs and scales as FmtX's decode)
+        __m512i g4[TY == 18 ? 9 : 4];
+        const __m512i* pre = nullptr;
+        if constexpr (TY == 18 || TY == 21) {
+            if (vbmi3) {
+                if constexpr (TY == 21) grid21_vbmi(blk, g4);
+                else grid18_vbmi(blk, g4);
+                pre = g4;
+            }
+        }
         for (int j = 0; j < 4; ++j) {
             __m512i g, sc;
             __mmask64 m;
-            FmtX<TY>::decode(blk, j, g, m, sc);
+            if constexpr (TY == 18 || TY == 21) {
+                if (pre) Fmt<TY>::decode(blk, j, g, m, sc, pre);
+                else FmtX<TY>::decode(blk, j, g, m, sc);
+            } else FmtX<TY>::decode(blk, j, g, m, sc);
             for (int t = 0; t < NT; ++t) {
                 const __m512i yv = _mm512_loadu_si512((const void*) (y[t][i].qs + 64 * j));
                 const __m512i ys = _mm512_mask_sub_epi8(yv, m, zero, yv);

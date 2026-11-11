@@ -412,8 +412,12 @@ void native_gu_rows_impl(const NativeFmt& f, const uint8_t* blob, const void* co
     // 512-bit exact rows, ggml-cpu's single-token AVX2 dot bit for bit with the grid words gathered: 1.3x ggml's dot on a Xeon 8468
     // (x512_bench), the same output.  Where the multi-token rule (#152) already sends one token to the multi-token kernel
     // (STRATA_IQ_MT_MIN=1) that stays; STRATA_NO_IQ512X1=1 turns this off; the first use checks the bits against this ggml.
-    static const bool x512_one = avx512 && iq512_gather_on() && std::getenv("STRATA_NO_IQ512X1") == nullptr;
-    if (x512_one && nt == 1 && nt < native_gu_mt_min(f.gu_type) && f.tail_off == 0 && (f.gu_type == 18 || f.gu_type == 21) &&
+    // fork: STRATA_IQ512X1=1 takes these rows without the gather (Zen 4: microcoded gather; the grid by STRATA_IQ3_VBMI or scalar
+    // lookups instead), and STRATA_IQ512X1=2 adds IQ2_S.  x512_one_ok still checks each type's bits against this ggml first.
+    static const int x512_force = [] { const char* v = std::getenv("STRATA_IQ512X1"); return v ? std::atoi(v) : 0; }();
+    static const bool x512_one = avx512 && (iq512_gather_on() || x512_force > 0) && std::getenv("STRATA_NO_IQ512X1") == nullptr;
+    if (x512_one && nt == 1 && nt < native_gu_mt_min(f.gu_type) && f.tail_off == 0 &&
+        (f.gu_type == 18 || f.gu_type == 21 || (x512_force >= 2 && f.gu_type == 22)) &&
         x512_one_ok(f.gu_type)) {
         const int n1 = (int) f.n_embd;
         float g[64], u[64];
