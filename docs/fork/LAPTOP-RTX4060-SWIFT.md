@@ -14,13 +14,16 @@ pull request.
 Fresh prompt each time (random words, nothing reused), then a 256-token answer, through `/v1/chat/completions` with
 thinking off and the model card's sampling (temperature 1.0, top-p 0.95, top-k 20). One server, one run per row, 11-11.
 
-| Context | Prompt reading | Time to read it | Answer (256 tokens) |
-|---|---|---|---|
-| Short (29 tokens) | - | 1.4 s | 21.1 tok/s |
-| 26,138 tokens | 877 tok/s | 29.8 s | 24.5 tok/s |
-| 150,026 tokens | 858 tok/s | 174.9 s | 23.3 tok/s |
+| Context | Prompt reading | Time to read it | Answer (256 tokens) | Drafts accepted |
+|---|---|---|---|---|
+| Short (29 tokens) | - | 1.4 s | 21.1 tok/s | 127 of 174 (73%) |
+| 26,138 tokens | 877 tok/s | 29.8 s | 24.5 tok/s | 129 of 186 (69%) |
+| 150,026 tokens | 858 tok/s | 174.9 s | 23.3 tok/s | 128 of 184 (70%) |
 
 Prompt reading holds flat from 26K to 150K, and the answer speed does not drop with context.
+
+All speed tables on this page have thinking off. With thinking on (the model's default), answers are longer and the
+draft acceptance differs, so these numbers are not comparable with thinking-on runs.
 
 ## Run-to-run spread
 
@@ -32,7 +35,7 @@ The same benchmark run earlier the same day, with a fresh server:
 | 26,138 tokens | 862 tok/s | 18.9 tok/s | 116 of 155 (75%) |
 | 150,026 tokens | 851 tok/s | 19.3 tok/s | 127 of 171 (74%) |
 
-At 26K the later run accepted fewer drafts (129 of 186, 69%) and still answered 30% faster (24.5 vs 18.9 tok/s), so
+At 26K the later run (first table) accepted fewer drafts (69% vs 75%) and still answered 30% faster (24.5 vs 18.9 tok/s), so
 draft acceptance does not explain the gap. Prompt reading moved only 2-3%. On this PC, with RAM nearly full, answer speed
 spreads about ±15% between server starts, much more than the ±5% inside one server. Compare decode only within one
 server, with alternating arms. For normal text, plan on 19-25 tok/s.
@@ -69,7 +72,8 @@ from another upload instead (`--ple-gguf`, a 54 GB file). Teacher-forced at 4,99
 | IQ3_S file, shard 1 | 94.09% | 0.033 | 3.977 |
 
 Decode in the same session, paired: 22.03 (Q8_0) vs 21.93 tok/s (shard 1). So the file's own table costs no speed, saves
-the 54 GB download, and differs about as much as any change of rounding does (~94-95% on this yardstick). We now run the
+the 54 GB download. It is not a rounding-only change: KL 0.033 is about 16 times the 0.002 line, and a little more than
+the 8-bit read in [AMD_HIP.md](../AMD_HIP.md) (top-1 95.4%, KL 0.025). Perplexity is no worse. We now run the
 shard-1 table.
 
 Two things that tripped us up:
@@ -77,8 +81,9 @@ Two things that tripped us up:
 - Pointing `--ple-gguf` at shard 2 fails with "per_layer_token_embd.weight is not in ...00002". The table is in shard 1.
 - Shard 2 cannot be deleted even though the pack's `experts.bin` (46.8 GiB) holds every expert from both shards:
   `gguf_split.hpp` refuses to start when any shard of a split is missing, and `NativeDense` reads the dense matrices of
-  the later layers (~2 GiB) straight from shard 2. A single-file GGUF without the expert tensors would remove the need
-  for the 36 GiB shard. Not done.
+  the later layers (~2 GiB) straight from shard 2. A shard 2 with its `*_exps` tensors replaced by placeholders and its
+  split keys kept would likely shrink to about 2 GiB and still pass the split check (suggested in review; not tried yet,
+  and the output must be checked against the full shard first).
 
 ## Local switches, not in this pull request
 
