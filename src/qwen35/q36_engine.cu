@@ -1603,6 +1603,65 @@ __global__ void k_attn_softmax16_h_blk(__half* S16, int ld, int T, int Pb, int b
         lb[(size_t) t * gridDim.y + h] = sum;
     }
 }
+/// STRATA_Q36_ATT_FAST: k_attn_softmax16_h_blk in two passes, 8 halves a load (as k_attn_softmax16_h8), with the block's
+/// m_b / l_b.  grid (T, H), block 256.
+__global__ void __launch_bounds__(256) k_attn_softmax16_h8_blk(__half* S16, int ld, int T, int Pb, int b0, int pos0,
+                                                               float* mb, float* lb) {
+    __shared__ float shm[8], shs[8];
+    const int t = blockIdx.x, h = blockIdx.y, tid = threadIdx.x;
+    __half* row = S16 + ((size_t) h * T + t) * ld;
+    const int n = max(0, min(Pb, pos0 + t + 1 - b0));
+    float m = -INFINITY, sm = 0.f;
+    for (int p0 = tid * 8; p0 < n; p0 += 256 * 8) {
+        const uint4 raw = *reinterpret_cast<const uint4*>(row + p0);
+        const __half* hv = reinterpret_cast<const __half*>(&raw);
+        float x[8], lm = -INFINITY;
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            x[j] = p0 + j < n ? __half2float(hv[j]) : -INFINITY;
+            lm = fmaxf(lm, x[j]);
+        }
+        float ls = 0.f;
+#pragma unroll
+        for (int j = 0; j < 8; ++j) ls += x[j] == -INFINITY ? 0.f : __expf(x[j] - lm);
+        ms_merge(m, sm, lm, ls);
+    }
+    for (int o = 16; o > 0; o >>= 1) {
+        const float m2 = __shfl_xor_sync(0xffffffffu, m, o, 32), s2 = __shfl_xor_sync(0xffffffffu, sm, o, 32);
+        ms_merge(m, sm, m2, s2);
+    }
+    if ((tid & 31) == 0) { shm[tid >> 5] = m; shs[tid >> 5] = sm; }
+    __syncthreads();
+    if (tid < 32) {
+        m = tid < 8 ? shm[tid] : -INFINITY;
+        sm = tid < 8 ? shs[tid] : 0.f;
+        for (int o = 4; o > 0; o >>= 1) {
+            const float m2 = __shfl_xor_sync(0xffffffffu, m, o, 32), s2 = __shfl_xor_sync(0xffffffffu, sm, o, 32);
+            ms_merge(m, sm, m2, s2);
+        }
+        if (tid == 0) { shm[0] = m; shs[0] = sm; }
+    }
+    __syncthreads();
+    const float mx = shm[0], sum = shs[0], inv = sum > 0.f ? 1.0f / sum : 0.f;
+    for (int p0 = tid * 8; p0 < Pb; p0 += 256 * 8) {
+        __align__(16) __half out[8];
+        if (p0 < n) {
+            const uint4 raw = *reinterpret_cast<const uint4*>(row + p0);
+            const __half* hv = reinterpret_cast<const __half*>(&raw);
+#pragma unroll
+            for (int j = 0; j < 8; ++j) out[j] = __float2half(p0 + j < n ? __expf(__half2float(hv[j]) - mx) * inv : 0.f);
+        } else {
+#pragma unroll
+            for (int j = 0; j < 8; ++j) out[j] = __float2half(0.f);
+        }
+        if (p0 + 8 <= Pb) *reinterpret_cast<uint4*>(row + p0) = *reinterpret_cast<const uint4*>(out);
+        else for (int j = 0; j < 8 && p0 + j < Pb; ++j) row[p0 + j] = out[j];
+    }
+    if (tid == 0) {
+        mb[(size_t) t * gridDim.y + h] = n > 0 ? mx : -INFINITY;
+        lb[(size_t) t * gridDim.y + h] = sum;
+    }
+}
 /// FP16 attention output to FP32: out = o16 * sigmoid(gate) (gated) or out = o16, n values.
 __global__ void k_h2f_gate(const __half* o16, const float* gate, float* out, int64_t n) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
@@ -4105,6 +4164,7 @@ struct Engine {
                 k_kv_q8_f16_tab<<<grid1((int64_t) HKV * Pb * HD), kThreads, 0, st>>>(kb, k16, v16, b0, Pb, HD, HKV, kv_qb());
             }
             const size_t kv_head = (size_t) Pb * HD;
+            pmark("blocked attention: gather / stage / FP16 copies");
             if (att16_on()) {   // FP16-out GEMMs: the block normalized in the softmax, l_b put back after the values
                 __half* o16b = ensure_o16((size_t) T * H * HD);
                 for (int t0 = 0; t0 < T; t0 += tq) {
@@ -4121,14 +4181,22 @@ struct Engine {
                             std::exit(1);
                         }
                     }
+                    pmark("blocked attention: scores GEMM");
+                    if (att_fast_on())
+                        k_attn_softmax16_h8_blk<<<dim3(nt, H), 256, 0, st>>>(att_p16, ldp, nt, Pb, b0, (int) p0 + t0,
+                                                                             blk_mb + (size_t) t0 * H, blk_lb + (size_t) t0 * H);
+                    else
                     k_attn_softmax16_h_blk<<<dim3(nt, H), kThreads, 0, st>>>(att_p16, ldp, nt, Pb, b0, (int) p0 + t0,
                                                                              blk_mb + (size_t) t0 * H, blk_lb + (size_t) t0 * H);
+                    pmark("blocked attention: softmax");
                     for (int kvh = 0; kvh < HKV; ++kvh)
                         attn_values16(v16 + (size_t) kvh * kv_head, att_p16 + (size_t) kvh * G * nt * ldp,
                                       o16b + ((size_t) t0 * H + kvh * G) * HD, Pb, nt, ldp, H, HD, G);
+                    pmark("blocked attention: values GEMM");
                 }
                 k_h2f_rows<<<grid1((int64_t) T * H * HD), kThreads, 0, st>>>(o16b, blk_lb, blk_ob, HD, (int64_t) T * H * HD);
                 k_attn_blk_merge<<<T * H, HD, 0, st>>>(att, blk_ob, blk_m, blk_l, blk_mb, blk_lb, HD, bi == 0);
+                pmark("blocked attention: merge");
                 continue;
             }
             if (fa_ok()) {   // the fused kernel: the block's unnormalized output and its row stats
