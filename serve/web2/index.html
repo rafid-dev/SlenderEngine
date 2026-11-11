@@ -1,0 +1,324 @@
+<!doctype html>
+<html lang="en" data-theme="black" data-font="system" data-corners="soft" data-size="normal">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark light">
+<script src="web2/boot.js"></script>
+<title>SlenderEngine</title>
+<link rel="icon" href="web2/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="web2/app.css">
+</head>
+<body>
+<div class="app" id="app">
+  <!-- ------------------------------------------------------------------ sidebar -->
+  <aside class="side" id="side" aria-label="Chats and projects">
+    <div class="side__top">
+      <div class="brand"><img src="web2/favicon.svg" alt="" width="20" height="20"><span>SlenderEngine</span></div>
+      <button class="icon-btn" id="side-close" type="button" aria-label="Close sidebar" title="Close sidebar" data-icon="sidebar"></button>
+    </div>
+    <nav class="side__actions">
+      <button class="side-item" id="new-chat" type="button"><span data-icon="edit"></span><span>New chat</span></button>
+      <label class="side-search">
+        <span data-icon="search"></span>
+        <input id="chat-search" type="search" placeholder="Search chats" autocomplete="off" aria-label="Search chats">
+      </label>
+    </nav>
+    <div class="side__scroll" id="side-scroll">
+      <div class="side-head">
+        <span>Projects</span>
+        <button class="icon-btn icon-btn--sm" id="new-project" type="button" aria-label="New project" title="New project" data-icon="folder-plus"></button>
+      </div>
+      <div id="project-list" class="side-list"></div>
+      <div id="chat-list" class="side-list"></div>
+    </div>
+    <div class="side__foot">
+      <button class="side-item" id="open-settings" type="button"><span data-icon="settings"></span><span>Settings</span></button>
+    </div>
+  </aside>
+  <div class="scrim" id="scrim" hidden></div>
+
+  <!-- ------------------------------------------------------------------ main -->
+  <main class="main">
+    <header class="top">
+      <div class="top__left">
+        <button class="icon-btn" id="side-open" type="button" aria-label="Open sidebar" title="Open sidebar" data-icon="sidebar"></button>
+        <div class="model-pill" id="model-pill" title="Model">
+          <span class="dot" id="model-dot"></span><span id="model-name">Connecting…</span>
+        </div>
+      </div>
+      <div class="tabs" role="tablist" aria-label="Views">
+        <button class="tab" role="tab" id="tab-chat" aria-selected="true" aria-controls="view-chat" data-tab="chat">Chat</button>
+        <button class="tab" role="tab" id="tab-analytics" aria-selected="false" aria-controls="view-analytics" data-tab="analytics">Analytics</button>
+      </div>
+      <div class="top__right">
+        <button class="icon-btn" id="top-new" type="button" aria-label="New chat" title="New chat" data-icon="edit"></button>
+      </div>
+    </header>
+
+    <section class="view view--chat is-empty" id="view-chat" role="tabpanel" aria-labelledby="tab-chat">
+      <div class="thread" id="thread">
+        <div class="thread__inner">
+          <div class="chat-head" id="chat-head" hidden>
+            <span class="chat-head__project" id="chat-head-project"></span>
+          </div>
+          <div id="messages" class="messages" aria-live="polite"></div>
+        </div>
+      </div>
+      <div class="dock" id="dock">
+        <h1 class="greeting" id="greeting">Ready when you are.</h1>
+        <form class="composer" id="composer" autocomplete="off">
+          <div class="attachments" id="attachments" hidden></div>
+          <textarea id="input" rows="1" placeholder="Ask anything" aria-label="Message"></textarea>
+          <div class="composer__row">
+            <div class="composer__left">
+              <button class="icon-btn" id="attach-btn" type="button" aria-label="Attach files" title="Attach files: text, PDF, Word, Excel, PowerPoint, pictures" data-icon="plus"></button>
+              <button class="tool-toggle" id="search-btn" type="button" aria-pressed="false" title="Web search" hidden><span data-icon="globe"></span><span>Search</span></button>
+            </div>
+            <div class="composer__right">
+              <button class="ctx" id="ctx-btn" type="button" aria-haspopup="menu" title="Context used" hidden>
+                <svg viewBox="0 0 36 36" aria-hidden="true"><circle class="ctx__track" cx="18" cy="18" r="15"/><circle class="ctx__fill" id="ctx-fill" cx="18" cy="18" r="15"/></svg>
+                <span class="ctx__pct" id="ctx-pct"></span>
+              </button>
+              <div class="effort" id="effort">
+                <button class="effort__btn" id="effort-btn" type="button" aria-haspopup="listbox" aria-expanded="false" title="Reasoning effort">
+                  <span data-icon="brain"></span><span id="effort-label">High</span><span data-icon="chevron-down"></span>
+                </button>
+                <div class="menu effort__menu" id="effort-menu" role="listbox" aria-label="Reasoning effort" hidden></div>
+              </div>
+              <button class="send-btn" id="send-btn" type="submit" aria-label="Send" title="Send" data-icon="arrow-up"></button>
+              <button class="send-btn send-btn--stop" id="stop-btn" type="button" aria-label="Stop" title="Stop" data-icon="stop" hidden></button>
+            </div>
+          </div>
+        </form>
+        <p class="dock__note" id="dock-note">Runs on this machine. Nothing leaves it.</p>
+      </div>
+      <button class="jump" id="jump" type="button" aria-label="Scroll to the newest message" data-icon="arrow-down" hidden></button>
+    </section>
+
+    <section class="view view--analytics" id="view-analytics" role="tabpanel" aria-labelledby="tab-analytics" hidden>
+      <div class="an" id="an">
+        <div class="an__strip">
+          <span class="an-state" id="an-state"><span class="dot"></span><span id="an-state-text">Connecting…</span></span>
+          <span class="an__facts" id="an-facts"></span>
+        </div>
+        <div class="an__gauges">
+          <div class="gauge-card" id="g-decode">
+            <div class="gauge-card__head"><span>Decode</span><small>tokens per second while writing</small></div>
+            <div class="gauge"><svg viewBox="0 0 200 116" aria-hidden="true"><path class="gauge__track" d="M20 106 A80 80 0 0 1 180 106"/><path class="gauge__arc" pathLength="100" d="M20 106 A80 80 0 0 1 180 106"/><g class="gauge__ticks"></g></svg>
+              <div class="gauge__needle"></div><div class="gauge__hub"></div>
+              <div class="gauge__value"><b>0</b><span>tok/s</span></div>
+              <div class="gauge__scale"><span>0</span><span class="gauge__max">60</span></div></div>
+            <div class="gauge-card__foot"></div>
+          </div>
+          <div class="gauge-card" id="g-prefill">
+            <div class="gauge-card__head"><span>Prefill</span><small>tokens per second while reading the prompt</small></div>
+            <div class="gauge"><svg viewBox="0 0 200 116" aria-hidden="true"><path class="gauge__track" d="M20 106 A80 80 0 0 1 180 106"/><path class="gauge__arc" pathLength="100" d="M20 106 A80 80 0 0 1 180 106"/><g class="gauge__ticks"></g></svg>
+              <div class="gauge__needle"></div><div class="gauge__hub"></div>
+              <div class="gauge__value"><b>0</b><span>tok/s</span></div>
+              <div class="gauge__scale"><span>0</span><span class="gauge__max">1000</span></div></div>
+            <div class="gauge-card__foot"></div>
+          </div>
+        </div>
+        <h3 class="an__h">Hardware</h3>
+        <div class="an__cards" id="an-cards"></div>
+        <h3 class="an__h" id="an-disks-h">Disks</h3>
+        <div class="an__cards" id="an-disks"></div>
+        <p class="an__note" id="an-note"></p>
+      </div>
+    </section>
+  </main>
+</div>
+
+<!-- ------------------------------------------------------------------ settings -->
+<dialog class="settings" id="settings" aria-labelledby="settings-title">
+  <form method="dialog" class="settings__frame" id="settings-form">
+    <div class="settings__head">
+      <h2 id="settings-title">Settings</h2>
+      <button class="icon-btn" value="close" aria-label="Close settings" title="Close" data-icon="x"></button>
+    </div>
+    <div class="settings__body">
+      <nav class="settings__nav" id="settings-nav" role="tablist" aria-label="Settings sections">
+        <button type="button" role="tab" data-pane="general" aria-selected="true"><span data-icon="settings"></span>General</button>
+        <button type="button" role="tab" data-pane="appearance" aria-selected="false"><span data-icon="palette"></span>Appearance</button>
+        <button type="button" role="tab" data-pane="model" aria-selected="false"><span data-icon="sliders"></span>Model</button>
+        <button type="button" role="tab" data-pane="search" aria-selected="false"><span data-icon="globe"></span>Search</button>
+        <button type="button" role="tab" data-pane="context" aria-selected="false"><span data-icon="layers"></span>Context</button>
+        <button type="button" role="tab" data-pane="interface" aria-selected="false"><span data-icon="sparkle"></span>Interface</button>
+        <button type="button" role="tab" data-pane="connection" aria-selected="false"><span data-icon="key"></span>Connection</button>
+        <button type="button" role="tab" data-pane="data" aria-selected="false"><span data-icon="database"></span>Data</button>
+      </nav>
+      <div class="settings__panes">
+        <section class="pane" data-pane="general">
+          <label class="field">
+            <span class="field__label">System prompt</span>
+            <textarea id="s-system" rows="8" placeholder="Empty: the model's own behaviour. Write instructions here to apply them to every chat."></textarea>
+            <span class="field__note">Sent at the start of every chat. Changing it makes the next answer read the whole conversation again.</span>
+          </label>
+          <div class="row-toggle">
+            <span><b>Send with Enter</b><small>Shift+Enter makes a new line. Off: Ctrl+Enter sends.</small></span>
+            <button type="button" class="switch" id="s-enter" role="switch" aria-checked="true" aria-label="Send with Enter"></button>
+          </div>
+        </section>
+
+        <section class="pane" data-pane="appearance" hidden>
+          <div class="field">
+            <span class="field__label">Theme</span>
+            <div class="choice-grid" id="s-theme" role="radiogroup" aria-label="Theme">
+              <button type="button" role="radio" data-v="black"><span class="swatch" style="--a:#000;--b:#171717;--c:#ececec"></span><span>Black</span></button>
+              <button type="button" role="radio" data-v="graphite"><span class="swatch" style="--a:#212121;--b:#303030;--c:#ececec"></span><span>Graphite</span></button>
+              <button type="button" role="radio" data-v="periwinkle"><span class="swatch" style="--a:#0c0d18;--b:#1c1f3d;--c:#8e97f2"></span><span>Periwinkle</span></button>
+              <button type="button" role="radio" data-v="light"><span class="swatch" style="--a:#fff;--b:#ececec;--c:#0d0d0d"></span><span>Light</span></button>
+              <button type="button" role="radio" data-v="system"><span class="swatch swatch--split" style="--a:#000;--b:#fff;--c:#7ab7ff"></span><span>Match system</span></button>
+            </div>
+          </div>
+          <div class="field">
+            <span class="field__label">Font</span>
+            <div class="font-list" id="s-font" role="radiogroup" aria-label="Font">
+              <button type="button" role="radio" data-v="system" style="font-family:'Segoe UI Variable Text','Segoe UI',ui-sans-serif,system-ui,sans-serif"><b>System</b><small>Segoe UI on Windows, San Francisco on a Mac. Clean and familiar.</small></button>
+              <button type="button" role="radio" data-v="roboto" style="font-family:Roboto,'Segoe UI',sans-serif"><b>Roboto</b><small>Even and compact, easy on long answers.</small></button>
+              <button type="button" role="radio" data-v="arial" style="font-family:Arial,Helvetica,sans-serif"><b>Arial</b><small>The classic neutral sans-serif.</small></button>
+              <button type="button" role="radio" data-v="outfit" style="font-family:Outfit,sans-serif"><b>Outfit</b><small>Round and friendly; the earlier look.</small></button>
+              <button type="button" role="radio" data-v="georgia" style="font-family:Georgia,serif"><b>Georgia</b><small>A serif for reading long texts.</small></button>
+              <button type="button" role="radio" data-v="mono" style="font-family:'Cascadia Code',Consolas,monospace"><b>Monospace</b><small>Every letter the same width, like a terminal.</small></button>
+            </div>
+            <span class="field__note">Fonts come from this PC (Outfit comes with the app); one that is missing falls back to the system font.</span>
+          </div>
+          <div class="field-pair">
+            <div class="field"><span class="field__label">Corners</span>
+              <div class="seg" id="s-corners" role="radiogroup" aria-label="Corners">
+                <button type="button" role="radio" data-v="sharp">Sharp</button><button type="button" role="radio" data-v="soft">Soft</button><button type="button" role="radio" data-v="round">Round</button>
+              </div></div>
+            <div class="field"><span class="field__label">Text size in chats</span>
+              <div class="seg" id="s-size" role="radiogroup" aria-label="Text size in chats">
+                <button type="button" role="radio" data-v="small">Small</button><button type="button" role="radio" data-v="normal">Normal</button><button type="button" role="radio" data-v="large">Large</button>
+              </div></div>
+          </div>
+        </section>
+
+        <section class="pane" data-pane="model" hidden>
+          <div class="row-toggle">
+            <span><b>Use the model's own sampling</b><small>The server picks the model card's values for thinking or not thinking.</small></span>
+            <button type="button" class="switch" id="s-card" role="switch" aria-checked="true" aria-label="Use the model's own sampling"></button>
+          </div>
+          <div id="sampling" class="sampling">
+            <label class="field field--slider"><span class="field__label">Temperature <output id="o-temp"></output></span>
+              <input type="range" id="s-temp" min="0" max="1.5" step="0.05"></label>
+            <label class="field field--slider"><span class="field__label">Top P <output id="o-topp"></output></span>
+              <input type="range" id="s-topp" min="0.05" max="1" step="0.01"></label>
+            <label class="field field--slider"><span class="field__label">Top K <output id="o-topk"></output></span>
+              <input type="range" id="s-topk" min="1" max="100" step="1"></label>
+          </div>
+          <div class="field-pair">
+            <label class="field"><span class="field__label">Max answer tokens</span>
+              <input type="number" id="s-max" min="1" placeholder="No limit"></label>
+            <label class="field"><span class="field__label">Seed</span>
+              <input type="number" id="s-seed" placeholder="Random"></label>
+          </div>
+          <div class="row-toggle" id="row-mcp">
+            <span><b>Tools from MCP servers</b><small id="mcp-note">No MCP servers are set up in the run config.</small></span>
+            <button type="button" class="switch" id="s-mcp" role="switch" aria-checked="true" aria-label="Tools from MCP servers"></button>
+          </div>
+        </section>
+
+        <section class="pane" data-pane="search" hidden>
+          <div class="row-toggle">
+            <span><b>Web search</b><small>Lets the model search the web and read pages, through SearXNG on this PC. Off by default; switching it on starts SearXNG when the server knows how.</small></span>
+            <button type="button" class="switch" id="s-search" role="switch" aria-checked="false" aria-label="Web search"></button>
+          </div>
+          <p class="status-line" id="search-status">Checking…</p>
+          <p class="field__note">Searches go out from SearXNG to the search engines it is set up for; the model can also read public web pages it finds. Pages on this PC or your local network are never read.</p>
+        </section>
+
+        <section class="pane" data-pane="context" hidden>
+          <div class="row-toggle">
+            <span><b>Compact long chats automatically</b><small>When a chat fills the context, older messages are summarised for the model. You still see them; the model reads the summary.</small></span>
+            <button type="button" class="switch" id="s-compact" role="switch" aria-checked="true" aria-label="Compact long chats automatically"></button>
+          </div>
+          <label class="field field--slider"><span class="field__label">Compact at <output id="o-compact"></output></span>
+            <input type="range" id="s-compact-at" min="50" max="95" step="5"></label>
+          <p class="field__note">Each compaction is one short request, then the next answer reads the shorter conversation once. The ring next to the effort menu shows how full the context is; click it to compact by hand.</p>
+        </section>
+
+        <section class="pane" data-pane="interface" hidden>
+          <div class="row-toggle">
+            <span><b>Typing effect</b><small>New words fade in with a small wobble as the model writes.</small></span>
+            <button type="button" class="switch" id="s-typing" role="switch" aria-checked="true" aria-label="Typing effect"></button>
+          </div>
+          <div class="row-toggle">
+            <span><b>Show thinking while it streams</b><small>The thinking block opens while the model thinks and folds when the answer starts.</small></span>
+            <button type="button" class="switch" id="s-think" role="switch" aria-checked="true" aria-label="Show thinking while it streams"></button>
+          </div>
+          <div class="row-toggle">
+            <span><b>Draw math</b><small>Formulas like \( x^2 \) and $$ \int f $$ are drawn with KaTeX, on this machine.</small></span>
+            <button type="button" class="switch" id="s-math" role="switch" aria-checked="true" aria-label="Draw math"></button>
+          </div>
+        </section>
+
+        <section class="pane" data-pane="connection" hidden>
+          <label class="field">
+            <span class="field__label">API key</span>
+            <input type="password" id="s-key" placeholder="Only needed when the server was started with a key" autocomplete="off">
+            <span class="field__note">Kept in this browser only.</span>
+          </label>
+          <dl class="facts" id="facts"></dl>
+          <p class="field__note">The previous Strata page stays on the <a href="classic">classic page</a> for now.</p>
+        </section>
+
+        <section class="pane" data-pane="data" hidden>
+          <p class="field__note">Chats and projects are kept in this browser (IndexedDB). The server never stores them. Attached documents' text is kept by the server next to its run config, so the model can read them.</p>
+          <div class="row-toggle">
+            <span><b>Export</b><small>Every chat and project as one JSON file.</small></span>
+            <button type="button" class="btn" id="s-export">Export</button>
+          </div>
+          <div class="row-toggle">
+            <span><b>Import</b><small>A file exported here. Chats already in this browser are kept; newer copies replace older ones.</small></span>
+            <button type="button" class="btn" id="s-import">Import</button>
+          </div>
+          <div class="row-toggle">
+            <span><b>Attached documents on the server</b><small id="files-note">Their text is kept so the model can read them; the oldest go after 30 days or past 2 GB.</small></span>
+            <button type="button" class="btn btn--danger" id="s-files-clear">Delete documents</button>
+          </div>
+          <div class="row-toggle">
+            <span><b>Delete every chat</b><small>Projects stay. This cannot be undone.</small></span>
+            <button type="button" class="btn btn--danger" id="s-wipe">Delete chats</button>
+          </div>
+        </section>
+      </div>
+    </div>
+  </form>
+</dialog>
+
+<dialog class="settings settings--small" id="proj-dialog" aria-labelledby="proj-title">
+  <form method="dialog" class="settings__frame" id="proj-form">
+    <div class="settings__head">
+      <h2 id="proj-title">Project</h2>
+      <button class="icon-btn" type="button" data-close aria-label="Close" title="Close" data-icon="x"></button>
+    </div>
+    <div class="settings__panes">
+      <div class="pane">
+        <label class="field"><span class="field__label">Name</span><input type="text" id="proj-name" maxlength="80" required></label>
+        <label class="field"><span class="field__label">Instructions</span>
+          <textarea id="proj-instr" rows="8" placeholder="Optional. How the model should work in this project's chats, background it should know, the style to answer in."></textarea>
+          <span class="field__note">Added after the system prompt in every chat of this project.</span></label>
+        <div class="dialog-actions"><button class="btn" type="button" data-close>Cancel</button><button class="btn btn--primary" value="save" id="proj-save">Save</button></div>
+      </div>
+    </div>
+  </form>
+</dialog>
+
+<div class="menu ctx-menu" id="ctx-menu" role="menu" hidden></div>
+<div class="toasts" id="toasts" aria-live="polite"></div>
+<input type="file" id="file-input" multiple hidden>
+<input type="file" id="import-input" accept="application/json,.json" hidden>
+
+<script src="web2/icons.js"></script>
+<script src="web2/math.js"></script>
+<script src="web2/math-adapter.js"></script>
+<script src="web2/markdown.js"></script>
+<script src="web2/store.js"></script>
+<script src="web2/typing.js"></script>
+<script src="web2/app.js"></script>
+<script src="web2/analytics.js"></script>
+</body>
+</html>

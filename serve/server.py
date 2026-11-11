@@ -509,6 +509,13 @@ class GpuBusy(RuntimeError):
 # The page's only CSP directive: its preview frames (srcdoc) may not load any address. Other directives are left out
 # on purpose: a frame made from srcdoc inherits the page's policy, and the opt-in "run scripts" preview needs its own inline script.
 PAGE_CSP = "frame-src 'none'"
+# The SlenderEngine web app (serve/web2): its own files only. No inline or remote scripts (an injected <script> does not
+# run), no remote pictures, fonts or connections (a chat that holds a link to a tracking image cannot load it, and a
+# script cannot send the API key in localStorage anywhere), no frames, and no other site may frame the page
+# (clickjacking). Inline styles stay allowed: the page and KaTeX set element styles. data: pictures are the user's own.
+WEB2_CSP = ("default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; "
+            "font-src 'self' data:; connect-src 'self'; media-src 'self' data: blob:; object-src 'none'; frame-src 'none'; "
+            "worker-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'")
 
 
 def unload_wait(value, default: float) -> float:
@@ -4780,6 +4787,7 @@ class Service:
         self.keep_awake = None                        # #1727 (opt-in): serve.keepawake.KeepAwake, the config's "prevent_sleep"
         self.fifo = threading.Lock()
         self.slot_save_path = None                    # --slot-save-path: /slots/0?action=save|restore (off when None)
+        self.parker = None                            # --park-dir: disk parking (serve/park.py), off when None
         self.embeddings = threading.local()           # the current request's image embeddings file (GENI)
         self.api_key = ""                              # when set, /v1/* needs it (Bearer or x-api-key)
         # #458 (opt-in, the config's "effort_position": "end"): a non-default reasoning effort goes in a short system
@@ -4839,6 +4847,7 @@ class Service:
         self.status_lock = threading.Lock()
         self.admission_changed = threading.Condition(self.status_lock)
         self.mcp = None                                  # serve/mcp.py's McpHub when MCP servers are configured
+        self.builtins = None                             # serve/builtin_tools.py: web search, web pages, attached files
         self.offline = False                             # no image URL fetch or MCP subprocess in strict local mode
         self.telemetry_key = ""                         # optional read-only key, valid only on /v1/telemetry
         # sharing the GPU with other programs (all off by default): unload the engine after this many idle seconds,
@@ -4947,6 +4956,21 @@ class Service:
                 cancel.set()
                 if active:
                     self.client_disconnect_cancels += 1
+
+    def _solo_acquire(self, pk, key, timeout: float) -> bool:
+        """The single turn for a request (solo engine).  Without disk parking: the plain lock, as before.  With it
+        (rules 10-11): the request that continues the held conversation goes first, then the one with the least to
+        read; past park wait_cap_s plain arrival order, and a turn left free for a second goes to whoever asks."""
+        if pk is None:
+            return self.fifo.acquire(timeout=timeout)
+        end = time.monotonic() + timeout
+        while True:
+            if pk.is_next(key) and self.fifo.acquire(timeout=0.05):
+                return True
+            rem = end - time.monotonic()
+            if rem <= 0:
+                return False
+            pk.wait(min(0.1, rem))
 
     @contextlib.contextmanager
     def _inference_fifo(self, deadline: float | None, cancel: threading.Event | None = None):
@@ -5059,6 +5083,8 @@ class Service:
             if waiting:                                     # never reached the FIFO (an exception while waiting)
                 with self.status_lock:
                     self.status["queued"] -= 1
+        if action == "restore" and self.parker is not None:
+            self.parker.forget()
         if action == "save":
             return 200, {"id_slot": 0, "filename": filename, "n_saved": r["tokens"], "n_written": r["bytes"],
                          "timings": {"save_ms": r["ms"]}}
@@ -5638,9 +5664,22 @@ class Service:
                     | {"wallclock_s": r.get("wallclock_s", round(time.perf_counter() - r["_clock"], 3))}
                     for r in reversed(records)]
 
-    def metrics(self, all_requests=False) -> dict:
+    def live_view(self) -> dict:
+        """GET /v1/live: what the web app's Analytics tab polls each second - what the engine is doing, the last
+        request's speeds and the hardware with its minute of history.  Cheap: no log reading, no request list."""
+        live = self.metrics(live_only=True)
+        tel = self.telemetry.snapshot() if getattr(self, "telemetry", None) else {"now": {}, "history": {}, "static": {}}
+        with self.status_lock:
+            last = dict(self.last_timings) if self.last_timings else None
+            t = dict(self.totals)
+        return {"live": live, "last": last, "model": self.model, "max_context": self.reported_ctx(),
+                "totals": {k: t.get(k) for k in ("requests", "output_tokens", "prompt_tokens", "reused", "prompt_ms",
+                                                 "decode_ms")},
+                "hardware": tel["now"], "history": tel["history"], "static": tel["static"], "time": time.time()}
+
+    def metrics(self, all_requests=False, live_only=False) -> dict:
         """GET /metrics: what the Monitor tab shows - the engine's facts, what it is doing, the last requests, and
-        the hardware (with a minute of history per series)."""
+        the hardware (with a minute of history per series).  `live_only`: just the "live" part (live_view)."""
         with self.status_lock:
             s = dict(self.status)
             if self.live_reqs:                          # parallel requests: the newest one's status
@@ -5686,12 +5725,15 @@ class Service:
             live["replicas"] = self.engine.replica_view()
         if hasattr(self.engine, "split_view"):          # opt-in split serving: the hand-overs so far (serve/split.py)
             live["split_serve"] = self.engine.split_view()
+        if live_only:
+            return live
         engine = {"model": self.model, "max_context": self.reported_ctx(), "images": self.vision is not None,
                   **dict(getattr(self.engine, "info", {}) or {})}
         tel = self.telemetry.snapshot() if getattr(self, "telemetry", None) else {"now": {}, "history": {}, "static": {}}
         parked = self.conv_log.poll(getattr(self.engine, "log_path", None), getattr(self.engine, "log_start", None))
         return {"engine": engine, "live": live, "requests": hist[::-1][:None if all_requests else 12],
                 "conversation_cache": conversation_cache_view(engine, hist, totals, parked),
+                **({"park": self.parker.stats()} if self.parker is not None else {}),
                 "requests_kept": len(hist), "totals": totals, "hardware": tel["now"],
                 "hardware_static":
                 tel["static"], "history": tel["history"], "time": now}
@@ -6312,28 +6354,40 @@ class Service:
         try:
             # --batch: the engine runs several requests at once (StrataEngine.generate_batched orders them)
             turn = contextlib.ExitStack()
+            # disk parking (serve/park.py, opt-in --park-dir): one conversation at a time, cheap to switch
+            pk = self.parker if not par else None
+            park_space = getattr(cancel, "_strata_park_space", "host")
+            park_key = object()
             if not par:
                 # #1619: a request waiting for the single turn sends a keep-alive every QUEUE_BEAT_S, so a client with
                 # a stream idle timeout does not abort a healthy queued request (and its retry read the prompt again);
                 # a client that left while queued gives its place up instead of taking the turn only to cancel there
                 got = False
-                while not got:
-                    if cancel.is_set():
-                        raise QueueCancelled("the client disconnected while waiting for the engine")
-                    left = deadline - time.monotonic() if deadline is not None else QUEUE_BEAT_S
-                    if left <= 0:
-                        raise QueueWaitExpired("the inference queue wait deadline expired; retry later")
-                    got = self.fifo.acquire(timeout=min(QUEUE_BEAT_S, left))
-                    if got:
+                if pk is not None:
+                    pk.enter(park_key, ids, park_space)
+                try:
+                    while not got:
                         if cancel.is_set():
-                            self.fifo.release()
                             raise QueueCancelled("the client disconnected while waiting for the engine")
-                        if deadline is not None and time.monotonic() >= deadline:
-                            self.fifo.release()
+                        left = deadline - time.monotonic() if deadline is not None else QUEUE_BEAT_S
+                        if left <= 0:
                             raise QueueWaitExpired("the inference queue wait deadline expired; retry later")
-                        turn.callback(self.fifo.release)
-                    else:
-                        yield "ping", None
+                        got = self._solo_acquire(pk, park_key, min(QUEUE_BEAT_S, left))
+                        if got:
+                            if cancel.is_set():
+                                self.fifo.release()
+                                raise QueueCancelled("the client disconnected while waiting for the engine")
+                            if deadline is not None and time.monotonic() >= deadline:
+                                self.fifo.release()
+                                raise QueueWaitExpired("the inference queue wait deadline expired; retry later")
+                            if pk is not None:
+                                turn.callback(pk.notify)        # (runs after the release below: LIFO)
+                            turn.callback(self.fifo.release)
+                        else:
+                            yield "ping", None
+                finally:
+                    if pk is not None:
+                        pk.leave(park_key)
             with turn:
                 try:
                     with self.status_lock:
@@ -6377,6 +6431,11 @@ class Service:
                     while True:
                         segment_before = getattr(self.engine, "last", None)
                         segments_before = len(segments)     # (#879: a pass sent again leaves no segment)
+                        if pk is not None:
+                            try:
+                                pk.before(prompt, park_space, images=bool(emb), cancel=cancel)
+                            except Exception as e:  # noqa: BLE001 - parking never fails a request
+                                print(f"[strata] park: skipped for this request ({type(e).__name__}: {e})", flush=True)
                         gen = self.engine.generate(prompt, max_new - n, sampling, cancel, embeddings=emb) if emb \
                             else self.engine.generate(prompt, max_new - n, sampling, cancel)
                         recover_prompt = None
@@ -6495,6 +6554,14 @@ class Service:
                             segment_done = getattr(self.engine, "last", None)
                             if segment_done is not None and segment_done is not segment_before:
                                 segments.append(dict(segment_done))
+                            if pk is not None:
+                                try:
+                                    if nonfinite or finish == "error":
+                                        pk.forget()         # the engine dropped its state (#879) or may have ended
+                                    else:
+                                        pk.after(prompt, seg, park_space, images=bool(emb))
+                                except Exception as e:  # noqa: BLE001
+                                    print(f"[strata] park: could not note the pass ({e})", flush=True)
                         if nonfinite and not cancel.is_set():
                             # #879: the engine emitted none of the poisoned window's tokens and reads its next prompt
                             # from token 0.  Nothing sent yet: the same request once more, unseen by the client
@@ -7676,6 +7743,9 @@ def make_handler(svc: Service):
             request is HTTP/1.0 and fully read here, so no later bytes are expected - data is not a hang-up."""
             done = self.watch_done = threading.Event()
             self.cancel_event = cancel
+            # disk parking's namespace: the sandbox's gate replaces any client copy of this header with its own
+            space = str(self.headers.get("X-Strata-Park-Space") or "").strip().lower()
+            setattr(cancel, "_strata_park_space", "sandbox" if space == "sandbox" else "host")
             with svc.status_lock:
                 svc.active_cancels.add(cancel)
             sock = self.connection
@@ -7826,12 +7896,14 @@ def make_handler(svc: Service):
                 self.end_headers()
                 self.wfile.write(body)
                 return
-            if path.startswith("/web/"):
-                # the web app's own files (serve/web): styles, script, icon sprite - same origin, no CDN
-                name = path[len("/web/"):]
+            if path.startswith(("/web/", "/web2/")):
+                # the web app's own files (serve/web, and the SlenderEngine app's serve/web2): styles, scripts, icons -
+                # same origin, no CDN, flat folders only
+                folder = "web2" if path.startswith("/web2/") else "web"
+                name = path[len(folder) + 2:]
                 types = {".css": "text/css; charset=utf-8", ".js": "text/javascript; charset=utf-8",
                          ".svg": "image/svg+xml"}
-                f = ROOT / "serve" / "web" / name
+                f = ROOT / "serve" / folder / name
                 ext = os.path.splitext(name)[1]
                 if "/" in name or "\\" in name or ext not in types or not f.is_file():
                     self._json(404, {"error": {"message": "not found"}})
@@ -7839,6 +7911,7 @@ def make_handler(svc: Service):
                 body = f.read_bytes()
                 self.send_response(200)
                 self.send_header("Content-Type", types[ext])
+                self.send_header("X-Content-Type-Options", "nosniff")
                 self.send_header("Cache-Control", "no-cache")
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
@@ -8065,17 +8138,59 @@ def make_handler(svc: Service):
                 if self._authorized():
                     self._json(200, svc.mcp.status() if svc.mcp else {"servers": [], "tools": 0})
                 return
-            if path == "" or (path == "/api-monitor" and svc.api_monitor):
-                body = (ROOT / "serve" / "web" / ("monitor.html" if path else "index.html")).read_bytes()
+            if path == "/v1/live":                           # the web app's Analytics tab, once a second
+                if self._authorized():
+                    self._json(200, svc.live_view())
+                return
+            if path == "/v1/search":                         # is web search (SearXNG) running? (the web app's switch)
+                if self._authorized():
+                    b = svc.builtins
+                    self._json(200, b.searx.status() if b is not None and b.searx is not None
+                               else {"url": None, "up": False, "can_start": False, "starting": False, "error": None})
+                return
+            if path == "/v1/files":                          # how much the attached files take (Settings > Data)
+                if self._authorized():
+                    b = svc.builtins
+                    self._json(200, b.files.usage() if b is not None and b.files is not None else {"files": 0, "bytes": 0})
+                return
+            if path.startswith("/v1/files/"):                # an attached file's facts (never its text)
+                if self._authorized():
+                    b = svc.builtins
+                    doc = b.files.get(path[len("/v1/files/"):]) if b is not None and b.files is not None else None
+                    if doc is None:
+                        self._json(404, {"error": {"message": "no such file"}})
+                    else:
+                        from serve.builtin_tools import FileStore
+                        self._json(200, FileStore.summary(doc))
+                return
+            if path in ("", "/classic") or (path == "/api-monitor" and svc.api_monitor):
+                # "" is the SlenderEngine app (serve/web2); /classic keeps the Strata app (serve/web) until it is retired.
+                # The classic page's relative links (web/app.js, health, ...) resolve to the root from /classic as well.
+                page = (ROOT / "serve" / "web2" / "index.html" if path == "" else
+                        ROOT / "serve" / "web" / ("monitor.html" if path == "/api-monitor" else "index.html"))
+                body = page.read_bytes()
                 self.send_response(200)
                 self.send_header("Content-Type", "text/html; charset=utf-8")
-                if not path:
+                if path == "":
+                    self.send_header("Content-Security-Policy", WEB2_CSP)
+                    self.send_header("X-Frame-Options", "DENY")          # frame-ancestors for browsers without CSP 2
+                    self.send_header("Referrer-Policy", "no-referrer")   # a link the model wrote gets no address of this PC
+                    self.send_header("X-Content-Type-Options", "nosniff")
+                    self.send_header("Cache-Control", "no-cache")
+                elif path != "/api-monitor":
                     # the chat's svg/html preview is a sandboxed frame; this keeps it from navigating away to a web page
                     # (a link or <meta refresh> inside a model's html), which no sandbox flag does (serve/web/preview.js)
                     self.send_header("Content-Security-Policy", PAGE_CSP)
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
                 self.wfile.write(body)
+            elif path == "/v1/park":                      # disk parking: what is kept (sizes, ages; never text)
+                if svc.parker is None:
+                    self._json(404, {"error": {"message": "disk parking is off (start the server with --park-dir)"}})
+                else:
+                    with svc.parker.lock:
+                        files = svc.parker.store.listing()
+                    self._json(200, {"park": svc.parker.stats(), "files": files})
             elif path in ("/health", "/api/health"):
                 self._json(200, {"status": "ok", "max_context": svc.reported_ctx(), "model": svc.model,
                                  "images": svc.vision is not None, "api_key": bool(svc.api_key),
@@ -8250,6 +8365,68 @@ def make_handler(svc: Service):
                             svc.fifo.release()
                         result = "loaded"
                     self._json(200, {"status": result, **svc.v1_status()})
+                    return
+                if path in ("/v1/park/clear", "/v1/park/delete"):   # disk parking: delete kept conversations
+                    if svc.parker is None:
+                        self._json(404, {"error": {"message": "disk parking is off (start the server with --park-dir)"}})
+                        return
+                    if not self._own_page("kept conversations can be deleted"):
+                        return
+                    with svc.parker.lock:
+                        if path == "/v1/park/clear":
+                            n = svc.parker.store.clear()
+                        else:
+                            fid = str(req.get("id") or "")
+                            n = 1 if fid in svc.parker.store.files else 0
+                            svc.parker.store.drop(fid, count=False)
+                            svc.parker.store.save_index()
+                        h = svc.parker.held
+                        if h is not None and h.get("file") not in svc.parker.store.files:
+                            h["file"], h["saved_len"] = None, 0
+                    self._json(200, {"deleted": n})
+                    return
+                if path == "/v1/files/clear":                # delete every attached file's text (Settings > Data)
+                    b = svc.builtins
+                    if b is None or b.files is None:
+                        self._json(404, {"error": {"message": "attached files are not set up on this server"}})
+                        return
+                    if not self._own_page("attached files can be deleted"):
+                        return
+                    n = b.files.clear()
+                    print(f"[strata] deleted {n} attached file(s) on request", flush=True)
+                    self._json(200, {"deleted": n})
+                    return
+                if path == "/v1/files":                      # a file attached in the web app: its text, kept here
+                    b = svc.builtins
+                    if b is None or b.files is None:
+                        self._json(404, {"error": {"message": "attached files are not set up on this server"}})
+                        return
+                    if not self._own_page("files can be attached"):
+                        return
+                    from serve.builtin_tools import ExtractError, FileStore
+                    try:
+                        data = base64.b64decode(str(req.get("data") or ""), validate=True)
+                    except ValueError:
+                        raise ValueError("data: the file's bytes in base64") from None
+                    try:
+                        doc = b.files.put(str(req.get("name") or "file"), data)
+                    except ExtractError as e:
+                        self._json(422, {"error": {"type": "invalid_request_error", "message": str(e)}})
+                        return
+                    inline = req.get("inline_chars")
+                    inline = inline if isinstance(inline, int) and not isinstance(inline, bool) and inline > 0 else 0
+                    print(f"[strata] attached {doc['name']}: {doc['kind']}, {len(doc['pages'])} part(s), "
+                          f"{doc['chars']:,} characters", flush=True)
+                    self._json(200, FileStore.summary(doc, inline_chars=min(inline, 200000)))
+                    return
+                if path == "/v1/search/start":               # the web app switched web search on: start SearXNG
+                    b = svc.builtins
+                    if b is None or b.searx is None:
+                        self._json(404, {"error": {"message": "web search is not set up on this server"}})
+                        return
+                    if not self._own_page("web search can be started"):
+                        return
+                    self._json(200, b.searx.start())
                     return
                 if path == "/v1/vram":                       # #533: give VRAM back to other programs, or take it
                     if not self._own_page("the VRAM reserve can be changed"):
@@ -8616,12 +8793,20 @@ def make_handler(svc: Service):
                                      f"(0..{n_vocab - 1})")
             bias_api.validate_request(req, svc.engine, len(getattr(svc.tok, "tokens", ())) or None)
             use_mcp = req.get("strata_mcp") is True and svc.mcp is not None      # the web app's opt-in (serve/mcp.py)
+            # the web app's own tools (serve/builtin_tools.py): web search, web pages, attached files - asked for by name
+            wanted = req.get("strata_builtin")
+            builtin = [n for n in wanted if isinstance(n, str)] if isinstance(wanted, list) and svc.builtins else []
             own = {t.get("name") for t in tools or [] if isinstance(t, dict)}   # #592: a second line of defence
-            if use_mcp:
+            hub = svc.mcp
+            if use_mcp or builtin:
                 if not self._own_page("MCP tools can be used"):   # tools run with the user's rights on this PC
                     return
-                svc.mcp.wait(10)                                  # servers still starting (only right after start)
-                extra = svc.mcp.template_tools(exclude=own)       # the request's own tools win a name clash
+                if use_mcp:
+                    svc.mcp.wait(10)                              # servers still starting (only right after start)
+                if builtin:
+                    from serve.builtin_tools import ToolRouter
+                    hub = ToolRouter(svc.mcp, svc.builtins, builtin, external=use_mcp)
+                extra = hub.template_tools(exclude=own)           # the request's own tools win a name clash
                 use_mcp = bool(extra)
                 tools = (tools or []) + extra or None
             if force and use_mcp:
@@ -8633,7 +8818,7 @@ def make_handler(svc: Service):
             self._watch_client(cancel)                       # #430 #431 (#1999: before prepare, which can take long)
             ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, force=force, req=req, cancel=cancel)
             _debug_req("openai", req, messages, tools, max_new, thinking, len(ids))
-            run = run_with_mcp(svc, svc.mcp, messages, tools, kw, ids, thinking, max_new, max_req, req, cancel,
+            run = run_with_mcp(svc, hub, messages, tools, kw, ids, thinking, max_new, max_req, req, cancel,
                                {t["name"] for t in extra}) if use_mcp else None
             chunks = openai_chunks(svc, req, ids, thinking, tools, max_new, cancel, run=run, force=force)
             if validator is not None:
@@ -9941,6 +10126,10 @@ def _main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> i
     ap.add_argument("--slot-save-path", default=None, metavar="DIR",
                     help="enable POST /slots/0?action=save|restore {\"filename\": NAME} (llama-server's API): the "
                          "conversation the engine holds, to or from DIR/NAME (also \"slot_save_path\" in the config)")
+    ap.add_argument("--park-dir", default=None, metavar="DIR",
+                    help="disk parking (opt-in): conversations the engine lets go of (a subagent, a second chat, a "
+                         "restart) are kept in DIR/<model> as session files and restored instead of read again; "
+                         "also \"park_dir\" in the config.  Not with --parallel")
     ap.add_argument("--replicas", type=int, default=None, metavar="N",
                     help="data-parallel replicas (opt-in): cut the \"gpu\" list into N equal groups and run one engine on "
                          "each, requests spread over them (also \"replicas\" in the config: a number, or "
@@ -10315,6 +10504,47 @@ def _main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> i
             raise SystemExit(f"[strata] {e}")
         print(f"[strata] slot save/restore on: {svc.slot_save_path} (session files are kept until deleted: "
               "about 1.2 GB per 63K-token conversation; restore only files this server wrote)", flush=True)
+    park_dir = a.park_dir or cfg.get("park_dir")
+    if park_dir:
+        if getattr(engine, "batch", 0) or not hasattr(engine, "session_file"):
+            print("[strata] disk parking is off: it needs one request at a time and an engine with session files "
+                  "(not --parallel)", flush=True)
+        else:
+            try:
+                from serve.park import ParkStore, Parker
+
+                def num(key, default):
+                    v = cfg.get(key, default)
+                    if isinstance(v, bool) or not isinstance(v, (int, float)) or v < 0:
+                        raise ValueError(f"config {key} must be a number >= 0, not {v!r}")
+                    return float(v)
+                private = cfg.get("park_private") is True
+                store = ParkStore(park_dir if os.path.isabs(str(park_dir)) else
+                                  os.path.join(cfg.get("cwd") or os.getcwd(), str(park_dir)),
+                                  cfg.get("model_name") or svc.model,
+                                  budget_gib=num("park_budget_gib", 24), min_free_gb=num("park_min_free_gb", 50),
+                                  write_cap_gb=num("park_write_cap_gb", 200),
+                                  ttl_scale=0.5 if private else 1.0, clear_on_stop=private)
+
+                def magic_ok(path):
+                    try:
+                        with open(path, "rb") as f:
+                            return f.read(8) == b"STRSESS\x01"
+                    except OSError:
+                        return False
+                swept = store.sweep(magic_ok)
+                turn = svc.tok.encode("<|im_start|>", parse_special=True)
+                svc.parker = Parker(svc, store, idle_s=num("park_idle_s", 60),
+                                    turn_token=turn[0] if len(turn) == 1 else None)
+                svc.parker.start()
+                if not getattr(engine, "session_save_reclaim", False):
+                    print("[strata] disk parking: the engine runs without --session-save-reclaim, so a save is refused "
+                          "whenever free RAM is under its floor; add it to the config's args", flush=True)
+                print(f"[strata] disk parking on: {store.dir} ({len(store.files)} kept, {swept} removed at start; "
+                      f"budget {store.budget / 2**30:.0f} GiB{', private: half lifetimes, cleared on stop' if private else ''})",
+                      flush=True)
+            except (ValueError, OSError) as e:
+                raise SystemExit(f"[strata] disk parking: {e}")
     mode = str(cfg.get("anthropic_thinking") or "model")   # #278: "on_request" = only when the request asks
     if mode not in ("model", "on_request"):
         raise SystemExit(f"[strata] config anthropic_thinking must be \"model\" or \"on_request\", not {mode!r}")
@@ -10375,6 +10605,24 @@ def _main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> i
                       ", ".join(f"{k}={v}" for k, v in svc.shared.items()), flush=True)
         except (OSError, ValueError):
             svc.shared = {}
+    # the web app's own tools (serve/builtin_tools.py): attached files' text is kept next to the run config; web search
+    # asks SearXNG ("searxng_url"), started by "searxng_start" (a command) when the page switches search on
+    from serve.builtin_tools import Builtins, FileStore, Searx
+    start_cmd = cfg.get("searxng_start")
+    if start_cmd is not None and not (isinstance(start_cmd, str) or (isinstance(start_cmd, list)
+                                                                     and all(isinstance(x, str) for x in start_cmd))):
+        raise SystemExit("[strata] config \"searxng_start\": a command, as a string or a list of strings")
+    if cfg.get("searxng_url") is not None and not isinstance(cfg["searxng_url"], str):
+        raise SystemExit("[strata] config \"searxng_url\": an address like http://127.0.0.1:8888")
+    files_dir = cfg.get("files_dir") if isinstance(cfg.get("files_dir"), str) else         str(Path(a.config).with_suffix(".files")) if a.config else str(Path.cwd() / ".web-files")
+    limits = {}
+    for key, default in (("files_max_mb", 2048), ("files_keep_days", 30)):
+        v = cfg.get(key, default)
+        if isinstance(v, bool) or not isinstance(v, (int, float)) or v < 0:
+            raise SystemExit(f"[strata] config \"{key}\": a number, 0 or more (0: no limit), not {v!r}")
+        limits[key] = v
+    svc.builtins = Builtins(FileStore(files_dir, max_bytes=int(limits["files_max_mb"] * 2**20), keep_days=limits["files_keep_days"]),
+                            Searx(cfg.get("searxng_url") or "http://127.0.0.1:8888", start_cmd))
     if hub is not None:
         import atexit
         svc.mcp = hub
@@ -10457,7 +10705,7 @@ def _main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> i
                 svc.wait_for_drain(5)
                 drained = False
         closers = [httpd.shutdown, getattr(engine, "close", None), vision.shutdown if vision else None,
-                   hub.close if hub is not None else None]
+                   hub.close if hub is not None else None, svc.parker.close if svc.parker is not None else None]
         try:
             for close in filter(None, closers):
                 try:

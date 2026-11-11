@@ -166,6 +166,32 @@ With `STRATA_IQ_MT_MIN=1`, `STRATA_ROUTE_TAIL_SKIP=0`, `STRATA_PREFILL_CPU_SHARE
 and the tuned setup at `--spec 3` gave byte-identical answers on 3 short prompts. `--spec 4` changes the wording on upstream and this fork alike. Partial page-locking's
 PCIe path and the RAM moves did not run in that check. In normal use answers can vary between runs on any engine: `STRATA_PREFILL_CPU_SHARE` splits short prompts by measured timing, and upstream's reproducibility list does not turn it off.
 
+## Disk parking (opt-in)
+
+The engine holds one conversation at a time. A request that doesn't continue it (an agent's subagent, a title, a second chat) or an engine restart
+replaces it, and the next turn of the first conversation reads its whole history again: about two minutes at 150K tokens on this PC. With
+`--park-dir DIR` (or `"park_dir"` in the config) the server keeps such conversations on the SSD as session files, using the engine's existing
+`SAVE` / `RESTORE`, and restores one instead of reading it again (`serve/park.py`). No extra RAM, and nothing changes what the engine computes.
+
+- **Park on switch:** before a request that leaves a conversation of 4,096+ tokens, that conversation is saved (skipped when its file is up to date).
+- **Restore when it pays:** a saved file is restored when reading the tokens it covers would take longer than restoring the whole file
+  (about 0.6 ms a token to read, 0.2 s + 17 µs a token to restore).
+- **Idle save:** after `park_idle_s` (60) idle, a conversation that grew is saved again, so a restart or crash costs a restore, not a re-read.
+- **Shared openings:** an opening that two new conversations share (an agent's system prompt and tools) is saved once on its own and restored for the next.
+- **Queue:** while several requests wait, the one that continues the held conversation goes first, then the one with the least to read; after 20 s, arrival order.
+- **Retention:** lifetimes from the last use (under 32K tokens 30 minutes, longer 24 hours, shared openings 7 days), a 24 GiB budget
+  (`park_budget_gib`), at least 50 GB free on the drive (`park_min_free_gb`), a daily write cap (`park_write_cap_gb`, 200). `"park_private": true`
+  halves the lifetimes and deletes the folder on a clean stop. The index keeps lengths, times and block hashes, never token ids or text; the files do
+  hold the conversation, so keep the folder out of shared places.
+- **Namespaces:** a request with `X-Strata-Park-Space: sandbox` parks apart (30-minute lifetimes) and never restores or evicts another's file.
+- **Control:** `GET /v1/park` lists the files (sizes, ages), `POST /v1/park/clear` and `POST /v1/park/delete {"id": ...}` remove them; `/metrics` has a `park` block.
+- **Not with `--parallel`** (the engine refuses session files there), and not for conversations with images.
+- **Add `--session-save-reclaim` to the engine's args.** A save needs about 350 MB of RAM for a moment on top of the engine's 2.5 GiB free-RAM
+  floor; with this flag the engine first drops its older in-RAM checkpoints (about 118 MB each), which a parked conversation no longer needs.
+  Without it, a save on a PC with little free RAM is refused and that switch reads the conversation again, as before. With the in-RAM
+  conversation cache off (`--conversation-cache-mib 0`) there is usually only the one checkpoint the file needs, so on a 32 GB PC with a
+  10 GiB RAM tier (about 2.8 GiB free) the save also needs `--conversation-cache-min-free-mib 2048` (the floor that only saves and parking use).
+
 ## Also in the code, all off by default
 
 | Switch | What it is | Result |
