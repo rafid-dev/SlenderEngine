@@ -2344,6 +2344,11 @@ bool cold_kept_readers() {
     static const bool on = [] { const char* v = std::getenv("STRATA_COLD_KEPT_READERS"); return v != nullptr && v[0] == '1'; }();
     return on;
 }
+/// STRATA_DIRECT_READERS=N (opt-in, 1-16, default 4): the most direct cold readers per layer and the kept reader threads.
+int direct_readers() {
+    static const int n = [] { const char* v = std::getenv("STRATA_DIRECT_READERS"); const int k = v ? std::atoi(v) : 4; return k < 1 ? 1 : k > 16 ? 16 : k; }();
+    return n;
+}
 }  // namespace
 
 // 149-cold STRATA_COLD_OVERLAP=1: the claimed blobs are read on background threads (the decode thread computes the
@@ -2423,9 +2428,9 @@ int64_t FileExpertSource::prefetch_begin(int64_t layer, const int64_t* experts, 
         int64_t cur = async_end_ns_.load(std::memory_order_relaxed);
         while (ns > cur && !async_end_ns_.compare_exchange_weak(cur, ns, std::memory_order_relaxed)) {}
     };
-    const size_t nt = direct ? std::min<size_t>(4, (async_todo_.size() + direct_batch - 1) / direct_batch)
+    const size_t nt = direct ? std::min<size_t>((size_t) direct_readers(), (async_todo_.size() + direct_batch - 1) / direct_batch)
                              : std::min<size_t>(async_todo_.size(), (size_t) std::max(1, fetch_threads_));
-    if (cold_kept_readers() && nt <= 4) kept_readers_.run((int) nt, work);
+    if (cold_kept_readers() && nt <= (size_t) direct_readers()) kept_readers_.run((int) nt, work);
     else for (size_t t = 0; t < nt; ++t) async_th_.emplace_back(work);
     return np;
 }
@@ -2571,8 +2576,8 @@ void FileExpertSource::KeptReaders::run(int n, std::function<void()> f) {
     {
         std::lock_guard<std::mutex> lk(m);
         if (th.empty()) {
-            th.reserve(4);
-            for (int i = 0; i < 4; ++i) th.emplace_back([this, i] { loop(i); });
+            th.reserve((size_t) direct_readers());
+            for (int i = 0; i < direct_readers(); ++i) th.emplace_back([this, i] { loop(i); });
         }
         work = std::move(f);
         want = n;
