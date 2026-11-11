@@ -5,7 +5,7 @@
 // fresh read from DRAM.  Prints the weight bytes per second against the --ram-gbs given (a separate read test).
 //
 //     kq_cpu_bench [--pairs q4_K/q5_1,q5_K/q8_0,q6_K/q8_0,q8_0/q8_0,iq3_s/iq4_nl] [--threads 1,8,16,32] [--nt 1,2,4]
-//                  [--mb 4096] [--reps 3] [--ram-gbs N]
+//                  [--mb 4096] [--reps 3] [--ram-gbs N] [--h 2560] [--ff 640]
 #include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/kernels/cpu/native_expert.hpp"
 
@@ -29,7 +29,7 @@ namespace cpu = strata::kernels::cpu;
 
 namespace {
 
-constexpr int64_t kH = 2560, kFF = 640;
+int64_t kH = 2560, kFF = 640;   // the expert geometry (--h / --ff; default Flash-Next's)
 constexpr int kMaxT = 8;
 
 int type_of(const std::string& s) {
@@ -89,6 +89,8 @@ int main(int argc, char** argv) {
         else if (a == "--threads" && more) threads = ints(argv[++i]);
         else if (a == "--nt" && more) nts = ints(argv[++i]);
         else if (a == "--mb" && more) mb = std::atoi(argv[++i]);
+        else if (a == "--h" && more) kH = std::atoll(argv[++i]);
+        else if (a == "--ff" && more) kFF = std::atoll(argv[++i]);
         else if (a == "--reps" && more) reps = std::max(1, std::atoi(argv[++i]));
         else if (a == "--ram-gbs" && more) ram = std::atof(argv[++i]);
         else {
