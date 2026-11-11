@@ -5588,9 +5588,15 @@ struct Engine {
     /// sampler instead of taken greedily; the drafts are accepted while the drawn token equals them and the first
     /// draw that differs is the next token (sample-and-match, as llama.cpp's speculative decoding without draft
     /// probabilities: every token comes from the target model's distribution given the tokens before it).
+    /// `ext` (STRATA_Q36_LOOKUP): drafts found elsewhere (an earlier repeat of the context's last tokens) instead of the
+    /// MTP block's: up to kVerify - 1 of them; the block still runs its first call (its cache follows the rows), not
+    /// its chained draft calls.  Verified as any draft, so the text is unchanged.
     int spec_step(int x_tok, const std::vector<int32_t>& fix, int D, std::vector<int32_t>& drafts, int32_t* picks,
-                  const std::atomic<bool>* cancel = nullptr, const std::function<int(int)>* sample_row = nullptr) {
+                  const std::atomic<bool>* cancel = nullptr, const std::function<int(int)>* sample_row = nullptr,
+                  const std::vector<int32_t>* ext = nullptr) {
         const int N = (int) m->g.n_embd;
+        const bool use_ext = ext != nullptr && !ext->empty();
+        if (use_ext) D = std::min<int>((int) ext->size(), kVerify - 1);
         if (main_hybrid) D = std::min<int>(D, (int) (rebal_every() - pos % rebal_every()) - 1);
         const int T0 = (int) fix.size() + 1;   // the redo rows and the row of x
         CK(cudaStreamSynchronize(st));
@@ -5605,15 +5611,17 @@ struct Engine {
         if (!fix.empty())
             CK(cudaMemcpyAsync(seeds, hmain, fix.size() * (size_t) N * 4, cudaMemcpyDeviceToDevice, st));
         CK(cudaMemcpyAsync(seeds + fix.size() * (size_t) N, hlast, (size_t) N * 4, cudaMemcpyDeviceToDevice, st));
-        forward_mtp(T0, pos - (int64_t) fix.size(), seeds, D > 0, false);
+        forward_mtp(T0, pos - (int64_t) fix.size(), seeds, D > 0 && !use_ext, false);
         drafts.assign((size_t) D, 0);
-        if (D > 0) {
+        if (use_ext) {
+            for (int d = 0; d < D; ++d) drafts[(size_t) d] = (*ext)[(size_t) d];
+        } else if (D > 0) {
             CK(cudaMemcpyAsync(hpin + 2, pick_m, 4, cudaMemcpyDeviceToHost, st));
             CK(cudaStreamSynchronize(st));
             drafts[0] = hpin[2];
         }
         int last_row = T0 - 1;   // the row of the previous MTP call whose output seeds the next draft
-        for (int d = 1; d < D; ++d) {   // chained: (the block's own output, the last draft) at the next position
+        for (int d = 1; d < D && !use_ext; ++d) {   // chained: (the block's own output, the last draft) at the next position
             hpin[0] = drafts[(size_t) d - 1];
             hpin[1] = (int32_t) (pos + d);
             CK(cudaMemcpyAsync(tok_m, hpin, 4, cudaMemcpyHostToDevice, st));
@@ -6786,6 +6794,27 @@ struct Serve {
         std::vector<float> lg_row;
         std::vector<int32_t> fix, drafts;
         int32_t picks[16];
+        // STRATA_Q36_LOOKUP=1 (opt-in): prompt lookup - where the last 4-6 tokens (the prompt and the answer so far) occurred
+        // before, the tokens that followed them are the drafts (up to 7) instead of the MTP block's; verified as any draft.
+        // A lookup step that accepts nothing hands the next 8 steps back to the MTP block (prose has chance repeats).
+        static const bool lookup_on = [] { const char* v = std::getenv("STRATA_Q36_LOOKUP"); return v && v[0] == '1'; }();
+        std::vector<int32_t> lkseq, lkd;
+        if (lookup_on) lkseq = ids;
+        long long lk_steps = 0, lk_acc = 0, lk_off = 0;   // lk_off: steps left on the MTP after a lookup draft missed
+        auto lookup = [&](std::vector<int32_t>& out) {
+            out.clear();
+            const int n_all = (int) lkseq.size();
+            for (int n = 6; n >= 4 && out.empty(); --n) {
+                if (n_all <= n + 1) continue;
+                const int32_t* tail = lkseq.data() + n_all - n;
+                for (int i = n_all - n - 1; i >= 0; --i) {   // the latest earlier occurrence
+                    if (std::memcmp(lkseq.data() + i, tail, (size_t) n * 4) != 0) continue;
+                    for (int j = i + n; j < n_all && (int) out.size() < 7; ++j) out.push_back(lkseq[(size_t) j]);
+                    break;
+                }
+            }
+            if (out.size() < 2) out.clear();
+        };
         int nx = smp.needs_logits() ? -1 : E.greedy();
         if (adm) {
             if (smp.needs_logits()) {
@@ -6832,6 +6861,7 @@ struct Serve {
                 std::fflush(stdout);
                 ++produced;
                 hist.push_back(t);
+                if (lookup_on) lkseq.push_back(t);
                 if (is_eos(t)) { finish = "stop"; return false; }
                 if (produced >= max_new) return false;
                 if (stop.load()) { finish = "cancel"; return false; }
@@ -6848,9 +6878,22 @@ struct Serve {
                         E.host_logits_row(r, lg_row);
                         return sample(lg_row, smp, h2, rng);
                     };
-                const int a = E.spec_step(nx, fix, E.mtp_d, drafts, picks, &stop, smp.needs_logits() ? &draw : nullptr);
-                offered += E.mtp_d;
+                if (lookup_on && lk_off > 0) {
+                    --lk_off;
+                    lkd.clear();
+                } else if (lookup_on) {
+                    lookup(lkd);
+                    if (!lkd.empty() && E.pos + (int64_t) std::min<size_t>(lkd.size(), 7) + 1 > E.ctx) lkd.clear();
+                    if (!lkd.empty()) ++lk_steps;
+                }
+                const int a = E.spec_step(nx, fix, E.mtp_d, drafts, picks, &stop, smp.needs_logits() ? &draw : nullptr,
+                                          lookup_on && !lkd.empty() ? &lkd : nullptr);
+                offered += (long long) drafts.size();
                 accepted += a;
+                if (lookup_on && !lkd.empty()) {
+                    lk_acc += a;
+                    if (a == 0) lk_off = 8;   // a miss: the MTP's drafts for the next 8 steps
+                }
                 // the state now holds x and every accepted draft, whether or not the answer ends inside them (an end of
                 // answer, max_new): the held tokens say so, so a later request that continues this conversation matches them
                 // (a prompt that has the same tokens next reuses the state, any other reads from the start) and never reads
@@ -6875,6 +6918,8 @@ struct Serve {
         }
         E.sess[(size_t) E.cur].pos = E.pos;
         const double decode_ms = ms_since(d0);
+        if (lookup_on && lk_steps > 0)
+            std::fprintf(stderr, "strata-q36: STRATA_Q36_LOOKUP: %lld speculative steps took prompt-lookup drafts (%lld accepted)\n", lk_steps, lk_acc);
         std::printf("DONE %lld %zu %.1f %.1f %s %lld %lld %zu 0 0 0 0 0.0 %lld 0\n", produced, ids.size(), prompt_ms,
                     decode_ms, finish, accepted, offered, reuse, (long long) fresh);
         std::fflush(stdout);
