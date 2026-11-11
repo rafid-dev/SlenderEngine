@@ -10658,6 +10658,12 @@ def _main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> i
                             Searx(searx_url, start_cmd, setup=setup, may_install=cfg.get("searxng_install") is not False))
     import atexit
     atexit.register(setup.stop)                         # the SearXNG this server started ends with it
+    autostart = cfg.get("searxng_autostart")
+    if autostart is not None and not isinstance(autostart, bool):
+        raise SystemExit("[strata] config \"searxng_autostart\": true or false")
+    if autostart:                                       # opt-in: SearXNG with the server, not only when the page asks
+        print(f"[strata] web search: starting SearXNG with the server (searxng_autostart) at {searx_url}", flush=True)
+        svc.builtins.searx.autostart()
     if hub is not None:
         import atexit
         svc.mcp = hub

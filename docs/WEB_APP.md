@@ -129,6 +129,7 @@ the chat, with its address when you open it. To be safe:
 | `"searxng_start"` | none | Your own command that starts SearXNG; when set, the server installs nothing |
 | `"searxng_install"` | true | false: never install SearXNG (search works only with one you run yourself) |
 | `"searxng_dir"` | `SlenderEngine/searxng` | Where the Python way installs SearXNG |
+| `"searxng_autostart"` | false | true: start SearXNG when the server starts, not only when the page asks (other apps on this PC that search through the same address get it too); it stops with the server |
 | `"files_dir"` | `<config>.files` | Where attached documents' text is kept |
 | `"files_max_mb"` | 2048 | The most the documents folder may hold before the oldest go (0: no limit) |
 | `"files_keep_days"` | 30 | Days a document is kept after it was last read (0: no limit) |

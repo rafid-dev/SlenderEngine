@@ -600,6 +600,19 @@ class Searx:
         self.setup.start(method, may_install=may_install and self.may_install)
         return self.status()
 
+    def autostart(self) -> threading.Thread:
+        """Start SearXNG in the background as the server starts (the config's "searxng_autostart": true), so other
+        apps on this PC (an agent that searches through the same SearXNG) have it without the web page. The run
+        config is the PC owner's own, so this may install; the way already installed is used, else the Python one."""
+        def go():
+            method = "native"
+            if self.setup is not None:
+                method = next((m for m, ok in self.setup.installed().items() if ok), "native")
+            self.start(method, may_install=True)
+        t = threading.Thread(target=go, daemon=True, name="searxng-autostart")
+        t.start()
+        return t
+
     def stop(self) -> dict:
         if self.setup is not None and not self.start_cmd:
             self.setup.stop()

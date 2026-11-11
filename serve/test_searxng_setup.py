@@ -118,6 +118,29 @@ class Lifecycle(unittest.TestCase):
             self.assertIn("    - json", (Path(d) / "docker" / "settings.yml").read_text())
 
 
+class Autostart(unittest.TestCase):
+    def test_uses_the_installed_way_and_may_install(self):
+        with tempfile.TemporaryDirectory() as d:
+            setup = ss.SearxngSetup(d, "http://127.0.0.1:1")
+            (Path(d) / "wsl.installed").write_text(json.dumps({"commit": ss.COMMIT}))
+            searx = Searx("http://127.0.0.1:1", setup=setup)
+            with mock.patch.object(setup, "start") as start:
+                searx.autostart().join(10)
+            start.assert_called_once_with("wsl", may_install=True)
+            (Path(d) / "wsl.installed").unlink()
+            with mock.patch.object(setup, "start") as start:
+                searx.autostart().join(10)
+            start.assert_called_once_with("native", may_install=True)
+
+    def test_respects_searxng_install_false(self):
+        with tempfile.TemporaryDirectory() as d:
+            setup = ss.SearxngSetup(d, "http://127.0.0.1:1")
+            searx = Searx("http://127.0.0.1:1", setup=setup, may_install=False)
+            with mock.patch.object(setup, "start") as start:
+                searx.autostart().join(10)
+            start.assert_called_once_with("native", may_install=False)
+
+
 class Routes(unittest.TestCase):
     """Who may install: a request from this PC itself, never one through a proxy (a Tailscale share)."""
 
