@@ -4,18 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="color-scheme" content="dark light">
-<script>
-// the saved look, before the first paint (no flash of another theme); app.js keeps it in step afterwards
-(function () {
-  try {
-    var s = JSON.parse(localStorage.getItem("slender.settings") || "{}"), d = document.documentElement;
-    var t = s.theme || "black";
-    if (t === "system") t = matchMedia("(prefers-color-scheme: light)").matches ? "light" : "black";
-    d.dataset.theme = t; d.dataset.font = s.font || "system";
-    d.dataset.corners = s.corners || "soft"; d.dataset.size = s.textSize || "normal";
-  } catch (e) { /* storage blocked: the defaults in the tag stay */ }
-})();
-</script>
+<script src="web2/boot.js"></script>
 <title>SlenderEngine</title>
 <link rel="icon" href="web2/favicon.svg" type="image/svg+xml">
 <link rel="stylesheet" href="web2/app.css">
@@ -285,6 +274,10 @@
           <div class="row-toggle">
             <span><b>Import</b><small>A file exported here. Chats already in this browser are kept; newer copies replace older ones.</small></span>
             <button type="button" class="btn" id="s-import">Import</button>
+          </div>
+          <div class="row-toggle">
+            <span><b>Attached documents on the server</b><small id="files-note">Their text is kept so the model can read them; the oldest go after 30 days or past 2 GB.</small></span>
+            <button type="button" class="btn btn--danger" id="s-files-clear">Delete documents</button>
           </div>
           <div class="row-toggle">
             <span><b>Delete every chat</b><small>Projects stay. This cannot be undone.</small></span>

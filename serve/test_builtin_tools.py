@@ -9,10 +9,14 @@ import base64
 import http.server
 import io
 import json
+import os
+import socket
 import sys
+import time
 import tempfile
 import threading
 import unittest
+import unittest.mock
 import urllib.error
 import urllib.request
 import zipfile
@@ -293,6 +297,20 @@ class Endpoints(unittest.TestCase):
         code, _ = self.req("/v1/files", {"name": "a.txt", "data": "aGk="}, headers={"Origin": "https://evil.example"})
         self.assertEqual(code, 403)
 
+    def test_page_headers_and_file_controls(self):
+        with urllib.request.urlopen(self.base + "/", timeout=10) as r:
+            csp = r.headers.get("Content-Security-Policy", "")
+            self.assertIn("script-src 'self';", csp)
+            self.assertIn("frame-ancestors 'none'", csp)
+            self.assertEqual(r.headers.get("X-Frame-Options"), "DENY")
+            self.assertNotIn(b"<script>", r.read())                 # no inline script: the CSP forbids them
+        with urllib.request.urlopen(self.base + "/web2/boot.js", timeout=10) as r:
+            self.assertEqual(r.headers.get("X-Content-Type-Options"), "nosniff")
+        code, body = self.req("/v1/files")
+        self.assertEqual(code, 200)
+        self.assertIn("max_bytes", json.loads(body))
+        self.assertEqual(self.req("/v1/files/clear", {}, headers={"Origin": "https://evil.example"})[0], 403)
+
     def test_search_status_and_live(self):
         code, body = self.req("/v1/search")
         self.assertEqual(code, 200)
@@ -315,6 +333,40 @@ class Endpoints(unittest.TestCase):
         result = [e for e in events if e.get("event") == "result"]
         self.assertTrue(result and result[0]["ok"], events)
         self.assertIn("The secret number is 4711.", result[0]["text"])
+
+
+class Hardening(unittest.TestCase):
+    def test_fetch_connects_only_to_checked_addresses(self):
+        real = socket.getaddrinfo
+
+        def fake(host, *a, **k):                       # a name that resolves to this PC (DNS rebinding)
+            return real("127.0.0.1" if host == "rebind.example" else host, *a, **k)
+        with unittest.mock.patch("socket.getaddrinfo", fake):
+            with self.assertRaisesRegex(ValueError, "not a public web address"):
+                bt.fetch("http://rebind.example/")
+        with self.assertRaisesRegex(ValueError, "user name or password"):
+            bt.fetch("https://user:pw@example.com/")
+        with self.assertRaisesRegex(ValueError, "only http"):
+            bt.fetch("ftp://example.com/")
+
+    def test_store_limits_and_clear(self):
+        with tempfile.TemporaryDirectory() as d:
+            fs = bt.FileStore(d, max_bytes=0, keep_days=0)
+            a = fs.put("a.txt", ("alpha " * 2000).encode())
+            b = fs.put("b.txt", ("beta " * 2000).encode())
+            old = time.time() - 40 * 86400
+            os.utime(Path(d) / f"{a['id']}.json", (old, old))
+            fs.keep_days = 30
+            self.assertEqual(fs.prune(), 1)                  # the 40-day-old one goes
+            self.assertIsNone(fs.get(a["id"]))
+            fs.max_bytes = 10                                # smaller than one file: everything goes
+            self.assertEqual(fs.prune(), 1)
+            fs.max_bytes = 0
+            fs.put("c.txt", b"gamma")
+            self.assertEqual(fs.usage()["files"], 1)
+            self.assertEqual(fs.clear(), 1)
+            self.assertEqual(fs.usage()["files"], 0)
+            self.assertIsNone(fs.get(b["id"]))
 
 
 class Readers(unittest.TestCase):

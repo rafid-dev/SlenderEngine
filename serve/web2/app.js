@@ -1234,6 +1234,7 @@ function showPane(name) {
   for (const b of $("settings-nav").children) b.setAttribute("aria-selected", String(b.dataset.pane === name));
   for (const p of document.querySelectorAll("#settings .pane")) p.hidden = p.dataset.pane !== name;
   if (name === "search") loadSearch();
+  if (name === "data") loadFilesNote();
 }
 $("settings-nav").onclick = (e) => { const b = e.target.closest("button[data-pane]"); if (b) showPane(b.dataset.pane); };
 $("open-settings").onclick = () => { fillSettings(); $("settings").showModal(); closeSideOnMobile(); };
@@ -1268,6 +1269,27 @@ $("s-wipe").onclick = async () => {
   startChat();
   fillSettings();
   toast("Every chat was deleted");
+};
+async function loadFilesNote() {
+  if (!builtins) { $("files-note").textContent = "This server keeps no documents."; $("s-files-clear").disabled = true; return; }
+  try {
+    const r = await fetch("v1/files", {headers: headers(), cache: "no-store"});
+    const u = await r.json();
+    const mb = (u.bytes || 0) / 1048576;
+    $("files-note").textContent = `${fmt(u.files)} document${u.files === 1 ? "" : "s"}, ${fmt(mb, mb < 10 ? 1 : 0)} MB, kept in ${u.folder}. ` +
+      `The oldest go after ${fmt(u.keep_days)} days or past ${fmt((u.max_bytes || 0) / 1048576)} MB.`;
+    $("s-files-clear").disabled = !u.files;
+  } catch (e) { /* the note keeps its text */ }
+}
+$("s-files-clear").onclick = async () => {
+  if (!confirm("Delete the text of every attached document on the server? Chats that refer to them can no longer read them.")) return;
+  try {
+    const r = await fetch("v1/files/clear", {method: "POST", headers: headers(true), body: "{}"});
+    const j = await r.json();
+    if (!r.ok) throw new Error((j.error && j.error.message) || `HTTP ${r.status}`);
+    toast("Documents deleted", `${fmt(j.deleted)} removed from the server.`);
+  } catch (e) { toast("Could not delete the documents", e.message || String(e), {kind: "error"}); }
+  loadFilesNote();
 };
 $("s-export").onclick = () => {
   const data = {app: "SlenderEngine", version: 1, exported: new Date().toISOString(), projects, chats};
@@ -1311,12 +1333,19 @@ function paintDot() {
   $("model-pill").title = health.ok === false ? "The server does not answer" : busy ? "Answering" :
     health.loaded === false ? "Not loaded: it loads on the first message" : "Loaded and ready";
 }
+let keyAsked = false;
 async function loadHealth() {
   try {
     const r = await fetch("health", {headers: headers(), cache: "no-store"});
     const h = await r.json();
     health = {...h, ok: true};
     if ($("model-name").textContent !== (h.model || "Model")) $("model-name").textContent = h.model || "Model";
+    // a server with a key (shared over Tailscale, say) and a browser that has none: say so once, with the way to fix it
+    if (h.api_key && !apiKey && !keyAsked) {
+      keyAsked = true;
+      toast("This server needs its API key", "Paste it in Settings > Connection.", {ms: 15000, action: {label: "Open",
+        run: () => { fillSettings(); showPane("connection"); $("settings").showModal(); $("s-key").focus(); }}});
+    }
   } catch (e) {
     health = {...health, ok: false};
     $("model-name").textContent = "Server not reachable";

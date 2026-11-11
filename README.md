@@ -153,6 +153,8 @@ Written by Qwen3.8-Flash-Next IQ3_S through OpenCode on the PC described above. 
 ## More details
 
 - [FORK.md](FORK.md): engine changes, switches and measurements.
+- [The web app](docs/WEB_APP.md): the chat page at the server's address, where its data is kept, and its security.
+- [Sharing over Tailscale](docs/TAILSCALE.md): use the page from your phone or another PC, HTTPS and private, with `TAILSCALE-SHARE.bat`.
 - [Worklog](docs/fork/WORKLOG.md): recorded tests, including failed experiments.
 - [The prompt room](docs/fork/PROMPT-ROOM.md): how long prompts read in fewer passes, and how it was found and checked.
 - [RTX 4060 8 GB laptop report](docs/fork/LAPTOP-RTX4060.md): optional switches contributed by [Gamination](https://github.com/Gamination).

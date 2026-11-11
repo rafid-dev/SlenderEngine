@@ -56,8 +56,10 @@ class TheHeader(unittest.TestCase):
         cls.httpd.server_close()
 
     def test_the_page_forbids_a_frame_to_load_an_address(self):
-        with urllib.request.urlopen(self.base + "/", timeout=10) as r:
+        with urllib.request.urlopen(self.base + "/classic", timeout=10) as r:     # the Strata page and its previews
             self.assertEqual(r.headers.get("Content-Security-Policy"), PAGE_CSP)
+        with urllib.request.urlopen(self.base + "/", timeout=10) as r:            # the web app: a stricter policy
+            self.assertIn("frame-src 'none'", r.headers.get("Content-Security-Policy", ""))
         self.assertEqual(PAGE_CSP, "frame-src 'none'",
                          "only this directive: a srcdoc frame inherits the page's policy, and the opt-in script preview needs its inline script")
 

@@ -509,6 +509,13 @@ class GpuBusy(RuntimeError):
 # The page's only CSP directive: its preview frames (srcdoc) may not load any address. Other directives are left out
 # on purpose: a frame made from srcdoc inherits the page's policy, and the opt-in "run scripts" preview needs its own inline script.
 PAGE_CSP = "frame-src 'none'"
+# The SlenderEngine web app (serve/web2): its own files only. No inline or remote scripts (an injected <script> does not
+# run), no remote pictures, fonts or connections (a chat that holds a link to a tracking image cannot load it, and a
+# script cannot send the API key in localStorage anywhere), no frames, and no other site may frame the page
+# (clickjacking). Inline styles stay allowed: the page and KaTeX set element styles. data: pictures are the user's own.
+WEB2_CSP = ("default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; "
+            "font-src 'self' data:; connect-src 'self'; media-src 'self' data: blob:; object-src 'none'; frame-src 'none'; "
+            "worker-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'")
 
 
 def unload_wait(value, default: float) -> float:
@@ -7904,6 +7911,7 @@ def make_handler(svc: Service):
                 body = f.read_bytes()
                 self.send_response(200)
                 self.send_header("Content-Type", types[ext])
+                self.send_header("X-Content-Type-Options", "nosniff")
                 self.send_header("Cache-Control", "no-cache")
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
@@ -8140,6 +8148,11 @@ def make_handler(svc: Service):
                     self._json(200, b.searx.status() if b is not None and b.searx is not None
                                else {"url": None, "up": False, "can_start": False, "starting": False, "error": None})
                 return
+            if path == "/v1/files":                          # how much the attached files take (Settings > Data)
+                if self._authorized():
+                    b = svc.builtins
+                    self._json(200, b.files.usage() if b is not None and b.files is not None else {"files": 0, "bytes": 0})
+                return
             if path.startswith("/v1/files/"):                # an attached file's facts (never its text)
                 if self._authorized():
                     b = svc.builtins
@@ -8158,7 +8171,13 @@ def make_handler(svc: Service):
                 body = page.read_bytes()
                 self.send_response(200)
                 self.send_header("Content-Type", "text/html; charset=utf-8")
-                if path != "/api-monitor":
+                if path == "":
+                    self.send_header("Content-Security-Policy", WEB2_CSP)
+                    self.send_header("X-Frame-Options", "DENY")          # frame-ancestors for browsers without CSP 2
+                    self.send_header("Referrer-Policy", "no-referrer")   # a link the model wrote gets no address of this PC
+                    self.send_header("X-Content-Type-Options", "nosniff")
+                    self.send_header("Cache-Control", "no-cache")
+                elif path != "/api-monitor":
                     # the chat's svg/html preview is a sandboxed frame; this keeps it from navigating away to a web page
                     # (a link or <meta refresh> inside a model's html), which no sandbox flag does (serve/web/preview.js)
                     self.send_header("Content-Security-Policy", PAGE_CSP)
@@ -8364,6 +8383,17 @@ def make_handler(svc: Service):
                         h = svc.parker.held
                         if h is not None and h.get("file") not in svc.parker.store.files:
                             h["file"], h["saved_len"] = None, 0
+                    self._json(200, {"deleted": n})
+                    return
+                if path == "/v1/files/clear":                # delete every attached file's text (Settings > Data)
+                    b = svc.builtins
+                    if b is None or b.files is None:
+                        self._json(404, {"error": {"message": "attached files are not set up on this server"}})
+                        return
+                    if not self._own_page("attached files can be deleted"):
+                        return
+                    n = b.files.clear()
+                    print(f"[strata] deleted {n} attached file(s) on request", flush=True)
                     self._json(200, {"deleted": n})
                     return
                 if path == "/v1/files":                      # a file attached in the web app: its text, kept here
@@ -10585,7 +10615,14 @@ def _main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> i
     if cfg.get("searxng_url") is not None and not isinstance(cfg["searxng_url"], str):
         raise SystemExit("[strata] config \"searxng_url\": an address like http://127.0.0.1:8888")
     files_dir = cfg.get("files_dir") if isinstance(cfg.get("files_dir"), str) else         str(Path(a.config).with_suffix(".files")) if a.config else str(Path.cwd() / ".web-files")
-    svc.builtins = Builtins(FileStore(files_dir), Searx(cfg.get("searxng_url") or "http://127.0.0.1:8888", start_cmd))
+    limits = {}
+    for key, default in (("files_max_mb", 2048), ("files_keep_days", 30)):
+        v = cfg.get(key, default)
+        if isinstance(v, bool) or not isinstance(v, (int, float)) or v < 0:
+            raise SystemExit(f"[strata] config \"{key}\": a number, 0 or more (0: no limit), not {v!r}")
+        limits[key] = v
+    svc.builtins = Builtins(FileStore(files_dir, max_bytes=int(limits["files_max_mb"] * 2**20), keep_days=limits["files_keep_days"]),
+                            Searx(cfg.get("searxng_url") or "http://127.0.0.1:8888", start_cmd))
     if hub is not None:
         import atexit
         svc.mcp = hub

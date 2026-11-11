@@ -333,10 +333,55 @@ class FileStore:
     """Attached files' extracted text, one JSON file per file in `folder` (named by the content's hash, so the same file
     attached twice is stored once). The bytes themselves are not kept."""
 
-    def __init__(self, folder):
+    def __init__(self, folder, max_bytes: int = 2 << 30, keep_days: float = 30.0):
         self.folder = Path(folder)
+        self.max_bytes, self.keep_days = max_bytes, keep_days   # 0: no limit
         self.cache: OrderedDict[str, dict] = OrderedDict()
         self.lock = threading.Lock()
+
+    def _files(self):
+        try:
+            return [(f, f.stat()) for f in self.folder.glob("*.json") if ID_RE.fullmatch(f.stem)]
+        except OSError:
+            return []
+
+    def prune(self) -> int:
+        """Drop files older than keep_days, then the oldest until the folder is under max_bytes. -> how many."""
+        files = sorted(self._files(), key=lambda x: x[1].st_mtime)
+        now, gone = time.time(), 0
+        total = sum(st.st_size for _, st in files)
+        for f, st in files:
+            old = self.keep_days and now - st.st_mtime > self.keep_days * 86400
+            big = self.max_bytes and total > self.max_bytes
+            if not (old or big):
+                continue
+            try:
+                f.unlink()
+                gone += 1
+                total -= st.st_size
+                with self.lock:
+                    self.cache.pop(f.stem, None)
+            except OSError:
+                pass
+        return gone
+
+    def clear(self) -> int:
+        """Delete every kept file (the web app's Settings > Data). -> how many."""
+        gone = 0
+        for f, _ in self._files():
+            try:
+                f.unlink()
+                gone += 1
+            except OSError:
+                pass
+        with self.lock:
+            self.cache.clear()
+        return gone
+
+    def usage(self) -> dict:
+        files = self._files()
+        return {"files": len(files), "bytes": sum(st.st_size for _, st in files), "folder": str(self.folder),
+                "max_bytes": self.max_bytes, "keep_days": self.keep_days}
 
     def put(self, name: str, data: bytes) -> dict:
         if len(data) > FILE_BYTES:
@@ -351,6 +396,7 @@ class FileStore:
         tmp = self.folder / f"{fid}.json.tmp"
         tmp.write_text(json.dumps(doc, ensure_ascii=False), encoding="utf-8")
         os.replace(tmp, self.folder / f"{fid}.json")
+        self.prune()
         with self.lock:
             self.cache[fid] = doc
             self.cache.move_to_end(fid)
@@ -369,6 +415,7 @@ class FileStore:
         f = self.folder / f"{fid}.json"
         try:
             doc = json.loads(f.read_text(encoding="utf-8"))
+            os.utime(f)                       # in use: the age limit counts from the last read
         except (OSError, ValueError):
             return None
         with self.lock:
@@ -402,29 +449,98 @@ def public_host(host: str) -> bool:
         return False
 
 
-class _Redirects(urllib.request.HTTPRedirectHandler):
-    max_redirections = 5
+def _is_public(addr: str) -> bool:
+    try:
+        return ipaddress.ip_address(addr.split("%")[0]).is_global
+    except ValueError:
+        return False
 
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        u = urllib.parse.urlsplit(newurl)
-        if u.scheme not in ("http", "https") or not u.hostname or not public_host(u.hostname):
-            raise urllib.error.URLError(f"a redirect to {u.hostname or newurl!r} was refused (not a public web address)")
-        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+def _vetted_socket(host: str, port: int, timeout, check_host) -> socket.socket:
+    """A connection to `host` that goes to an address checked here and now. Checking a name and then letting the HTTP
+    library resolve it again leaves a gap (DNS rebinding: the second answer can be 127.0.0.1), so the check and the
+    connection use the same resolved address. Every address the name has must be public (one private one refuses
+    the name), unless `check_host` is not public_host (the tests' local servers)."""
+    try:
+        infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+    except (socket.gaierror, UnicodeError, OSError) as e:
+        raise urllib.error.URLError(f"{host} could not be found ({e})") from None
+    if check_host is public_host:
+        if not infos or not all(_is_public(i[4][0]) for i in infos):
+            raise urllib.error.URLError(f"{host} is not a public web address (this PC and the local network are not read)")
+    elif not check_host(host):
+        raise urllib.error.URLError(f"{host} is not an allowed address")
+    last = None
+    for family, kind, proto, _, addr in infos:
+        sock = socket.socket(family, kind, proto)
+        try:
+            if timeout is not None and timeout is not socket._GLOBAL_DEFAULT_TIMEOUT:
+                sock.settimeout(timeout)
+            sock.connect(addr)
+            return sock
+        except OSError as e:
+            last = e
+            sock.close()
+    raise urllib.error.URLError(f"{host} did not answer ({last})")
+
+
+def _opener(check_host):
+    """urllib with every connection (redirects too) made by _vetted_socket, and no proxy from the environment (a proxy
+    would resolve the name itself, out of reach of the check)."""
+    import http.client
+    import ssl
+
+    class Plain(http.client.HTTPConnection):
+        def connect(self):
+            self.sock = _vetted_socket(self.host, self.port, self.timeout, check_host)
+
+    class Secure(http.client.HTTPSConnection):
+        def connect(self):
+            sock = _vetted_socket(self.host, self.port, self.timeout, check_host)
+            self.sock = self._context.wrap_socket(sock, server_hostname=self.host)
+
+    class PlainHandler(urllib.request.HTTPHandler):
+        def http_open(self, req):
+            return self.do_open(Plain, req)
+
+    class SecureHandler(urllib.request.HTTPSHandler):
+        def https_open(self, req):
+            return self.do_open(Secure, req, context=ssl.create_default_context())
+
+    class Redirects(urllib.request.HTTPRedirectHandler):
+        max_redirections = 5
+
+        def redirect_request(self, req, fp, code, msg, headers, newurl):
+            u = urllib.parse.urlsplit(newurl)
+            if u.scheme not in ("http", "https") or not u.hostname:
+                raise urllib.error.URLError(f"a redirect to {newurl!r} was refused (only http and https)")
+            return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+    return urllib.request.build_opener(urllib.request.ProxyHandler({}), PlainHandler(), SecureHandler(), Redirects())
 
 
 def fetch(url: str, timeout: float = 15.0, check_host=public_host) -> tuple[str, bytes, str]:
-    """(final url, body, content type) of a public http(s) URL, at most FETCH_BYTES."""
+    """(final url, body, content type) of a public http(s) URL, at most FETCH_BYTES. Every hop (redirects included)
+    connects only to an address that passed the check."""
     u = urllib.parse.urlsplit(url)
     if u.scheme not in ("http", "https") or not u.hostname:
         raise ValueError("only http:// and https:// addresses can be read")
-    if not check_host(u.hostname):
-        raise ValueError(f"{u.hostname} is not a public web address (this PC and the local network are not read)")
-    opener = urllib.request.build_opener(_Redirects())
+    if u.username or u.password:
+        raise ValueError("addresses with a user name or password are not read")
     req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT, "Accept": "text/html,application/xhtml+xml,"
                                                "text/plain,application/pdf;q=0.9,*/*;q=0.5", "Accept-Language": "en"})
-    with opener.open(req, timeout=timeout) as r:
-        body = r.read(FETCH_BYTES + 1)
-        return r.geturl(), body[:FETCH_BYTES], r.headers.get("Content-Type", "")
+    try:
+        with _opener(check_host).open(req, timeout=timeout) as r:
+            body = r.read(FETCH_BYTES + 1)
+            return r.geturl(), body[:FETCH_BYTES], r.headers.get("Content-Type", "")
+    except urllib.error.URLError as e:
+        reason = e.reason
+        while isinstance(reason, urllib.error.URLError):     # urllib wraps a connect error in another URLError
+            reason = reason.reason
+        reason = str(reason)
+        if "not a public web address" in reason or "not an allowed address" in reason or "was refused" in reason:
+            raise ValueError(reason) from None
+        raise
 
 
 # ------------------------------------------------------------------------------------------------ SearXNG

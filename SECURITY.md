@@ -44,6 +44,31 @@ this PC only. The details and every setting are in [docs/DETAILS.md](docs/DETAIL
   last few prompts, whatever `"api_monitor"` says, to encode the next turn faster; no endpoint shows them, and they
   are gone when the server stops.
 
+## The web app
+
+The chat page the server serves at `/` (`serve/web2`) adds these. Details, and where its data is kept:
+[docs/WEB_APP.md](docs/WEB_APP.md).
+
+- **Content-Security-Policy.** Scripts, pictures, fonts and connections only from the server itself (and `data:`
+  pictures), no inline script, no frames, and no other site may frame the page. `X-Frame-Options: DENY`,
+  `Referrer-Policy: no-referrer` and `X-Content-Type-Options: nosniff` are sent too. Answers are escaped before
+  Markdown is applied; KaTeX runs with `trust: false`.
+- **The web app's tools** (`web_search`, `fetch_url`, `read_document`, `search_document`) are accepted like MCP tools:
+  only as JSON from the server's own page or a `"trusted_origins"` origin, and with the key when one is set. Search is
+  off until the user switches it on. `fetch_url` connects only to public internet addresses, checked on the exact
+  address it connects to for every redirect (no DNS rebinding), with no proxy from the environment, at most 4 MB and
+  15 s. Starting SearXNG runs only the run config's `"searxng_start"`.
+- **Attached documents.** `POST /v1/files` keeps the extracted text (never the file) in a folder next to the run
+  config, named by the content's hash; a name is reduced to its base name, an id must be 20 hex characters. The
+  oldest go after 30 days or past 2 GB (`"files_keep_days"`, `"files_max_mb"`). `POST /v1/files/clear` (own page
+  only) deletes them all.
+- **Prompt injection.** Text from web pages and documents can try to steer the model, for example into a `fetch_url`
+  that carries chat text in its address. Tool calls are shown in the chat; keep Search off when working with private
+  documents.
+- **Sharing.** `TAILSCALE-SHARE.bat` (`tools/tailscale_share.py`) keeps the server on `127.0.0.1`, puts it behind
+  `tailscale serve` (HTTPS, tailnet only), and adds an API key and the host name to the run config. It never uses
+  Funnel and never changes another `tailscale serve` mapping. See [docs/TAILSCALE.md](docs/TAILSCALE.md).
+
 ## The desktop app and the Terminal
 
 Strata comes in three parts that share one engine: the **desktop app**, the **Terminal** (`strata`) and the **engine** that runs
