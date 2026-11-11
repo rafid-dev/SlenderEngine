@@ -1,5 +1,7 @@
 # Tuning on an 8 GB laptop (RTX 4060 Laptop, Ryzen 7 8845HS, 32 GB), 2026-11-03 to 11-04
 
+Part 2, with the Swift-1.5 model, 150K context and the levers that did not pay: [LAPTOP-RTX4060-SWIFT.md](LAPTOP-RTX4060-SWIFT.md).
+
 Qwen3.8-Flash-Next abliterated IQ3_S pack, 262K context, MTP on (`--spec 4 --spec-min-p 0.5`), expert copy on a second
 SSD. No working-set or page locking of the RAM tier (`STRATA_RESIDENT_PIN=0`). Measured with `tools/strata_bench.py`
 (2 runs, median) and a decode A/B script (300 tokens x 3 prompts, temperature 0, alternating arms).
