@@ -1884,6 +1884,193 @@ __global__ void __launch_bounds__(512) k_gdn_seq_cols(float* state, const float*
 #pragma unroll
     for (int r = 0; r < RPG; ++r) base[r * row_stride] = sv[r];
 }
+/// STRATA_Q36_GDN_CHUNK=1 (opt-in): the prompt's gated delta rule in blocks of kGcC tokens (the chunkwise form of
+/// Yang et al., "Gated Delta Networks"): with the state S (128 x 128, rows = k, columns = v) at a block's start, the
+/// cumulative log-decay lb_t (g_t = exp(gate_t)), and u_t = beta_t (v_t - g_t S_{t-1}^T k_t) the delta vectors,
+///   (I + A) U = diag(beta) (V - diag(b) K S),  A[t][i] = beta_t e^{lb_t - lb_i} (k_t . k_i) (i < t),  b_t = e^{lb_t}
+///   O = diag(b) Q S + P U,                      P[t][i] = e^{lb_t - lb_i} (q_t . k_i) (i <= t)
+///   S' = b_C S + K^T diag(e^{lb_C - lb_t}) U
+/// The same recurrence as k_gdn_seq_cols in another summation order (FP32 throughout).  k_gdn_chunk_prep makes
+/// W = (I + A)^-1 diag(beta), P, b and the decays of every block at once (no state); k_gdn_chunk_scan walks the
+/// blocks per (V head, 32 state columns) with the state slice in shared memory.  Writes the raw outputs o (as
+/// k_gdn_seq_cols: times 1 / sqrt(128)); k_gdn_norm follows.
+/// Measured (RX 6600, 8K prompt, STRATA_Q36_PROF=2): correct (KL 0.144 / 0.125 against the token walk, the chunk-size
+/// floor 0.141) but NOT faster yet: prep 402 ms + scan 603 ms against k_gdn_seq_cols' 962 ms.  A scan with
+/// warp-broadcast k / q loads was slower still (2010 ms).  The way forward is flash-linear-attention's split: W V and
+/// W diag(b) K in the parallel prep, the outputs in a parallel pass from stored block states, only U and the state in
+/// the serial scan (~2K FMA a thread a block).  Kept opt-in as a correct starting point.
+constexpr int kGcC = 64;                                   // tokens a block
+constexpr int kGcPer = 2 * kGcC * kGcC + 2 * kGcC + 1;     // floats a (block, head): W, P, b, d, b_C
+/// grid (blocks, HV), block 256.  scratch: kGcPer floats per (block, head), (block * HV + head) * kGcPer.
+__global__ void __launch_bounds__(256) k_gdn_chunk_prep(const float* h, int C, const float* gate, const float* beta,
+                                                        float* scratch, int h_k, int h_v, int T) {
+    constexpr int S = 128;
+    __shared__ float ks[kGcC][S + 1];   // the block's k rows (+1: no bank conflicts on the column reads); later W
+    __shared__ float kk[kGcC][kGcC];    // k_t . k_i, then A
+    __shared__ float lb[kGcC], bt[kGcC];
+    const int blk = blockIdx.x, head = blockIdx.y, tid = threadIdx.x, qh = head % h_k;
+    const int t0 = blk * kGcC, nt = min(kGcC, T - t0);
+    float* out = scratch + ((size_t) blk * h_v + head) * kGcPer;
+    float* oW = out;
+    float* oP = out + kGcC * kGcC;
+    float* ob = out + 2 * kGcC * kGcC;
+    float* od = ob + kGcC;
+    for (int e = tid; e < kGcC * S; e += 256) {
+        const int t = e / S, i = e % S;
+        ks[t][i] = t < nt ? h[(size_t) (t0 + t) * C + h_k * S + qh * S + i] : 0.0f;
+    }
+    if (tid == 0) {   // the cumulative log-decay (a pad token: gate 0, beta 0 - the identity)
+        float a = 0.0f;
+        for (int t = 0; t < kGcC; ++t) {
+            if (t < nt) a += gate[(size_t) (t0 + t) * h_v + head];
+            lb[t] = a;
+            bt[t] = t < nt ? beta[(size_t) (t0 + t) * h_v + head] : 0.0f;
+        }
+    }
+    __syncthreads();
+    // P[t][i] = e^{lb_t - lb_i} (q_t . k_i), i <= t (written straight out); kk[t][i] = k_t . k_i
+    {
+        const int t = tid >> 2, part = tid & 3;   // a thread: one row t, the 16 columns i = part * 16 ..
+        const float* qp = h + (size_t) (t0 + t) * C + qh * S;
+        float pq[16], pk[16];
+#pragma unroll
+        for (int j = 0; j < 16; ++j) { pq[j] = 0.0f; pk[j] = 0.0f; }
+        for (int d0 = 0; d0 < S; d0 += 16) {
+            float qv[16];
+#pragma unroll
+            for (int d = 0; d < 16; ++d) qv[d] = t < nt ? qp[d0 + d] : 0.0f;
+#pragma unroll
+            for (int j = 0; j < 16; ++j) {
+                const int i = part * 16 + j;
+                float aq = 0.0f, ak = 0.0f;
+#pragma unroll
+                for (int d = 0; d < 16; ++d) {
+                    aq = fmaf(qv[d], ks[i][d0 + d], aq);
+                    ak = fmaf(ks[t][d0 + d], ks[i][d0 + d], ak);
+                }
+                pq[j] += aq;
+                pk[j] += ak;
+            }
+        }
+#pragma unroll
+        for (int j = 0; j < 16; ++j) {
+            const int i = part * 16 + j;
+            oP[t * kGcC + i] = i <= t ? __expf(lb[t] - lb[i]) * pq[j] : 0.0f;
+            kk[t][i] = pk[j];
+        }
+    }
+    __syncthreads();
+    // A[t][j] = beta_t e^{lb_t - lb_j} (k_t . k_j), j < t (in place)
+    for (int e = tid; e < kGcC * kGcC; e += 256) {
+        const int t = e / kGcC, j = e % kGcC;
+        kk[t][j] = j < t ? bt[t] * __expf(lb[t] - lb[j]) * kk[t][j] : 0.0f;
+    }
+    __syncthreads();
+    // W = (I + A)^-1 diag(beta), row by row: W[t][i] = beta_t [t == i] - sum_{j<t} A[t][j] W[j][i].  A thread: column
+    // i = tid / 4 and every 4th j; the 4 partial sums meet by shuffles (lanes 4i .. 4i + 3 of one warp).  W lives in ks.
+    {
+        float (*Wl)[kGcC + 1] = reinterpret_cast<float (*)[kGcC + 1]>(&ks[0][0]);
+        const int i = tid >> 2, part = tid & 3;
+        for (int t = 0; t < kGcC; ++t) {
+            float acc = 0.0f;
+            for (int j = part; j < t; j += 4) acc = fmaf(kk[t][j], Wl[j][i], acc);
+            acc += __shfl_xor_sync(0xffffffffu, acc, 1, 32);
+            acc += __shfl_xor_sync(0xffffffffu, acc, 2, 32);
+            if (part == 0) Wl[t][i] = (t == i ? bt[t] : 0.0f) - acc;
+            __syncthreads();
+        }
+        for (int e = tid; e < kGcC * kGcC; e += 256) oW[e] = Wl[e / kGcC][e % kGcC];
+    }
+    if (tid < kGcC) {
+        ob[tid] = __expf(lb[tid]);
+        od[tid] = __expf(lb[kGcC - 1] - lb[tid]);
+    }
+    if (tid == 0) od[kGcC] = __expf(lb[kGcC - 1]);   // b_C (the slot after d)
+}
+/// grid (HV, 4), block 256: a V head's 32 state columns cg * 32 .. through every block in order.
+__global__ void __launch_bounds__(256) k_gdn_chunk_scan(float* state, const float* h, int C, const float* scratch,
+                                                        float* o_raw, int h_k, int h_v, int T) {
+    constexpr int S = 128, NC = 32;
+    __shared__ float st[S][NC + 1];       // the state slice
+    __shared__ float rs[kGcC][NC + 1];    // V - b (K S), then U
+    const int head = blockIdx.x, cg = blockIdx.y, tid = threadIdx.x, qh = head % h_k;
+    const size_t row_stride = (size_t) h_v * S;
+    for (int e = tid; e < S * NC; e += 256) {
+        const int r = e / NC, c = e % NC;
+        st[r][c] = state[(size_t) r * row_stride + (size_t) head * S + cg * NC + c];
+    }
+    __syncthreads();
+    const int nblk = (T + kGcC - 1) / kGcC;
+    const int t = tid >> 2, c0 = (tid & 3) * 8;   // a thread: token t of the block, columns c0 .. c0 + 7
+    for (int blk = 0; blk < nblk; ++blk) {
+        const int t0 = blk * kGcC, nt = min(kGcC, T - t0);
+        const float* W = scratch + ((size_t) blk * h_v + head) * kGcPer;
+        const float* P = W + kGcC * kGcC;
+        const float* b = P + kGcC * kGcC;
+        const float* d = b + kGcC;
+        const float bC = d[kGcC];
+        const bool live = t < nt;
+        const float* ht = h + (size_t) (t0 + (live ? t : 0)) * C;
+        // KS and QS for (t, c0 ..): k_t / q_t from global, the state from shared memory
+        float ksv[8], qsv[8];
+        for (int c = 0; c < 8; ++c) { ksv[c] = 0.0f; qsv[c] = 0.0f; }
+        if (live) {
+            const float* kp = ht + h_k * S + qh * S;
+            const float* qp = ht + qh * S;
+            for (int r = 0; r < S; ++r) {
+                const float kv = kp[r], qv = qp[r];
+                for (int c = 0; c < 8; ++c) {
+                    ksv[c] = fmaf(kv, st[r][c0 + c], ksv[c]);
+                    qsv[c] = fmaf(qv, st[r][c0 + c], qsv[c]);
+                }
+            }
+        }
+        const float bt_ = b[t];
+        for (int c = 0; c < 8; ++c) {
+            const float v = live ? ht[2 * h_k * S + head * S + cg * NC + c0 + c] : 0.0f;
+            rs[t][c0 + c] = v - bt_ * ksv[c];
+        }
+        __syncthreads();
+        // U[t] = sum_{i <= t} W[t][i] R[i]
+        float u[8];
+        for (int c = 0; c < 8; ++c) u[c] = 0.0f;
+        for (int i = 0; i <= t; ++i) {
+            const float w = W[t * kGcC + i];
+            for (int c = 0; c < 8; ++c) u[c] = fmaf(w, rs[i][c0 + c], u[c]);
+        }
+        __syncthreads();   // every R read
+        for (int c = 0; c < 8; ++c) rs[t][c0 + c] = u[c];
+        __syncthreads();
+        // O[t] = b_t (q_t S) + sum_{i <= t} P[t][i] U[i]
+        if (live) {
+            float o[8];
+            for (int c = 0; c < 8; ++c) o[c] = bt_ * qsv[c];
+            for (int i = 0; i <= t; ++i) {
+                const float pw = P[t * kGcC + i];
+                for (int c = 0; c < 8; ++c) o[c] = fmaf(pw, rs[i][c0 + c], o[c]);
+            }
+            float* op = o_raw + (size_t) (t0 + t) * h_v * S + (size_t) head * S + cg * NC + c0;
+            for (int c = 0; c < 8; ++c) op[c] = o[c] * rsqrtf((float) S);
+        }
+        // S' = b_C S + K^T diag(d) U: a thread holds row r = tid / 2, 16 columns
+        {
+            const int r = tid >> 1, cc = (tid & 1) * 16;
+            float acc[16];
+            for (int c = 0; c < 16; ++c) acc[c] = bC * st[r][cc + c];
+            for (int i = 0; i < nt; ++i) {
+                const float kd = h[(size_t) (t0 + i) * C + h_k * S + qh * S + r] * d[i];
+                for (int c = 0; c < 16; ++c) acc[c] = fmaf(kd, rs[i][cc + c], acc[c]);
+            }
+            __syncthreads();   // every thread's QS / KS read of the old state is done (above), and U is read here
+            for (int c = 0; c < 16; ++c) st[r][cc + c] = acc[c];
+        }
+        __syncthreads();
+    }
+    for (int e = tid; e < S * NC; e += 256) {
+        const int r = e / NC, c = e % NC;
+        state[(size_t) r * row_stride + (size_t) head * S + cg * NC + c] = st[r][c];
+    }
+}
 /// y = rms(o) * gamma * SiLU(z) per (token, V head): grid (HV, T), block 128.
 __global__ void __launch_bounds__(128) k_gdn_norm(const float* o_raw, const float* z, const float* gamma, float eps,
                                                   float* y, int h_v) {
@@ -3653,6 +3840,11 @@ struct Engine {
         static const int n = [] { const char* v = std::getenv("STRATA_Q36_ATT_GQA_MIN"); return v ? std::atoi(v) : 16; }();
         return n;
     }
+    /// STRATA_Q36_GDN_CHUNK=1 (opt-in): the prompt's delta rule in blocks of 64 tokens (k_gdn_chunk_prep / _scan)
+    static bool gdn_chunk_on() {
+        static const bool on = [] { const char* v = std::getenv("STRATA_Q36_GDN_CHUNK"); return v && v[0] == '1'; }();
+        return on;
+    }
     static bool att16_on() {
         static const bool on = [] { const char* v = std::getenv("STRATA_Q36_ATT_F16"); return v && v[0] == '1'; }();
         return on;
@@ -3913,6 +4105,7 @@ struct Engine {
                 f32mm(L.beta, h, be_b, N, HV, T);
                 k_gdn_gb<<<grid1((int64_t) HV * T), kThreads, 0, st>>>(al_b, L.dt, L.ssm_a, be_b, HV, T);
             }
+            pmark("delta-net: qkv / z / a / b projections");
             if (rows_mode) {   // batch rows: a slot's rows (one, or a verify window's two) in sequence on its own state
                 k_conv_seq<<<dim3(C / 128, rows_G), 128, 0, st>>>(nullptr, qkv_b, L.conv, hc_b, C, 2 * HK, m->eps, 1,
                                                                   !verify, d_conv_tab + li * n_sess, d_gslot, d_grow0, d_gcnt);
@@ -3928,15 +4121,25 @@ struct Engine {
                 // a prompt chunk: tiles of kConvTile tokens side by side (tile mode); else one block per head walks the tokens
                 const int tiles = (fast_k && T > kGemmT && !verify) ? (T + kConvTile - 1) / kConvTile : 1;
                 k_conv_seq<<<dim3(C / 128, tiles), 128, 0, st>>>(conv[li], qkv_b, L.conv, hc_b, C, 2 * HK, m->eps, T, !verify);
+                pmark("delta-net: conv + q/k norm");
                 if (T > kGemmT && !verify) {   // a prompt chunk: the column-split delta rule, then the norm
+                    const int nblk = (T + kGcC - 1) / kGcC;
+                    if (gdn_chunk_on() && D == 128 && att_s != nullptr && (size_t) nblk * HV * kGcPer <= kAttScoreFloats) {
+                        // STRATA_Q36_GDN_CHUNK: blocks of kGcC tokens (att_s is free in a delta-net layer: scratch)
+                        k_gdn_chunk_prep<<<dim3(nblk, HV), 256, 0, st>>>(hc_b, C, al_b, be_b, att_s, HK, HV, T);
+                        pmark("delta-net: chunk prep (W, P)");
+                        k_gdn_chunk_scan<<<dim3(HV, 4), 256, 0, st>>>(S[li], hc_b, C, att_s, gdn_y, HK, HV, T);
+                    } else
                     k_gdn_seq_cols<<<dim3(HV, kGdnColGroups), dim3(128 / kGdnColGroups, 16), 0, st>>>(S[li], hc_b, C, al_b,
                                                                                                       be_b, gdn_y, HK, HV, T);
+                    pmark("delta-net: recurrence (k_gdn_seq_cols)");
                     k_gdn_norm<<<dim3(HV, T), 128, 0, st>>>(gdn_y, z, L.ssm_norm, m->eps, gdn_y, HV);
                 } else {   // decode, verify windows and commits: one kernel, so a window's rows are a decode step's rows
                     k_gdn_seq<<<HV, dim3(128, 4), 0, st>>>(S[li], hc_b, C, al_b, be_b, z, L.ssm_norm, m->eps, gdn_y, HK, HV,
                                                            T, !verify);
                 }
             }
+            pmark("delta-net: gated norm (decode: + recurrence)");
             mm(L.ssm_out, gdn_y, y, T);
         } else {
             prep_in(T);
@@ -4132,7 +4335,7 @@ struct Engine {
             pmark("attention: merge (decode) / prompt attention");
             mm(L.wo, att, y, T);
         }
-        pmark(L.attn ? "attention layer: projections + attention" : "delta-net layer: projections + recurrence");
+        pmark(L.attn ? "attention layer: projections + attention" : "delta-net: out projection");
         add_rms_post(L, T);
         // routed experts (one token: the router and the shared expert's gate in one product, the gate its last row)
         const bool one = T == 1;
