@@ -29,9 +29,19 @@
     g.innerHTML = s;
   }
   function setText(el, v) { if (el.textContent !== v) el.textContent = v; }
-  function dial(id, value, max, foot) {
+  // value null: not known yet ("…", the needle stays where it is); held: a past reading shown on purpose (dimmed)
+  function dial(id, value, max, foot, held = false, caption = "tok/s") {
     const card = $a(id);
     ticks(card.querySelector("svg"));
+    card.classList.toggle("is-held", held);
+    setText(card.querySelector(".gauge__value span"), caption);
+    if (value == null) {
+      setText(card.querySelector(".gauge__value b"), "…");
+      const footEl = card.querySelector(".gauge-card__foot");
+      const html = foot.map(([k, v]) => `<span>${k} <b>${v}</b></span>`).join("");
+      if (footEl._html !== html) { footEl.innerHTML = html; footEl._html = html; }
+      return;
+    }
     const f = Math.max(0, Math.min(1, (value || 0) / max));
     card.querySelector(".gauge__needle").style.transform = `rotate(${-90 + 180 * f}deg)`;
     const arc = card.querySelector(".gauge__arc");
@@ -141,8 +151,12 @@
     const peakP = Math.max(0, ...recent.prefill.slice(-600), lastPrefill || 0);
     maxPrefill = niceMax(Math.max(peakP, maxPrefill / 1.15), 500);
     const avgPrefill = t.prompt_ms > 0 ? (t.prompt_tokens - (t.reused || 0)) / (t.prompt_ms / 1000) : null;
-    dial("g-prefill", prefill, maxPrefill, [["Last prompt", lastPrefill ? `${fmtA(last.prompt_n)} at ${fmtA(lastPrefill)} tok/s` : "–"],
-      ["Average", avgPrefill > 0 ? `${fmtA(avgPrefill)} tok/s` : "–"]]);
+    // the engine reports reading progress in large steps, so a short prompt often has no rate until it is read:
+    // while reading the dial says "…" until a rate is known; afterwards it holds the last prompt's speed (dimmed)
+    const footP = [["Last prompt", lastPrefill ? `${fmtA(last.prompt_n)} at ${fmtA(lastPrefill)} tok/s` : "–"],
+      ["Average", avgPrefill > 0 ? `${fmtA(avgPrefill)} tok/s` : "–"]];
+    if (state === "reading") dial("g-prefill", prefill || null, maxPrefill, footP, false, "tok/s, reading");
+    else dial("g-prefill", lastPrefill || 0, maxPrefill, footP, !!lastPrefill, lastPrefill ? "tok/s, last prompt" : "tok/s");
 
     // hardware
     const box = $a("an-cards");

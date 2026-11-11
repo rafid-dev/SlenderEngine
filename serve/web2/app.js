@@ -889,12 +889,16 @@ async function generateReply(c, retried = false) {
   if (own.length) body.strata_builtin = own;
 
   let firstAt = null, thinkStart = null, usage = null, timings = null, lastSave = performance.now();
-  // paints follow the screen's frames, spaced out when one gets slow: a starved CPU paints less often, not later
-  let frame = 0, timer = 0, nextAt = 0, cost = 0;
-  const paint = () => {
-    frame = 0;
+  // paints follow the screen's frames, spaced out when one gets slow: a starved CPU paints less often, not later.
+  // A timer backs the frame request up: a browser can stop sending frames while the page still counts as visible
+  // (a covered window, a starved compositor), and the answer must still appear as it is written.
+  let frame = 0, fallback = 0, timer = 0, nextAt = 0, cost = 0;
+  const arm = () => { frame = requestAnimationFrame(run); fallback = setTimeout(run, 250); };
+  const run = () => {
+    if (frame) { cancelAnimationFrame(frame); frame = 0; }
+    if (fallback) { clearTimeout(fallback); fallback = 0; }
     const t0 = performance.now();
-    if (t0 < nextAt) { timer = setTimeout(() => { timer = 0; frame = requestAnimationFrame(paint); }, nextAt - t0); return; }
+    if (t0 < nextAt) { timer = setTimeout(() => { timer = 0; arm(); }, nextAt - t0); return; }
     const el = elNow();
     if (el) { updateAssistant(el, m, true); scrollDown(); }
     const t1 = performance.now();
@@ -902,7 +906,7 @@ async function generateReply(c, retried = false) {
     nextAt = t1 + Math.min(220, cost * 3);
     if (t1 - lastSave > 5000) { lastSave = t1; persist(c); }
   };
-  const schedule = () => { if (!frame && !timer) frame = requestAnimationFrame(paint); };
+  const schedule = () => { if (!frame && !fallback && !timer) arm(); };
   try {
     const r = await fetch("v1/chat/completions", {method: "POST", headers: headers(true), body: JSON.stringify(body), signal: controller.signal});
     if (!r.ok) {
@@ -952,6 +956,7 @@ async function generateReply(c, retried = false) {
     else m.error = e.message || String(e);
   }
   if (frame) cancelAnimationFrame(frame);
+  if (fallback) clearTimeout(fallback);
   if (timer) clearTimeout(timer);
   if (thinkStart && m.thinkSecs == null) m.thinkSecs = (performance.now() - thinkStart) / 1000;
   for (const t of m.tools || []) if (t.state === "writing" || t.state === "running") { t.state = "skipped"; t.ms = null; }

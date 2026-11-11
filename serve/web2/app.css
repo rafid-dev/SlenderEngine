@@ -421,3 +421,6 @@ input[type=range]{accent-color:var(--accent);width:100%}
   .gauge__value b{font-size:28px}
 }
 .tool__detail{font-size:12.5px;color:var(--ink-3);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0}
+.gauge-card.is-held .gauge__value b{color:var(--ink-2)}
+.gauge-card.is-held .gauge__needle{opacity:.55}
+.gauge-card.is-held .gauge__arc{opacity:.45 !important}
