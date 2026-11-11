@@ -223,11 +223,24 @@
 
         <section class="pane" data-pane="search" hidden>
           <div class="row-toggle">
-            <span><b>Web search</b><small>Lets the model search the web and read pages, through SearXNG on this PC. Off by default; switching it on starts SearXNG when the server knows how.</small></span>
+            <span><b>Web search</b><small>Lets the model search the web and read pages, through SearXNG on this PC. Off by default. The first time, SearXNG is installed for you (a minute or two); after that it just starts.</small></span>
             <button type="button" class="switch" id="s-search" role="switch" aria-checked="false" aria-label="Web search"></button>
           </div>
           <p class="status-line" id="search-status">Checking…</p>
-          <p class="field__note">Searches go out from SearXNG to the search engines it is set up for; the model can also read public web pages it finds. Pages on this PC or your local network are never read.</p>
+          <div class="field" id="search-method-box" hidden>
+            <span class="field__label">Run SearXNG with</span>
+            <div class="font-list" id="s-search-method" role="radiogroup" aria-label="Run SearXNG with">
+              <button type="button" role="radio" data-v="native"><b>Python on this PC</b><small></small></button>
+              <button type="button" role="radio" data-v="wsl"><b>WSL</b><small></small></button>
+              <button type="button" role="radio" data-v="docker"><b>Docker</b><small></small></button>
+            </div>
+            <span class="field__note" id="search-method-note"></span>
+          </div>
+          <div class="row-toggle" id="search-manage" hidden>
+            <span><b>SearXNG</b><small id="search-manage-note">Stop it to free its memory; Remove deletes what was installed.</small></span>
+            <span class="btn-row"><button type="button" class="btn" id="s-search-stop">Stop</button><button type="button" class="btn btn--danger" id="s-search-remove">Remove</button></span>
+          </div>
+          <p class="field__note">Searches go out from SearXNG to the search engines it uses; the model can also read public web pages it finds. Pages on this PC or your local network are never read. SearXNG is installed only from this PC itself, never from a shared device.</p>
         </section>
 
         <section class="pane" data-pane="context" hidden>

@@ -545,11 +545,15 @@ def fetch(url: str, timeout: float = 15.0, check_host=public_host) -> tuple[str,
 
 # ------------------------------------------------------------------------------------------------ SearXNG
 class Searx:
-    """The SearXNG instance web_search uses, and how to start it when the web app switches search on."""
+    """The SearXNG instance web_search uses, and how it gets started when the web app switches search on: the run
+    config's "searxng_start" command when there is one (a SearXNG you set up yourself), else serve/searxng_setup.py,
+    which installs it the first time (native venv, WSL or Docker) and starts it."""
 
-    def __init__(self, url: str = "http://127.0.0.1:8888", start_cmd=None):
+    def __init__(self, url: str = "http://127.0.0.1:8888", start_cmd=None, setup=None, may_install: bool = True):
         self.url = (url or "http://127.0.0.1:8888").rstrip("/")
         self.start_cmd = start_cmd
+        self.setup = setup                      # searxng_setup.SearxngSetup, or None
+        self.may_install = may_install          # the config's "searxng_install" (false: never install)
         self.started_at = None
         self.last_error = None
 
@@ -560,27 +564,51 @@ class Searx:
         except Exception:  # noqa: BLE001 - down, refused, timed out
             return False
 
-    def status(self) -> dict:
+    def status(self, with_methods: bool = False) -> dict:
         starting = self.started_at is not None and time.time() - self.started_at < 60
-        return {"url": self.url, "up": self.up(), "can_start": bool(self.start_cmd), "starting": starting,
-                "error": self.last_error}
+        out = {"url": self.url, "up": self.up(), "custom": bool(self.start_cmd),
+               "can_start": bool(self.start_cmd or self.setup), "starting": starting, "error": self.last_error}
+        if self.setup is not None and not self.start_cmd:
+            st = self.setup.status()
+            out["setup"] = st
+            out["starting"] = st["state"] in ("installing", "starting")
+            out["error"] = st["error"] if st["state"] == "failed" else None
+            out["may_install"] = self.may_install
+            if with_methods:
+                out["methods"] = self.setup.methods()
+        return out
 
-    def start(self) -> dict:
+    def start(self, method: str = "native", may_install: bool = False) -> dict:
+        """Start SearXNG: the configured command, or the managed one (installing it only when `may_install`)."""
         if self.up():
             return self.status()
-        if not self.start_cmd:
+        if self.start_cmd:
+            if self.started_at is None or time.time() - self.started_at > 60:
+                cmd = self.start_cmd if isinstance(self.start_cmd, list) else [self.start_cmd]
+                flags = 0x08000000 if os.name == "nt" else 0               # CREATE_NO_WINDOW: no console pops up
+                try:
+                    subprocess.Popen([str(c) for c in cmd], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                     stderr=subprocess.DEVNULL, creationflags=flags, close_fds=True)
+                    self.started_at, self.last_error = time.time(), None
+                    print(f"[strata] starting SearXNG for web search: {' '.join(map(str, cmd))}", flush=True)
+                except OSError as e:
+                    self.last_error = f"the searxng_start command failed: {e}"
+            return self.status()
+        if self.setup is None:
             self.last_error = f"SearXNG does not answer at {self.url} and no searxng_start command is set in the config"
             return self.status()
-        if self.started_at is None or time.time() - self.started_at > 60:
-            cmd = self.start_cmd if isinstance(self.start_cmd, list) else [self.start_cmd]
-            flags = 0x08000000 if os.name == "nt" else 0               # CREATE_NO_WINDOW: no console pops up
-            try:
-                subprocess.Popen([str(c) for c in cmd], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                                 stderr=subprocess.DEVNULL, creationflags=flags, close_fds=True)
-                self.started_at, self.last_error = time.time(), None
-                print(f"[strata] starting SearXNG for web search: {' '.join(map(str, cmd))}", flush=True)
-            except OSError as e:
-                self.last_error = f"the searxng_start command failed: {e}"
+        self.setup.start(method, may_install=may_install and self.may_install)
+        return self.status()
+
+    def stop(self) -> dict:
+        if self.setup is not None and not self.start_cmd:
+            self.setup.stop()
+        return self.status()
+
+    def uninstall(self, method: str) -> dict:
+        if self.setup is None or self.start_cmd:
+            raise ValueError("this server does not manage SearXNG (a searxng_start command is set)")
+        self.setup.uninstall(method)
         return self.status()
 
     def search(self, query: str, n: int = 6, timeout: float = 12.0) -> list[dict]:

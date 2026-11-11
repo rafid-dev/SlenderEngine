@@ -10,6 +10,40 @@ speed and the hardware. Themes, fonts, corners and text size are in Settings > A
 
 To open it from your phone or another computer, see [Sharing over Tailscale](TAILSCALE.md).
 
+## Web search: set up for you
+
+Search needs [SearXNG](https://github.com/searxng/searxng), a search engine that runs on your PC and asks the big
+search engines for you. You do not have to install it. The first time you switch search on, the server installs it
+and starts it; after that the switch only starts it. Settings > Search shows each step.
+
+Pick how it runs in Settings > Search:
+
+| Way | What it needs | RAM when running | First switch-on |
+|---|---|---|---|
+| **Python on this PC** (default) | nothing extra | about 100 MB | about 40 s (measured: 36-48 s) |
+| **WSL** | WSL with a Linux distribution that has `python3-venv` | about 1 GB for WSL | similar |
+| **Docker** | Docker Desktop, running | Docker's own | depends on the image download |
+
+All three install the same pinned SearXNG version and check the download before they use it: the Python and WSL
+ways compare the source archive's SHA-256, the Docker way uses the official image by its digest. SearXNG listens
+on `127.0.0.1` only. The Python way installs into `SlenderEngine/searxng` (a Python environment of about 120 MB);
+the WSL way into `~/.local/share/slenderengine-searxng` inside the distribution; the Docker way into a container
+named `slenderengine-searxng`. Settings > Search has **Stop** (frees its memory) and **Remove** (deletes what was
+installed). The server also stops the SearXNG it started when the server stops.
+
+SearXNG does not support Windows officially. The Python way runs it anyway: the one Linux-only module it imports
+(`pwd`, used only for an error message about a database a local setup does not have) gets a small stand-in. If a
+future SearXNG version breaks this, the pinned version keeps working until the pin is changed in
+`serve/searxng_setup.py`. WSL and Docker are never installed by SlenderEngine: they need administrator rights.
+
+**Only from this PC.** SearXNG is installed only when the request comes from a browser on the PC that runs the
+model. A phone or laptop using the page over the network or a Tailscale share can switch search on once SearXNG is
+installed, but cannot install or remove it, with or without the API key.
+
+**Your own SearXNG.** If you run SearXNG yourself, put its address in `"searxng_url"` and, if the server should
+start it, its start command in `"searxng_start"`. With `"searxng_start"` set, the server never installs anything.
+`"searxng_install": false` turns installing off entirely.
+
 ## Where your data is
 
 | What | Where | How to remove it |
@@ -63,8 +97,9 @@ addresses, and addresses with a user name or password. The check happens when th
 address it connects to, for every redirect too, so a name that first points to the internet and then to your PC
 (DNS rebinding) is still refused. It uses no proxy from the environment, reads at most 4 MB and waits at most 15 s.
 
-Starting SearXNG runs the command in the run config's `"searxng_start"`. A request can only ask the server to start
-it; it cannot choose the command.
+Starting SearXNG runs the command in the run config's `"searxng_start"`, or the server's own installer. A request
+can ask for one of three fixed ways (Python, WSL, Docker), never a command, and only a request from this PC itself
+can cause an install.
 
 ### Prompt injection
 
@@ -90,8 +125,10 @@ the chat, with its address when you open it. To be safe:
 
 | Key | Default | What it does |
 |---|---|---|
-| `"searxng_url"` | `http://127.0.0.1:8888` | The SearXNG instance `web_search` asks |
-| `"searxng_start"` | none | The command that starts SearXNG when the page switches search on (a string or a list) |
+| `"searxng_url"` | `http://127.0.0.1:8888` | Where SearXNG answers (the installed one listens on this port too) |
+| `"searxng_start"` | none | Your own command that starts SearXNG; when set, the server installs nothing |
+| `"searxng_install"` | true | false: never install SearXNG (search works only with one you run yourself) |
+| `"searxng_dir"` | `SlenderEngine/searxng` | Where the Python way installs SearXNG |
 | `"files_dir"` | `<config>.files` | Where attached documents' text is kept |
 | `"files_max_mb"` | 2048 | The most the documents folder may hold before the oldest go (0: no limit) |
 | `"files_keep_days"` | 30 | Days a document is kept after it was last read (0: no limit) |

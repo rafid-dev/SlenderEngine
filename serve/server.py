@@ -8145,8 +8145,12 @@ def make_handler(svc: Service):
             if path == "/v1/search":                         # is web search (SearXNG) running? (the web app's switch)
                 if self._authorized():
                     b = svc.builtins
-                    self._json(200, b.searx.status() if b is not None and b.searx is not None
-                               else {"url": None, "up": False, "can_start": False, "starting": False, "error": None})
+                    if b is None or b.searx is None:
+                        self._json(200, {"url": None, "up": False, "can_start": False, "starting": False, "error": None})
+                    else:
+                        st = b.searx.status(with_methods="methods=1" in self.path)
+                        st["from_this_pc"] = self._from_this_pc()      # only then may it install SearXNG
+                        self._json(200, st)
                 return
             if path == "/v1/files":                          # how much the attached files take (Settings > Data)
                 if self._authorized():
@@ -8419,14 +8423,25 @@ def make_handler(svc: Service):
                           f"{doc['chars']:,} characters", flush=True)
                     self._json(200, FileStore.summary(doc, inline_chars=min(inline, 200000)))
                     return
-                if path == "/v1/search/start":               # the web app switched web search on: start SearXNG
+                if path in ("/v1/search/start", "/v1/search/stop", "/v1/search/uninstall"):
                     b = svc.builtins
                     if b is None or b.searx is None:
                         self._json(404, {"error": {"message": "web search is not set up on this server"}})
                         return
                     if not self._own_page("web search can be started"):
                         return
-                    self._json(200, b.searx.start())
+                    method = str(req.get("method") or "native")
+                    if path == "/v1/search/start":
+                        # installing downloads and runs SearXNG: only a request from this PC itself may cause it
+                        # (not a device on the network or a Tailscale share, even with the key); starting may
+                        self._json(200, b.searx.start(method, may_install=self._from_this_pc()))
+                    elif path == "/v1/search/stop":
+                        self._json(200, b.searx.stop())
+                    else:
+                        if not self._from_this_pc():
+                            self._json(403, {"error": {"message": "SearXNG can be removed only from this PC itself"}})
+                            return
+                        self._json(200, b.searx.uninstall(method))
                     return
                 if path == "/v1/vram":                       # #533: give VRAM back to other programs, or take it
                     if not self._own_page("the VRAM reserve can be changed"):
@@ -8663,6 +8678,17 @@ def make_handler(svc: Service):
                 print(f"[strata] the Settings view changed {', '.join(changed)} in {Path(svc.config_path).name} "
                       f"(the earlier file: {bak.name}); used from the next start", flush=True)
             self._json(200, {**runconfig.view(new, svc.config_path), "changed": changed})
+        def _from_this_pc(self) -> bool:
+            """The request comes from a browser on this PC itself: a loopback client, a loopback Host, and no header a
+            proxy adds (a `tailscale serve` or other reverse proxy also connects from 127.0.0.1, but adds these)."""
+            if any(self.headers.get(h) for h in ("X-Forwarded-For", "Forwarded", "X-Real-IP", "Tailscale-User-Login",
+                                                 "X-Forwarded-Host", "CF-Connecting-IP")):
+                return False
+            ip = (self.client_address[0] if self.client_address else "") or ""
+            if ip.startswith("::ffff:"):
+                ip = ip[7:]
+            return ip in ("127.0.0.1", "::1") and host_name(self.headers.get("Host", "")) in ("localhost", "127.0.0.1", "::1")
+
         def _foreign_origin(self) -> bool:
             """A web page of another origin sent this.  The Origin must be this server's own address (host and port),
             or an origin the config trusts (trusted_origins: the web app behind a reverse proxy or tunnel); no Origin
@@ -10621,8 +10647,17 @@ def _main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> i
         if isinstance(v, bool) or not isinstance(v, (int, float)) or v < 0:
             raise SystemExit(f"[strata] config \"{key}\": a number, 0 or more (0: no limit), not {v!r}")
         limits[key] = v
+    # without "searxng_start", the server installs SearXNG itself the first time search is switched on (from this PC
+    # only), in SlenderEngine/searxng ("searxng_dir"); "searxng_install": false turns that off
+    if cfg.get("searxng_install") is not None and not isinstance(cfg["searxng_install"], bool):
+        raise SystemExit("[strata] config \"searxng_install\": true or false")
+    from serve.searxng_setup import SearxngSetup
+    searx_url = cfg.get("searxng_url") or "http://127.0.0.1:8888"
+    setup = SearxngSetup(cfg.get("searxng_dir") if isinstance(cfg.get("searxng_dir"), str) else ROOT / "searxng", searx_url)
     svc.builtins = Builtins(FileStore(files_dir, max_bytes=int(limits["files_max_mb"] * 2**20), keep_days=limits["files_keep_days"]),
-                            Searx(cfg.get("searxng_url") or "http://127.0.0.1:8888", start_cmd))
+                            Searx(searx_url, start_cmd, setup=setup, may_install=cfg.get("searxng_install") is not False))
+    import atexit
+    atexit.register(setup.stop)                         # the SearXNG this server started ends with it
     if hub is not None:
         import atexit
         svc.mcp = hub

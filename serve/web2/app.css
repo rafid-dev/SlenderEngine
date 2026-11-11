@@ -489,3 +489,7 @@ input[type=range]{accent-color:var(--accent);width:100%}
 .seg button{flex:1;padding:6px 8px;border-radius:var(--r-sm);color:var(--ink-2);font-size:14px}
 .seg button:hover{color:var(--ink)}
 .seg button[aria-checked="true"]{background:var(--panel-3);color:var(--ink)}
+
+.btn-row{display:flex;gap:8px;flex:none}
+.muted{color:var(--ink-3)}
+.font-list button:disabled{opacity:.45;cursor:default}

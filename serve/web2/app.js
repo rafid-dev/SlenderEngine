@@ -23,7 +23,7 @@ const ls = {
 // ------------------------------------------------------------------ settings
 const DEFAULTS = {system: "", effort: "high", enterSends: true, card: true, temperature: 1.0, top_p: 0.95, top_k: 20,
                   max: "", seed: "", mcp: true, typing: true, thinkOpen: true, math: true, search: false,
-                  autoCompact: true, compactAt: 80, theme: "black", font: "system", corners: "soft", textSize: "normal"};
+                  autoCompact: true, compactAt: 80, searchMethod: "native", theme: "black", font: "system", corners: "soft", textSize: "normal"};
 let settings = {...DEFAULTS, ...ls.get("settings", {})};
 const saveSettings = () => ls.set("settings", settings);
 // the classic page's key is taken over once, so a server with a key keeps working after the switch
@@ -1112,11 +1112,23 @@ $("effort-menu").addEventListener("keydown", (e) => {
 document.addEventListener("click", (e) => { if (!e.target.closest("#effort")) closeEffort(); });
 
 // ------------------------------------------------------------------ web search
+// Without a "searxng_start" command in the run config, the server installs SearXNG itself the first time search is
+// switched on (Python venv by default, or WSL / Docker) and starts it after that (serve/searxng_setup.py).
+const managed = () => !!searchInfo.setup;
 function searchStatusText() {
   if (!builtins) return ["is-off", "This server has no web search (it was started without the web app's tools)."];
   if (searchInfo.up) return ["is-on", `SearXNG is running at ${searchInfo.url}.`];
+  const st = searchInfo.setup;
+  if (st && (st.state === "installing" || st.state === "starting")) return ["is-busy", `${st.step || (st.state === "installing" ? "Installing SearXNG" : "Starting SearXNG")}…`];
   if (searchInfo.starting) return ["is-busy", "Starting SearXNG…"];
   if (searchInfo.error) return ["is-off", searchInfo.error];
+  if (st) {
+    const m = settings.searchMethod;
+    if (st.installed && st.installed[m]) return ["", "SearXNG is installed and stopped; switching search on starts it."];
+    if (searchInfo.may_install === false) return ["is-off", "Installing SearXNG is turned off in the run config (\"searxng_install\": false)."];
+    if (searchInfo.from_this_pc === false) return ["is-off", "SearXNG is not installed. It can be installed only from the PC that runs the model."];
+    return ["", `SearXNG is not installed yet. Switching search on installs it (version ${st.version}, about a minute or two).`];
+  }
   return ["", searchInfo.can_start ? "SearXNG is not running; switching search on starts it." :
     `SearXNG does not answer at ${searchInfo.url || "its address"}. Start it yourself, or set "searxng_start" in the run config.`];
 }
@@ -1124,17 +1136,40 @@ function renderSearch() {
   const b = $("search-btn");
   b.hidden = !builtins;
   b.setAttribute("aria-pressed", String(!!settings.search));
-  b.title = settings.search ? (searchInfo.up ? "Web search is on" : "Web search is on, but SearXNG is not running yet") : "Web search is off";
+  const busy = searchInfo.setup && ["installing", "starting"].includes(searchInfo.setup.state);
+  b.title = settings.search ? (searchInfo.up ? "Web search is on" : busy ? searchStatusText()[1] : "Web search is on, but SearXNG is not running yet") : "Web search is off";
   setSwitch("s-search", settings.search);
   $("s-search").disabled = !builtins;
   const [cls, text] = searchStatusText();
   $("search-status").innerHTML = `<span class="dot ${cls}"></span><span>${esc(text)}</span>`;
+  // the way SearXNG runs: only when the server manages it (no searxng_start command of your own)
+  $("search-method-box").hidden = !managed();
+  $("search-manage").hidden = !managed();
+  if (managed()) {
+    const ms = searchInfo.methods || {}, inst = searchInfo.setup.installed || {};
+    for (const btn of $("s-search-method").querySelectorAll("[data-v]")) {
+      const m = btn.dataset.v, info = ms[m];
+      btn.setAttribute("aria-checked", String(m === settings.searchMethod));
+      btn.disabled = !!busy || (info ? !info.ok && !inst[m] : false);
+      btn.querySelector("small").textContent = (inst[m] ? "Installed. " : "") + (info ? info.note : "checking…");
+    }
+    $("search-method-note").textContent = "Python is the lightest. WSL and Docker need to be installed and running already; SlenderEngine does not install them.";
+    const anyInstalled = Object.values(inst).some(Boolean);
+    $("s-search-stop").disabled = !searchInfo.up && !busy;
+    $("s-search-remove").disabled = !anyInstalled || !!busy || searchInfo.from_this_pc === false;
+  } else if (searchInfo.custom) {
+    $("search-status").innerHTML += `<span class="muted"> (started by the run config's searxng_start command)</span>`;
+  }
 }
-async function loadSearch() {
+async function loadSearch(withMethods = false) {
   try {
-    const r = await fetch("v1/search", {headers: headers(), cache: "no-store"});
+    const r = await fetch(`v1/search${withMethods ? "?methods=1" : ""}`, {headers: headers(), cache: "no-store"});
     builtins = r.ok;
-    if (r.ok) searchInfo = await r.json();
+    if (r.ok) {
+      const methods = searchInfo.methods;
+      searchInfo = await r.json();
+      if (!searchInfo.methods && methods) searchInfo.methods = methods;   // keep the last check between quick polls
+    }
   } catch (e) { builtins = false; }
   renderSearch();
 }
@@ -1143,16 +1178,24 @@ async function ensureSearch() {
   if (searchStarting) return searchStarting;
   searchStarting = (async () => {
     try {
-      let r = await fetch("v1/search/start", {method: "POST", headers: headers(true), body: "{}"});
-      if (r.ok) searchInfo = await r.json();
+      let r = await fetch("v1/search/start", {method: "POST", headers: headers(true), body: JSON.stringify({method: settings.searchMethod})});
+      const methods = searchInfo.methods;
+      if (r.ok) searchInfo = {...(await r.json()), methods};
       renderSearch();
-      for (let i = 0; i < 30 && !searchInfo.up && (searchInfo.starting || i === 0) && settings.search; i++) {
+      // an install takes a minute or two: follow it (up to 20 minutes) while the switch stays on
+      const until = Date.now() + 20 * 60 * 1000;
+      while (settings.search && !searchInfo.up && Date.now() < until &&
+             (searchInfo.starting || (searchInfo.setup && ["installing", "starting"].includes(searchInfo.setup.state)))) {
         await new Promise((res) => setTimeout(res, 1500));
-        r = await fetch("v1/search", {headers: headers(), cache: "no-store"});
-        if (r.ok) searchInfo = await r.json();
-        renderSearch();
+        await loadSearch();
       }
-      if (settings.search && !searchInfo.up) toast("Web search is not running", searchStatusText()[1], {kind: "error", ms: 8000});
+      if (settings.search && !searchInfo.up) {
+        const why = searchStatusText()[1];
+        settings.search = false; saveSettings(); renderSearch();      // a switch that cannot work does not stay on
+        toast("Web search could not start", why, {kind: "error", ms: 10000});
+      } else if (searchInfo.up && settings.search) {
+        toast("Web search is on", "SearXNG is running on this PC.");
+      }
     } catch (e) { /* the status line says it */ }
     searchStarting = null;
   })();
@@ -1163,6 +1206,27 @@ function setSearch(on) {
   if (on && !searchInfo.up) ensureSearch();
 }
 $("search-btn").onclick = () => setSearch(!settings.search);
+$("s-search-method").addEventListener("click", (e) => {
+  const b = e.target.closest("[data-v]");
+  if (!b || b.disabled) return;
+  settings.searchMethod = b.dataset.v; saveSettings(); renderSearch();
+});
+async function searchAction(path, body, done) {
+  try {
+    const r = await fetch(path, {method: "POST", headers: headers(true), body: JSON.stringify(body || {})});
+    const j = await r.json();
+    if (!r.ok) throw new Error((j.error && j.error.message) || `HTTP ${r.status}`);
+    toast(done);
+  } catch (e) { toast("That did not work", e.message || String(e), {kind: "error"}); }
+  await loadSearch(true);
+}
+$("s-search-stop").onclick = () => { settings.search = false; saveSettings(); searchAction("v1/search/stop", {}, "SearXNG stopped"); };
+$("s-search-remove").onclick = () => {
+  const m = settings.searchMethod;
+  if (!confirm(`Remove SearXNG (${m})? It is installed again the next time search is switched on.`)) return;
+  settings.search = false; saveSettings();
+  searchAction("v1/search/uninstall", {method: m}, "SearXNG removed");
+};
 
 // ------------------------------------------------------------------ settings window
 function setSwitch(id, on) { $(id).setAttribute("aria-checked", String(!!on)); }
@@ -1233,7 +1297,7 @@ function fillSettings() {
 function showPane(name) {
   for (const b of $("settings-nav").children) b.setAttribute("aria-selected", String(b.dataset.pane === name));
   for (const p of document.querySelectorAll("#settings .pane")) p.hidden = p.dataset.pane !== name;
-  if (name === "search") loadSearch();
+  if (name === "search") loadSearch(true);
   if (name === "data") loadFilesNote();
 }
 $("settings-nav").onclick = (e) => { const b = e.target.closest("button[data-pane]"); if (b) showPane(b.dataset.pane); };

@@ -118,14 +118,24 @@ def main():
     ap.add_argument("--port", type=int, default=8095)
     ap.add_argument("--delay", type=float, default=0.004, help="seconds per byte (one byte = one token)")
     ap.add_argument("--ctx", type=int, default=32768, help="the context size the mock reports")
+    ap.add_argument("--real-searxng", metavar="DIR", help="use the real SearXNG installer (serve/searxng_setup.py) with "
+                    "this install folder instead of the fake search; for testing the install from the page")
+    ap.add_argument("--searxng-url", default="http://127.0.0.1:8890", help="with --real-searxng: where it listens")
     a = ap.parse_args()
     tok = ByteTokenizer()
     svc = Service(SmartMock(tok, REPLY, max_context=a.ctx, delay_s=a.delay), tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
     svc.model = "mock-model"
-    searx = http.server.ThreadingHTTPServer(("127.0.0.1", 0), FakeSearx)
-    threading.Thread(target=searx.serve_forever, daemon=True).start()
-    svc.builtins = Builtins(FileStore(tempfile.mkdtemp(prefix="web2-mock-files-")),
-                            Searx(f"http://127.0.0.1:{searx.server_address[1]}"))
+    if a.real_searxng:
+        import atexit
+        from serve.searxng_setup import SearxngSetup
+        setup = SearxngSetup(a.real_searxng, a.searxng_url)
+        atexit.register(setup.stop)
+        search = Searx(a.searxng_url, setup=setup)
+    else:
+        searx = http.server.ThreadingHTTPServer(("127.0.0.1", 0), FakeSearx)
+        threading.Thread(target=searx.serve_forever, daemon=True).start()
+        search = Searx(f"http://127.0.0.1:{searx.server_address[1]}")
+    svc.builtins = Builtins(FileStore(tempfile.mkdtemp(prefix="web2-mock-files-")), search)
     httpd = serve(svc, port=a.port)
     print(f"web app on http://127.0.0.1:{httpd.server_address[1]}/  (classic: /classic)", flush=True)
     try:                                   # serve() already answers on its own thread

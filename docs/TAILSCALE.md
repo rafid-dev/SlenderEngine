@@ -77,7 +77,8 @@ To take access away: remove the share or the rule, and change the key. Put a new
 restart the server; every device then needs the new key.
 
 Anyone with access and the key can use your GPU, the model, and the web app's tools: web search, reading web pages,
-and the documents attached on this server. See [WEB_APP.md](WEB_APP.md#security).
+and the documents attached on this server. They can switch search on only once SearXNG is installed: installing or
+removing it works only from the PC itself. See [WEB_APP.md](WEB_APP.md#security).
 
 ## Not recommended: the public internet
 

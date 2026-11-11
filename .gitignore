@@ -95,3 +95,6 @@ node_modules/
 /build-spark/
 /build-vision-spark/
 /.venv-build/
+
+# SearXNG installed by the web app (serve/searxng_setup.py)
+/searxng/

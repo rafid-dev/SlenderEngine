@@ -55,7 +55,10 @@ The chat page the server serves at `/` (`serve/web2`) adds these. Details, and w
   Markdown is applied; KaTeX runs with `trust: false`.
 - **The web app's tools** (`web_search`, `fetch_url`, `read_document`, `search_document`) are accepted like MCP tools:
   only as JSON from the server's own page or a `"trusted_origins"` origin, and with the key when one is set. Search is
-  off until the user switches it on. `fetch_url` connects only to public internet addresses, checked on the exact
+  off until the user switches it on. The first switch-on installs SearXNG (`serve/searxng_setup.py`): a pinned version, its
+  source checked by SHA-256 or its Docker image by digest, listening on `127.0.0.1`; only a request from a browser on this
+  PC itself (loopback client and Host, no proxy headers such as `X-Forwarded-For` or `Tailscale-User-Login`) can cause an
+  install or a removal. `fetch_url` connects only to public internet addresses, checked on the exact
   address it connects to for every redirect (no DNS rebinding), with no proxy from the environment, at most 4 MB and
   15 s. Starting SearXNG runs only the run config's `"searxng_start"`.
 - **Attached documents.** `POST /v1/files` keeps the extracted text (never the file) in a folder next to the run
