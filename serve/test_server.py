@@ -3503,16 +3503,24 @@ class WebApp(unittest.TestCase):
         code, ctype, body = self.get("/")
         self.assertEqual(code, 200)
         self.assertIn("text/html", ctype)
-        self.assertIn(b"\"web/app.js\"", body)   # relative since #82 (works behind a path-prefixed proxy)
+        self.assertIn(b"\"web2/app.js\"", body)   # the SlenderEngine app; relative (works behind a path-prefixed proxy)
+        with urllib.request.urlopen(self.base + "/", timeout=10) as r:
+            self.assertIn("frame-src 'none'", r.headers.get("Content-Security-Policy", ""))
+        code, ctype, body = self.get("/classic")   # the Strata app, kept until it is retired
+        self.assertEqual(code, 200)
+        self.assertIn(b"\"web/app.js\"", body)
         for path, want in (("/web/app.js", "javascript"), ("/web/app.css", "text/css"), ("/web/tokens.css", "text/css"),
-                           ("/web/components.css", "text/css"), ("/web/sprite.svg", "image/svg+xml")):
+                           ("/web/components.css", "text/css"), ("/web/sprite.svg", "image/svg+xml"),
+                           ("/web2/app.js", "javascript"), ("/web2/app.css", "text/css"), ("/web2/typing.js", "javascript"),
+                           ("/web2/favicon.svg", "image/svg+xml")):
             with self.subTest(path=path):
                 code, ctype, _ = self.get(path)
                 self.assertEqual(code, 200)
                 self.assertIn(want, ctype)
 
     def test_only_the_app_files_are_served(self):
-        for path in ("/web/..%2Fserver.py", "/web/index.html", "/web/test.py", "/fonts/..%2F..%2Fsetup.py",
+        for path in ("/web/..%2Fserver.py", "/web/index.html", "/web/test.py", "/web2/..%2Fserver.py", "/web2/index.html",
+                     "/web2/../web/app.js", "/fonts/..%2F..%2Fsetup.py",
                      "/fonts/missing.woff2", "/fonts/x.ttf"):
             with self.subTest(path=path):
                 self.assertEqual(self.get(path)[0], 404)

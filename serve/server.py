@@ -7873,12 +7873,14 @@ def make_handler(svc: Service):
                 self.end_headers()
                 self.wfile.write(body)
                 return
-            if path.startswith("/web/"):
-                # the web app's own files (serve/web): styles, script, icon sprite - same origin, no CDN
-                name = path[len("/web/"):]
+            if path.startswith(("/web/", "/web2/")):
+                # the web app's own files (serve/web, and the SlenderEngine app's serve/web2): styles, scripts, icons -
+                # same origin, no CDN, flat folders only
+                folder = "web2" if path.startswith("/web2/") else "web"
+                name = path[len(folder) + 2:]
                 types = {".css": "text/css; charset=utf-8", ".js": "text/javascript; charset=utf-8",
                          ".svg": "image/svg+xml"}
-                f = ROOT / "serve" / "web" / name
+                f = ROOT / "serve" / folder / name
                 ext = os.path.splitext(name)[1]
                 if "/" in name or "\\" in name or ext not in types or not f.is_file():
                     self._json(404, {"error": {"message": "not found"}})
@@ -8112,11 +8114,15 @@ def make_handler(svc: Service):
                 if self._authorized():
                     self._json(200, svc.mcp.status() if svc.mcp else {"servers": [], "tools": 0})
                 return
-            if path == "" or (path == "/api-monitor" and svc.api_monitor):
-                body = (ROOT / "serve" / "web" / ("monitor.html" if path else "index.html")).read_bytes()
+            if path in ("", "/classic") or (path == "/api-monitor" and svc.api_monitor):
+                # "" is the SlenderEngine app (serve/web2); /classic keeps the Strata app (serve/web) until it is retired.
+                # The classic page's relative links (web/app.js, health, ...) resolve to the root from /classic as well.
+                page = (ROOT / "serve" / "web2" / "index.html" if path == "" else
+                        ROOT / "serve" / "web" / ("monitor.html" if path == "/api-monitor" else "index.html"))
+                body = page.read_bytes()
                 self.send_response(200)
                 self.send_header("Content-Type", "text/html; charset=utf-8")
-                if not path:
+                if path != "/api-monitor":
                     # the chat's svg/html preview is a sandboxed frame; this keeps it from navigating away to a web page
                     # (a link or <meta refresh> inside a model's html), which no sandbox flag does (serve/web/preview.js)
                     self.send_header("Content-Security-Policy", PAGE_CSP)
