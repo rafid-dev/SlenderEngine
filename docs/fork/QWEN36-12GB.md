@@ -14,14 +14,16 @@ such a card, so the engine runs in its hybrid mode: some experts in VRAM, the re
 Engine arguments (the run config's `args`):
 
 ```
---native <path>\Qwen3.6-35B-A3B-UD-Q4_K_M.gguf --max-context 262144 --prefill auto --mtp 0 --pool-workers 19
+--native <path>\Qwen3.6-35B-A3B-UD-Q4_K_M.gguf --max-context 262144 --prefill auto --mtp 0 --pool-workers 19 --hybrid-rows 256
 ```
 
 The config also needs `"arch": "qwen35moe"` and a `tokenizer` folder made by `tools/strata_tokenizer.py --gguf <file>
 --out <folder>`. A GGUF without the MTP block loads (the `nextn_predict_layers` key is optional); use `--mtp 0`.
 
-Environment (all off by default; set them before starting the server). Every switch in this block gives the same
-output bits as the engine without it, or changes only where an expert is computed (see Quality):
+Environment (all off by default; set them before starting the server). Most switches give the same output bits as
+the engine without them, or change only where an expert is computed. Three settings change the arithmetic or the
+grouping of a prompt and move the output at noise level: `STRATA_Q36_DENSE_MMQ`, `STRATA_Q36_CK_EXACT` and
+`--hybrid-rows 256` (see Quality):
 
 ```bat
 rem cache and context
@@ -42,6 +44,7 @@ set STRATA_Q36_ATT_TR=1
 set STRATA_Q36_Q8ST=1
 set STRATA_Q36_GEMV_ILP=1
 set STRATA_POOL_FUSED=1
+set STRATA_Q36_GPU_TOPK=1
 rem prompts
 set STRATA_Q36_LM=1
 set STRATA_Q36_LM_TAIL=1
@@ -54,29 +57,41 @@ set STRATA_Q36_GDN_TC=1
 set STRATA_Q36_GDN_COLS=16
 set STRATA_Q36_MOE_OUT2=1
 set STRATA_Q36_SGEMM8=1
+set STRATA_Q36_DENSE_MMQ=1
+set STRATA_Q36_LAZY_F16=1
+set STRATA_Q36_SWQ=1
+set STRATA_Q36_QSCATTER=1
 set STRATA_Q36_CKPT=1
+set STRATA_Q36_CK_EXACT=1
 ```
 
-Two optional switches trade something for faster long prompts:
+One optional setting trades decode speed for faster long prompts:
 
-- `STRATA_Q36_DENSE_MMQ=1`: 8-bit activations in the prompt's dense projections, as decode already uses. A 50K read
-  +7%; the output changes at rounding level (see Quality).
-- `STRATA_Q36_CHUNK=4096` with `STRATA_Q36_LM_CHUNKS=2`: a 50K read +5% more, but the bigger chunk buffers take 14
-  expert slots a layer and decode drops 4-5%.
+- `STRATA_Q36_CHUNK=4096` with `STRATA_Q36_LM_CHUNKS=2`: a 50K read +5%, but the bigger chunk buffers take 14 expert
+  slots a layer and decode drops 4-5%.
+
+For output bits identical to the engine without switches, leave out `STRATA_Q36_DENSE_MMQ`, `STRATA_Q36_LAZY_F16` and
+`STRATA_Q36_CK_EXACT` and keep `--hybrid-rows` at its default (128): the "Bit-identical set" column below.
 
 ## Results
 
-Server runs at 262K context, the PC otherwise quiet, two alternated runs each. "Before" is the engine before this
-work at 65K (its f32 cache did not fit 131K); llama.cpp is b8abe41a5 with `--fit on` at 131K.
+Server runs at 262K context, two alternated runs each. "Before" is the engine before this work at 65K (its f32 cache
+did not fit 131K); llama.cpp is b8abe41a5 with `--fit on` at 131K.
 
-| | Before (65K) | The configuration above | + `DENSE_MMQ` | + 4096-token chunks | llama.cpp (131K) |
+| | Before (65K) | Bit-identical set | + `DENSE_MMQ` | The configuration above | llama.cpp (131K) |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| Short questions, decode (tok/s) | 47.5-48.4 | **99.0-99.3** | 98.0-98.1 | 94.0-94.6 | 43-45 |
-| 50K-token prompt read (tok/s) | 1,023-1,028 | **4,208-4,234** | 4,513-4,531 | 4,748-4,757 | 599 (1,588 with `-ub 2048`) |
-| Decode after a 50K prompt (tok/s) | 10.9-11.0 | **82.0-82.9** | 81.3-82.3 | 78.3-79.7 | 42 |
-| Decode after the follow-up (tok/s) | 10.7-10.9 | 80.7-81.5 | 82.3-82.7 | 78.1-79.1 | 42 |
-| Follow-up after a 50K prompt | the whole conversation read again (~50 s) | ~880 tokens read in ~1 s | same | same | 36 tokens read |
-| Page-file writes | 0.6-1.1 GB/h | 0.00 GB/h | 0.00-0.01 | 0.00 | 0.5-4.2 GB/h |
+| Short questions, decode (tok/s) | 47.5-48.4 | 99.0-99.3 | 98.0-98.1 | **93.0-97.2** | 43-45 |
+| 50K-token prompt read (tok/s) | 1,023-1,028 | 4,208-4,234 | 4,513-4,531 | **4,418-4,522** | 599 (1,588 with `-ub 2048`) |
+| Decode after a 50K prompt (tok/s) | 10.9-11.0 | 82.0-82.9 | 81.3-82.3 | **80.5-83.3** | 42 |
+| Decode after the follow-up (tok/s) | 10.7-10.9 | 80.7-81.5 | 82.3-82.7 | **77.9-82.1** | 42 |
+| Follow-up after a 50K prompt | the whole conversation read again (~50 s) | ~880 tokens read in ~1.1 s | same | **33 tokens read in 0.21 s** | 36 tokens read |
+| Page-file writes | 0.6-1.1 GB/h | 0.00 GB/h | 0.00-0.01 | 0.00-1.16 | 0.5-4.2 GB/h |
+
+The last configuration's two runs were made with other programs open (0.4-0.6 GiB of RAM free), the two columns
+before it on a quiet PC, so its decode and prompt-read ranges are not a like-for-like comparison with them; what
+it adds for certain is the follow-up. Short follow-ups after a 50K prompt: 64 / 128 / 200 new tokens are read in
+~0.3 / ~0.6 / ~0.9 s (before: ~1.0-1.1 s whatever the length). With 4096-token chunks on top of `DENSE_MMQ`
+(quiet PC): short 94.0-94.6, 50K read 4,748-4,757, after 50K 78.3-79.7.
 
 Decode 100K into a conversation measured ~58 tok/s on the CLI before the last decode round (not re-measured since).
 The first start writes the expert blob cache (~30 s); later starts are ready in 24-30 s.
@@ -88,8 +103,15 @@ the same prompt in other chunk sizes gives ~0.0005. The 8-bit cache: 0.0007 at 8
 prompt attention 0.0001-0.0004, the tensor-core delta-rule scan 0.00002. Switches that move experts between VRAM and
 the CPU (`REBAL_ASYNC`, `PROMPT_DECAY`, `KV_GROW`) change only where an expert is computed: first-token KL 0, the same
 greedy text over 200 steps. `STRATA_Q36_DENSE_MMQ` is a real change of arithmetic (8-bit activations): first-token KL
-0.00012, the same top-1 and greedy text over 32 steps, later steps mean 0.0008 and at most 0.0088. 4096-token chunks:
-first-token KL 0.00006.
+0.00012, the same top-1 and greedy text over 32 steps, later steps mean 0.0008 and at most 0.0088; on four more
+prompts first-token KL 0.000016-0.00235, where reading the same prompts in other chunk sizes gives 0.000022-0.0053.
+4096-token chunks: first-token KL 0.00006.
+
+The three output-changing settings together (`DENSE_MMQ`, `CK_EXACT`, `--hybrid-rows 256`) against none of them, four
+prompts, 128 steps each: first-token KL 0.00003-0.0046 with the same top-1. On the same prompts, reading in other
+chunk sizes gives 0.00002-0.0053 and the 8-bit against the f16 cache 0.00002-0.0033, so the change is inside what
+regrouping a prompt already does. `LAZY_F16`, `SWQ` and `QSCATTER` give the same bits as the setup without them;
+`GPU_TOPK` gives the same sampled text with a fixed seed.
 
 ## What each switch does
 
@@ -121,6 +143,9 @@ in host memory; the packed Q8_0 decode copy is off. `STRATA_Q36_BLOB_CACHE=0`, `
   memory (375 → ~435 GB/s on the large matrices; `STRATA_Q36_Q8ST_BLOCKS`, default 1024).
 - `STRATA_Q36_GEMV_ILP=1`: the router's matrix-vector product with its loads issued ahead.
 - `STRATA_POOL_FUSED=1`: the CPU pool runs an expert's gate/up and down rows in one batch, with no barrier between.
+- `STRATA_Q36_GPU_TOPK=1`: the sampler's top-k candidates and the penalized tokens' logits are found on the GPU, so
+  ~1 KB comes back a token instead of the 248,320-float logit row (host part of a sampled token 0.45 → 0.155 ms). It
+  falls back to the whole row when a penalty could raise a logit. Logit ties now go to the lowest token id.
 - `--pool-workers 19`: CPU expert threads (13 is the setup default; 19 measured best here, 10 next).
 
 **Prompts**
@@ -134,8 +159,19 @@ in host memory; the packed Q8_0 decode copy is off. `STRATA_Q36_BLOB_CACHE=0`, `
   engine's `gdn_tc_prompt.cuh`), sm_80 and later. `STRATA_Q36_GDN_COLS=16` sets the fallback kernel's column blocks.
 - `STRATA_Q36_MOE_OUT2=1`, `STRATA_Q36_SGEMM8=1`: the expert combine pass and the small FP32 GEMMs (router, delta-net
   alpha / beta, shared-expert gate).
+- `STRATA_Q36_DENSE_MMQ=1`: 8-bit activations in the prompt's dense projections (int8 MMQ with q8_1 activations), as
+  decode already uses. A 50K read +7%. `STRATA_Q36_LAZY_F16=1` (acts only with it): the FP16 copy of a chunk's input
+  is made only when a projection falls back to cuBLAS.
+- `STRATA_Q36_SWQ=1`: the prompt experts' SwiGLU and the 8-bit image for the down product in one kernel
+  (`src/qwen35/q36_swq.cu`). `STRATA_Q36_QSCATTER=1`: each token's activations quantized once for its 8 experts
+  instead of once per expert. Together a 50K read +4% (noisy pairs).
 - `STRATA_Q36_CKPT=1`: the recurrent state saved at the end of a prompt, so a follow-up continues from it instead of
-  reading the conversation again.
+  reading the conversation again. `STRATA_Q36_CK_EXACT=1`: the checkpoint sits at the prompt's last `<|im_start|>`
+  itself instead of the chunk boundary below it, so a follow-up reads only its new tokens (33 instead of ~880 after a
+  50K prompt).
+- `--hybrid-rows 256` (existing argument, default 128): reads of up to 256 tokens run on the VRAM slots and the CPU
+  pool instead of streaming every expert (a 230-token follow-up 0.99 → 0.61 s). 512 was faster for 448-token
+  follow-ups but slower for a cold 480-token first prompt; 1024 was 3.4x slower on a 900-token read.
 
 **Diagnostics and measured-but-not-used**
 - `STRATA_Q36_PROF=1/2/3`: prompt stage times, exact per-stage times, decode stage times. `STRATA_POOL_PHASE_TIMING=1`:
@@ -143,6 +179,11 @@ in host memory; the packed Q8_0 decode copy is off. `STRATA_Q36_BLOB_CACHE=0`, `
 - `STRATA_Q36_GGML_MOE=1` with `STRATA_Q36_GGML_MOE_PATH=<dll>` (`src/qwen35/q36_ggml_moe.cpp`): the prompt's expert
   GEMMs through llama.cpp's current kernel. Same quality, no gain under real routing.
 - `STRATA_Q36_GDN_NTL=2`: two column tiles a head in the tensor-core scan: 36% slower here.
+- `STRATA_Q36_STREAM_SPLIT=N`: a streamed layer's resident experts copied from VRAM, the rest from host. Same bits;
+  first reads on the CLI 16-20% faster, server follow-ups no faster.
+- `STRATA_Q36_ORACLE=nocpu|noattn|nomoe|nomoecopy|nodense`: skips one part of the work to time the rest. The output
+  is garbage; it is for measuring only. `STRATA_Q36_HOST_TIMING=1`: the host part of each decoded token.
+  `STRATA_Q36_HO_LOG=1`: a trace of the handoff.
 - `STRATA_Q36_LOOKUP=N`: drafts copied from the context: a loss on this card (each verified row brings CPU experts).
 
 ## Limits
@@ -150,8 +191,12 @@ in host memory; the packed Q8_0 decode copy is off. `STRATA_Q36_BLOB_CACHE=0`, `
 - **RAM.** 32 GB is tight: the engine maps the 18 GB expert file and holds 3-4 GB of its own. With other programs open
   (browsers, several desktop apps, a download) runs dropped to under 1 GB free, the expert file paged and speeds fell
   by a third or more. Close large programs for the best speed.
-- **Short reads.** A read of about 130 to 2,000 new tokens streams every expert of every layer and takes about 1 s
+- **Short reads.** A read of 257 to about 2,000 new tokens streams every expert of every layer and takes 1.0-1.2 s
   whatever its length.
+- **What bounds the speed now** (timed with `STRATA_Q36_ORACLE`). Decode: the GPU part of a step alone runs 120-127
+  tok/s; the CPU experts add 2.1-2.5 ms a token. A 50K prompt read takes 11.2 s; with the expert products and the
+  expert stream both skipped it takes 7.5 s, and skipping the products alone saves nothing, because the stream from
+  the mapped expert file (~8 GB/s effective) sits right behind them.
 - **VRAM margin.** At 262K with 4096-token chunks and no growing window, ~0.5 GiB stayed free and the driver demoted
   engine memory to system RAM once (heavy paging). The growing window avoids that.
 - **Full-length prompts.** Prompt reading at 262K is limited by attention (it grows with the square of the length).
