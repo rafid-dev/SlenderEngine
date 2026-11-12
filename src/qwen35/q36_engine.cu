@@ -64,6 +64,7 @@
 #include <functional>
 #include <iostream>
 #include <iterator>
+#include <array>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -75,6 +76,7 @@
 #include <type_traits>
 #include <vector>
 
+void q36_swiglu_q8mmq(const float* gu, void* y, int64_t rows, int64_t n_ff, int lay, cudaStream_t st);   // q36_swq.cu (TP2)
 namespace {
 
 namespace K = strata::kernels;
@@ -2490,6 +2492,54 @@ __global__ void k_argmax(const float* x, int n, int32_t* out, float* pv, int32_t
 }
 constexpr int kArgBlocks = 128;   // (the row stride of k_argmax's partials)
 
+// TD1 (Q36-T, STRATA_Q36_GPU_TOPK=1): the sampler's candidates on the GPU. A logit's key orders the logits by value, high
+// first, ties by the lowest id (the host sampler's order); k_topk_chunk sorts a chunk of 2048 keys (bitonic, one block)
+// and keeps its first K, run again on the kept keys until one chunk is left: the row's exact top K in order.
+// TP2 (Q36-T, STRATA_Q36_SWQ=1): the prompt experts' SwiGLU and its q8_1 MMQ image in one pass (q36_swq.cu: compiled
+// with --use_fast_math like MMQ::swiglu and quantize_mmq_q8_1, whose bytes it reproduces). lay: 1 D4, 2 DS4.
+// (declared above the anonymous namespace: q36_swiglu_q8mmq)
+// ggml type -> the q8_1 MMQ layout k_swiglu_q8mmq writes: 1 D4, 2 DS4, 0 neither (the two-pass path)
+inline int swq_layout(int t) {
+    switch (t) {
+        case 8: case 6: case 11: case 14: return 1;   // Q8_0, Q5_0, Q3_K, Q6_K
+        case 2: case 3: case 7: case 12: case 13: return 2;   // Q4_0, Q4_1, Q5_1, Q4_K, Q5_K
+        default: return 0;
+    }
+}
+constexpr int kTkN = 2048, kTkMax = 512;
+__device__ __forceinline__ unsigned long long tk_key(float v, int i) {
+    if (v == 0.f) v = 0.f;   // -0 ties +0 on the host
+    unsigned u = __float_as_uint(v);
+    u = (u & 0x80000000u) ? ~u : (u | 0x80000000u);   // ascending with v
+    return ((unsigned long long) (~u) << 32) | (unsigned) i;
+}
+__global__ void __launch_bounds__(1024) k_topk_chunk(const float* __restrict__ x, const unsigned long long* __restrict__ kin,
+                                                     int n, int K, unsigned long long* __restrict__ kout) {
+    __shared__ unsigned long long s[kTkN];
+    const int base = blockIdx.x * kTkN;
+    for (int i = threadIdx.x; i < kTkN; i += blockDim.x) {
+        const int gi = base + i;
+        s[i] = gi < n ? (x ? tk_key(x[gi], gi) : kin[gi]) : ~0ull;
+    }
+    __syncthreads();
+    for (int k = 2; k <= kTkN; k <<= 1)
+        for (int j = k >> 1; j > 0; j >>= 1) {
+            for (int i = threadIdx.x; i < kTkN; i += blockDim.x) {
+                const int l = i ^ j;
+                if (l > i) {
+                    const unsigned long long a = s[i], b = s[l];
+                    if ((a > b) == ((i & k) == 0)) { s[i] = b; s[l] = a; }
+                }
+            }
+            __syncthreads();
+        }
+    for (int i = threadIdx.x; i < K; i += blockDim.x) kout[(size_t) blockIdx.x * K + i] = s[i];
+}
+__global__ void k_gather_f(const float* __restrict__ x, const int32_t* __restrict__ ids, int n, float* __restrict__ out) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) out[i] = x[ids[i]];
+}
+
 unsigned grid1(int64_t n, int b = kThreads) { return (unsigned) ((n + b - 1) / b); }
 
 /// out[t][o] = W[o] . x[t] in FP32 for a prompt chunk's small F32 projections (the router, the GDN alpha / beta,
@@ -4825,16 +4875,55 @@ struct Engine {
     /// A batch above kGemmT tokens (a prompt chunk) runs its projections as GEMMs (prefill::Gemm::native: the GGUF
     /// blocks dequantized to FP16, the activations FP16); a decode batch on the native MMVQ (q8_1 activations).
     static constexpr int kGemmT = 8;
+    // Q36-CEIL2 TO1 / TO2 (STRATA_Q36_ORACLE, diagnostic only: the output is garbage, timing only, never a default):
+    // nocpu: decode without the CPU experts (no handoff wait, no merge: their rows left as they are); noattn: prompt
+    // chunks without the full-attention kernels; nomoe: prompt chunks without the routed experts' products (the expert
+    // stream still copied); nomoecopy: without the products and the stream; nodense: prompt chunks without the dense
+    // projections (apply() returns at once for T > kGemmT)
+    static int oracle() {
+        static const int o = [] {
+            const char* v = std::getenv("STRATA_Q36_ORACLE");
+            if (!v) return 0;
+            const std::string s(v);
+            const int r = s == "noattn" ? 1 : s == "nomoe" ? 2 : s == "nomoecopy" ? 3 : s == "nocpu" ? 4 : s == "nodense" ? 5 : 0;
+            if (r) std::fprintf(stderr, "strata-q36: STRATA_Q36_ORACLE=%s: diagnostic run, the output is garbage (timing only)\n", v);
+            return r;
+        }();
+        return o;
+    }
+    // TP1 (Q36-T, STRATA_Q36_LAZY_F16=1, with SP9 on): the FP16 copy of a prompt chunk's input is made only when a
+    // projection falls back to gemm.native (the dense MMQ path reads the FP32 input): x16_src is the input still to convert
+    const float* x16_src = nullptr;
+    int64_t x16_n = 0;
+    static bool lazy_f16() {
+        static const bool on = [] { const char* v = std::getenv("STRATA_Q36_LAZY_F16"); return v && v[0] == '1'; }() && dm_on();
+        return on;
+    }
+    static bool dm_on() {
+        static const bool on = [] { const char* v = std::getenv("STRATA_Q36_DENSE_MMQ"); return v && v[0] == '1'; }();
+        return on;
+    }
+    void to_f16(const float* xin, int64_t n) {
+        if (lazy_f16()) { x16_src = xin; x16_n = n; return; }
+        k_to_f16<<<grid1(n), kThreads, 0, st>>>(xin, x16, n);
+    }
     void prep(const float* xin, int n, int T, void* q) {
         if (T > kGemmT) {
-            k_to_f16<<<grid1((int64_t) n * T), kThreads, 0, st>>>(xin, x16, (int64_t) n * T);
+            to_f16(xin, (int64_t) n * T);
             dm_x = xin;            // SP9: the FP32 input, for the dense MMQ path
             dm_q_type = -1;        // (its q8_1 image is made on the first product that needs it)
         } else quant(xin, n, T, q);
     }
     void apply(const Mat& w, const void* q, float* out, int T) {
+        if (T > kGemmT && oracle() == 5) return;   // TO2 (c)
         if (T > kGemmT) {
-            if (!dense_mmq(w, out, T)) gemm.native((const uint16_t*) x16, w.type, w.d, out, T, w.n_out, w.n_in);
+            if (!dense_mmq(w, out, T)) {
+                if (x16_src) {
+                    k_to_f16<<<grid1(x16_n), kThreads, 0, st>>>(x16_src, x16, x16_n);
+                    x16_src = nullptr;
+                }
+                gemm.native((const uint16_t*) x16, w.type, w.d, out, T, w.n_out, w.n_in);
+            }
         } else mmq(w, q, out, T);
     }
     /// P-3 SP9 (STRATA_Q36_DENSE_MMQ=1): a prompt chunk's dense projection on llama.cpp's int8 MMQ (q8_1 activations from
@@ -4845,8 +4934,7 @@ struct Engine {
     int dm_q_type = -1, dm_q_k = 0;
     int32_t* dm_bounds = nullptr;
     bool dense_mmq(const Mat& w, float* out, int T) {
-        static const bool on = [] { const char* v = std::getenv("STRATA_Q36_DENSE_MMQ"); return v && v[0] == '1'; }();
-        if (!on || !use_mmq || !mq_x || !mctx || !dm_x || w.n_in % 256 != 0 || !MMQ::fits(w.type, w.n_out)) return false;
+        if (!dm_on() || !use_mmq || !mq_x || !mctx || !dm_x || w.n_in % 256 != 0 || !MMQ::fits(w.type, w.n_out)) return false;
         if (!dm_bounds) CK(cudaMalloc((void**) &dm_bounds, 64));
         if (dm_q_type != w.type || dm_q_k != w.n_in) {
             MMQ::quantize(dm_x, nullptr, mq_x, w.type, w.n_in, w.n_in, T, st);
@@ -5728,7 +5816,8 @@ struct Engine {
                 pmark("prompt attention: q / k / v projections, prep, FP16 copies");
                 static const bool fa2_check = std::getenv("STRATA_Q36_FA2_CHECK") != nullptr;
                 std::vector<float> fa2_out;
-                if (fa2_ok()) {   // STRATA_Q36_FA2: tensor cores, online softmax (then gated by k_gate_mul)
+                if (oracle() == 1) {   // TO2 (a): no attention kernels (att left as it is)
+                } else if (fa2_ok()) {   // STRATA_Q36_FA2: tensor cores, online softmax (then gated by k_gate_mul)
 #if !defined(STRATA_USE_HIP)
                     if (fa2q8_on())
                         k_fa2_prompt<true><<<dim3((T + fa2::Q - 1) / fa2::Q, HKV), 256, fa2::kSmem, st>>>(q16, nullptr, nullptr, T,
@@ -5989,6 +6078,13 @@ struct Engine {
         const int32_t* prow = nullptr;
         if (hy_rows) {
             moe_hybrid_gpu(L, li, T);
+        } else if (T > kGemmT && use_mmq && (oracle() == 2 || oracle() == 3)) {   // TO2 (b): no expert products
+            if (oracle() == 2 && lhy(li)) {   // the stream still copied and waited for
+                if (!lm_active) stream_take((int) li);
+                else if (lm_first) lm_wbase = stream_take((int) li);
+                if (!lm_active || lm_last) stream_done();
+            }
+            prow = nullptr;
         } else if (T > kGemmT && use_mmq) {
             // a prompt chunk: the experts on llama.cpp's MMQ (int8, the weights read once per expert): the entries
             // sorted by expert on the device, gate+up as one [2 FF] product per expert, SwiGLU, down into rows the
@@ -6021,7 +6117,11 @@ struct Engine {
                 if (lhy(li) && (!lm_active || lm_last)) stream_done();
                 prow = nullptr;
             } else {
-            MMQ::quantize(h, ent_tok, mq_x, L.L.gu_type, N, N, n_ent, st);
+            // TP3 (STRATA_Q36_QSCATTER=1): each token's h quantized once and stored at its entries' sorted rows (rinv: the
+            // inverse of ent_tok), not once per entry: the same bytes
+            static const bool qscatter = [] { const char* v = std::getenv("STRATA_Q36_QSCATTER"); return v && v[0] == '1'; }();
+            if (qscatter) MMQ::quantize_scatter(h, rinv, ent_tok, mq_x, L.L.gu_type, N, N, T, Kp, st);
+            else MMQ::quantize(h, ent_tok, mq_x, L.L.gu_type, N, N, n_ent, st);
             dm_q_type = -1;   // (SP9: mq_x now holds the experts' rows)
             MMQ::Product gu;
             gu.w = wbase; gu.type = L.L.gu_type; gu.w_rows = 2 * FF; gu.w_cols = N; gu.expert_bytes = L.stride;
@@ -6029,8 +6129,13 @@ struct Engine {
             gu.dst = mq_gu; gu.ld_dst = 2 * FF;
             mctx->run(gu, st);
             pmark("moe: quantize + gate/up MMQ");
-            MMQ::swiglu(mq_gu, mq_h, n_ent, FF, false, st);
-            MMQ::quantize(mq_h, nullptr, mq_hq, L.L.d_type, FF, FF, n_ent, st);
+            static const bool swq = [] { const char* v = std::getenv("STRATA_Q36_SWQ"); return v && v[0] == '1'; }();
+            if (const int lay = swq && FF % 4 == 0 ? swq_layout(L.L.d_type) : 0) {   // TP2: one pass, the same bytes
+                q36_swiglu_q8mmq(mq_gu, mq_hq, n_ent, FF, lay, st);
+            } else {
+                MMQ::swiglu(mq_gu, mq_h, n_ent, FF, false, st);
+                MMQ::quantize(mq_h, nullptr, mq_hq, L.L.d_type, FF, FF, n_ent, st);
+            }
             MMQ::Product dn;
             dn.w = wbase + L.L.down_off; dn.type = L.L.d_type; dn.w_rows = N; dn.w_cols = FF;
             dn.expert_bytes = L.stride; dn.n = ne; dn.xq = mq_hq; dn.bounds = rbounds; dn.ids = ident;
@@ -6049,7 +6154,7 @@ struct Engine {
         pmark("routed experts (incl. waiting for the stream)");
         // the shared expert, scaled by sigmoid(w . h)
         if (T > kGemmT) {
-            k_to_f16<<<grid1((int64_t) N * T), kThreads, 0, st>>>(h, x16, (int64_t) N * T);
+            to_f16(h, (int64_t) N * T);
             dm_x = h;              // (SP9: the shared expert's input)
             dm_q_type = -1;
         }
@@ -6354,6 +6459,7 @@ struct Engine {
 
     /// A streamed forward over the state indices `seq`: the first two layers' experts start copying now.
     void stream_begin(const std::vector<int>& seq) {
+        if (oracle() == 3) { stream_seq = seq; stream_pos = 0; return; }   // TO2 (b): no expert stream
         stream_seq = seq;
         stream_pos = 0;
         for (int i = 0; i < 2 && i < (int) seq.size(); ++i) stream_kick(i);
@@ -6410,43 +6516,58 @@ struct Engine {
         // of consecutive experts from the same source in one copy each.  STRATA_Q36_STREAM_ALL=1: the whole layer from
         // host memory (the first version: PCIe-bound)
         static const bool all = std::getenv("STRATA_Q36_STREAM_ALL") != nullptr;
+        // TS1 (Q36-T, STRATA_Q36_STREAM_SPLIT=1): the copy list (resident experts from their slots, the rest from host memory)
+        // even when under half the layer is resident
+        // STRATA_Q36_STREAM_SPLIT=N > 1: a resident run of under N consecutive-slot experts is copied from host memory with its
+        // neighbours (fewer, longer copies: after a long prompt's rebalance the resident experts sit in short runs)
+        static const int split_n = [] { const char* v = std::getenv("STRATA_Q36_STREAM_SPLIT"); return v ? std::max(0, std::atoi(v)) : 0; }();
+        static const bool split_res = split_n > 0;
         const int ne = (int) m->g.n_expert;
         const Hy& H = hy[(size_t) stream_seq[(size_t) i]];
+        // the copy list: runs [x, y) from the VRAM slots (dev) or from host memory
+        std::vector<std::array<int, 3>> runs;
+        {
+            std::vector<char> fd((size_t) ne, 0);
+            for (int x = 0; x < ne;) {
+                int y = x + 1;
+                if (H.slot_of[(size_t) x] >= 0) {
+                    while (y < ne && H.slot_of[(size_t) y] == H.slot_of[(size_t) y - 1] + 1) ++y;
+                    if (y - x >= std::max(1, split_n)) std::fill(fd.begin() + x, fd.begin() + y, (char) 1);
+                }
+                x = y;
+            }
+            for (int x = 0; x < ne;) {
+                int y = x + 1;
+                if (fd[(size_t) x])
+                    while (y < ne && fd[(size_t) y] && H.slot_of[(size_t) y] == H.slot_of[(size_t) y - 1] + 1) ++y;
+                else
+                    while (y < ne && !fd[(size_t) y]) ++y;
+                runs.push_back({x, y, (int) fd[(size_t) x]});
+                x = y;
+            }
+        }
         // fewer than half the experts resident (a 12 GB card): the one whole-layer copy is faster than many small ones
         // (RTX 3060, UD-Q4_K_XL at 37 of 256: pp2048 1970 whole vs 1540 in runs)
         if (streamer) {   // a pageable arena: the same copy list, run by the copier thread through the pinned ring
             std::vector<ExpertStreamer::Seg> segs;
-            if (all || 2 * L.n_slots < ne) {
+            if (all || (!split_res && 2 * L.n_slots < ne)) {
                 segs.push_back({stage[b], L.hblobs, L.stride * (size_t) ne, false});
             } else {
-                for (int x = 0; x < ne;) {
-                    const bool dev = H.slot_of[(size_t) x] >= 0;
-                    int y = x + 1;
-                    if (dev)
-                        while (y < ne && H.slot_of[(size_t) y] == H.slot_of[(size_t) y - 1] + 1) ++y;
-                    else
-                        while (y < ne && H.slot_of[(size_t) y] < 0) ++y;
+                for (const auto& [x, y, dev] : runs) {
                     const size_t n = (size_t) (y - x) * L.stride;
                     segs.push_back({stage[b] + (size_t) x * L.stride,
                                     dev ? L.blobs + (size_t) H.slot_of[(size_t) x] * L.stride : L.hblobs + (size_t) x * L.stride,
-                                    n, dev});
-                    x = y;
+                                    n, dev != 0});
                 }
             }
             kick_job[b] = streamer->submit(std::move(segs), ev_used[b], ev_copy[b]);
             if (prof_on()) prof_host_ms += ms_since(kick_t0);
             return;
         }
-        if (all || 2 * L.n_slots < ne) {
+        if (all || (!split_res && 2 * L.n_slots < ne)) {
             CK(cudaMemcpyAsync(stage[b], L.hblobs, L.stride * (size_t) ne, cudaMemcpyHostToDevice, cst));
         } else {
-            for (int x = 0; x < ne;) {
-                const bool dev = H.slot_of[(size_t) x] >= 0;
-                int y = x + 1;
-                if (dev)   // consecutive slots holding consecutive experts
-                    while (y < ne && H.slot_of[(size_t) y] == H.slot_of[(size_t) y - 1] + 1) ++y;
-                else
-                    while (y < ne && H.slot_of[(size_t) y] < 0) ++y;
+            for (const auto& [x, y, dev] : runs) {   // (consecutive slots holding consecutive experts, or host runs)
                 const size_t n = (size_t) (y - x) * L.stride;
                 if (dev)
                     CK(cudaMemcpyAsync(stage[b] + (size_t) x * L.stride, L.blobs + (size_t) H.slot_of[(size_t) x] * L.stride,
@@ -6454,7 +6575,6 @@ struct Engine {
                 else
                     CK(cudaMemcpyAsync(stage[b] + (size_t) x * L.stride, L.hblobs + (size_t) x * L.stride, n,
                                        cudaMemcpyHostToDevice, cst));
-                x = y;
             }
         }
         if (prof_on()) {
@@ -6505,6 +6625,7 @@ struct Engine {
     /// The CPU half: the entries without a slot on the pool (ggml-cpu's arithmetic for the layer's formats), their
     /// rows uploaded and merged into the entries' rows.
     void moe_hybrid_cpu(size_t li, int T) {
+        if (oracle() == 4) return;   // TO1: the GPU-only step (no CPU experts, no handoff wait)
 #if defined(STRATA_Q36_CPU_POOL)
         namespace C = strata::kernels::cpu;
         const auto& g = m->g;
@@ -7295,10 +7416,18 @@ struct Engine {
         constexpr int32_t kImStart = 248045;
         for (int64_t i = n - 1; i > from && i >= n - 64; --i)
             if (ids[i] == kImStart) {
-                const int64_t at = from + (i - from) / tmax * tmax;
+                const int64_t at = ck_exact() ? i : from + (i - from) / tmax * tmax;
                 return at - from >= 512 ? at : -1;
             }
         return -1;
+    }
+    // TS5 (Q36-T, STRATA_Q36_CK_EXACT=1): the checkpoint at the prompt's last <|im_start|> itself, not the chunk boundary
+    // below it: the read is split there (the few tokens after it go through the rows path), so a follow-up reads only the
+    // answer and its own text, not the ~tmax / 2 prompt tokens before the cut again. The prompt's tail is grouped
+    // differently: a rounding-level change
+    static bool ck_exact() {
+        static const bool on = [] { const char* v = std::getenv("STRATA_Q36_CK_EXACT"); return v && v[0] == '1'; }();
+        return on;
     }
     int hybrid_swaps_after_prompt = 2048;
     /// the MTP seed rows of a prompt chunk: a buffer the block's own forward does not use (`moe_out`, [tmax][N])
@@ -7500,6 +7629,47 @@ struct Engine {
         out.resize((size_t) m->g.n_vocab);
         CK(cudaMemcpyAsync(out.data(), logits, out.size() * 4, cudaMemcpyDeviceToHost, st));
         CK(cudaStreamSynchronize(st));
+    }
+    // TD1: the logits row's top K keys (K <= kTkMax, see k_topk_chunk) and the logits of P token ids (P <= kTkMax), on the
+    // host after one sync; about K * 8 + P * 8 bytes over PCIe instead of the 248,320-float row
+    unsigned long long *tk_a = nullptr, *tk_b = nullptr, *tk_h = nullptr;
+    int32_t *tk_did = nullptr, *tk_hid = nullptr;
+    float *tk_dv = nullptr, *tk_hv = nullptr;
+    const unsigned long long* host_topk(int K, const int32_t* ids, int P, const float** vals) {
+        const int n = (int) m->g.n_vocab;
+        if (!tk_a) {
+            const size_t cap = (size_t) ((n + kTkN - 1) / kTkN) * kTkMax;
+            CK(cudaMalloc(&tk_a, cap * 8));
+            CK(cudaMalloc(&tk_b, cap * 8));
+            CK(cudaMalloc(&tk_did, kTkMax * 4));
+            CK(cudaMalloc(&tk_dv, kTkMax * 4));
+            CK(cudaHostAlloc((void**) &tk_h, kTkMax * 8, cudaHostAllocDefault));
+            CK(cudaHostAlloc((void**) &tk_hid, kTkMax * 4, cudaHostAllocDefault));
+            CK(cudaHostAlloc((void**) &tk_hv, kTkMax * 4, cudaHostAllocDefault));
+        }
+        if (P > 0) {
+            std::memcpy(tk_hid, ids, (size_t) P * 4);
+            CK(cudaMemcpyAsync(tk_did, tk_hid, (size_t) P * 4, cudaMemcpyHostToDevice, st));
+            k_gather_f<<<grid1(P), kThreads, 0, st>>>(logits, tk_did, P, tk_dv);
+            CK(cudaMemcpyAsync(tk_hv, tk_dv, (size_t) P * 4, cudaMemcpyDeviceToHost, st));
+        }
+        int cnt = n;
+        const float* x = logits;
+        const unsigned long long* kin = nullptr;
+        unsigned long long* out = tk_a;
+        for (;;) {
+            const int nb = (cnt + kTkN - 1) / kTkN;
+            k_topk_chunk<<<nb, 1024, 0, st>>>(x, kin, cnt, K, out);
+            x = nullptr;
+            kin = out;
+            cnt = nb * K;
+            out = out == tk_a ? tk_b : tk_a;
+            if (nb == 1) break;
+        }
+        CK(cudaMemcpyAsync(tk_h, kin, (size_t) K * 8, cudaMemcpyDeviceToHost, st));
+        CK(cudaStreamSynchronize(st));
+        *vals = tk_hv;
+        return tk_h;
     }
 };
 
@@ -8065,18 +8235,12 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
 // ------------------------------------------------------------------------------------------------ sampling
 using strata::qwen35::Sampling;
 
-int sample(std::vector<float>& lg, const Sampling& s, const std::vector<int32_t>& hist, std::mt19937_64& rng) {
-    strata::qwen35::apply_penalties(lg, s, hist);
-    if (s.temperature <= 0.f) return (int) (std::max_element(lg.begin(), lg.end()) - lg.begin());
-    const int kk = std::max(1, std::min(s.top_k > 0 ? s.top_k : 64, (int) lg.size()));
-    std::vector<int> idx(lg.size());
-    for (size_t i = 0; i < idx.size(); ++i) idx[i] = (int) i;
-    std::partial_sort(idx.begin(), idx.begin() + kk, idx.end(), [&](int a, int b) { return lg[a] > lg[b]; });
-    idx.resize((size_t) kk);
+// The draw among the top-k candidates idx (in order: value high first, ties by the lowest id) with their logits v.
+int draw_cands(const std::vector<int>& idx, const std::vector<float>& v, const Sampling& s, std::mt19937_64& rng) {
     std::vector<double> p(idx.size());
-    const double mx = lg[(size_t) idx[0]];
+    const double mx = v[0];
     double sum = 0;
-    for (size_t i = 0; i < idx.size(); ++i) sum += (p[i] = std::exp((lg[(size_t) idx[i]] - mx) / s.temperature));
+    for (size_t i = 0; i < idx.size(); ++i) sum += (p[i] = std::exp((v[i] - mx) / s.temperature));
     size_t keep = idx.size();
     double cum = 0;
     for (size_t i = 0; i < idx.size(); ++i) {
@@ -8093,6 +8257,71 @@ int sample(std::vector<float>& lg, const Sampling& s, const std::vector<int32_t>
         if ((r -= p[i]) <= 0) return idx[i];
     }
     return idx[keep - 1];
+}
+
+int sample(std::vector<float>& lg, const Sampling& s, const std::vector<int32_t>& hist, std::mt19937_64& rng) {
+    strata::qwen35::apply_penalties(lg, s, hist);
+    if (s.temperature <= 0.f) return (int) (std::max_element(lg.begin(), lg.end()) - lg.begin());
+    const int kk = std::max(1, std::min(s.top_k > 0 ? s.top_k : 64, (int) lg.size()));
+    std::vector<int> idx(lg.size());
+    for (size_t i = 0; i < idx.size(); ++i) idx[i] = (int) i;
+    // (TD1: ties by the lowest id, so the order is one order whatever the sort: the GPU candidates' order)
+    std::partial_sort(idx.begin(), idx.begin() + kk, idx.end(), [&](int a, int b) { return lg[a] > lg[b] || (lg[a] == lg[b] && a < b); });
+    idx.resize((size_t) kk);
+    std::vector<float> v(idx.size());
+    for (size_t i = 0; i < idx.size(); ++i) v[i] = lg[(size_t) idx[i]];
+    return draw_cands(idx, v, s, rng);
+}
+
+/// TD1 (STRATA_Q36_GPU_TOPK=1): sample() from the GPU's candidates: the raw top kk + P logits and the P penalized
+/// history tokens' logits. The penalties only lower a logit here (repeat >= 1, freq >= 0, present >= 0), so the penalized
+/// row's top kk is among them: the same candidates, order and draw as sample() on the whole row. false: not this case
+/// (the caller reads the whole row).
+bool sample_gpu(Engine& E, const Sampling& s, const std::vector<int32_t>& hist, std::mt19937_64& rng, int& pick) {
+    if (s.repeat < 1.f || s.freq < 0.f || s.present < 0.f) return false;
+    const int n = (int) E.m->g.n_vocab;
+    std::vector<int32_t> pid;
+    std::vector<int> pc;
+    if (s.last_n != 0 && (s.repeat != 1.f || s.freq != 0.f || s.present != 0.f)) {
+        std::map<int, int> cnt;
+        const size_t from = s.last_n < 0 || (size_t) s.last_n >= hist.size() ? 0 : hist.size() - (size_t) s.last_n;
+        for (size_t i = from; i < hist.size(); ++i) ++cnt[hist[i]];
+        for (const auto& [id, c] : cnt)
+            if (id >= 0 && id < n) { pid.push_back(id); pc.push_back(c); }
+    }
+    const int P = (int) pid.size();
+    const int kk = s.temperature <= 0.f ? 1 : std::max(1, std::min(s.top_k > 0 ? s.top_k : 64, n));
+    const int K = kk + P;
+    if (K > kTkMax) return false;
+    const float* pv = nullptr;
+    const unsigned long long* keys = E.host_topk(K, pid.data(), P, &pv);
+    std::vector<std::pair<float, int>> c;
+    c.reserve((size_t) K + P);
+    auto penalized = [&](int id) { return std::binary_search(pid.begin(), pid.end(), id); };   // (pid ascending: a map's order)
+    for (int i = 0; i < K; ++i) {
+        const int id = (int) (unsigned) (keys[i] & 0xffffffffull);
+        if (penalized(id)) continue;   // its penalized logit below
+        unsigned o = ~(unsigned) (keys[i] >> 32);
+        o = (o & 0x80000000u) ? (o & 0x7fffffffu) : ~o;
+        float v;
+        std::memcpy(&v, &o, 4);
+        c.push_back({v, id});
+    }
+    for (int j = 0; j < P; ++j) {   // apply_penalties' arithmetic on the raw logit
+        float v = pv[j];
+        if (s.repeat != 1.f) v = v > 0 ? v / s.repeat : v * s.repeat;
+        v -= (float) pc[(size_t) j] * s.freq + s.present;
+        c.push_back({v, pid[(size_t) j]});
+    }
+    std::sort(c.begin(), c.end(), [](const std::pair<float, int>& a, const std::pair<float, int>& b) {
+        return a.first > b.first || (a.first == b.first && a.second < b.second);
+    });
+    if (s.temperature <= 0.f) { pick = c[0].second; return true; }
+    std::vector<int> idx((size_t) kk);
+    std::vector<float> v((size_t) kk);
+    for (int i = 0; i < kk; ++i) { idx[(size_t) i] = c[(size_t) i].second; v[(size_t) i] = c[(size_t) i].first; }
+    pick = draw_cands(idx, v, s, rng);
+    return true;
 }
 
 std::vector<int32_t> parse_ids(const char* s) {
@@ -8618,7 +8847,7 @@ struct Serve {
         };
         const int64_t ck_at = ck ? E.ck_cut(ids.data(), (int64_t) ids.size(), (int64_t) reuse) : -1;
         int64_t got;
-        if (ck_at > 0 && E.lm_tail) {   // one read; the checkpoint taken inside it (Engine::lm_tail)
+        if (ck_at > 0 && E.lm_tail && !Engine::ck_exact()) {   // one read; the checkpoint taken inside it (Engine::lm_tail)
             E.ck_req = ck_at;
             E.ck_req_ids = ids.data();
             E.ck_req_done = false;
@@ -8717,15 +8946,39 @@ struct Serve {
                          prompt_ms > 0 ? 1000.0 * (double) fresh / prompt_ms : 0.0, cont ? "" : ", done at once");
             return;
         }
+        // TD0 (STRATA_Q36_HOST_TIMING=1): the host part of a token, timed: the wait for the step's GPU work, the logits copy,
+        // sample(), the emit, the next step's launch (E.process)
+        static const bool host_timing = std::getenv("STRATA_Q36_HOST_TIMING") != nullptr;
+        static const bool gpu_topk = [] { const char* v = std::getenv("STRATA_Q36_GPU_TOPK"); return v && v[0] == '1'; }();
+        double tm_wait = 0, tm_copy = 0, tm_samp = 0, tm_emit = 0, tm_proc = 0;
+        long long tm_n = 0, tm_gpu = 0;
         for (;;) {
             if (smp.needs_logits() && !have_nx) {
-                E.host_logits(lg);
-                nx = sample(lg, smp, hist, rng);
+                auto t0 = Clock::now();
+                if (host_timing) {
+                    CK(cudaStreamSynchronize(E.st));
+                    tm_wait += ms_since(t0);
+                    t0 = Clock::now();
+                }
+                int pk = -1;
+                if (gpu_topk && sample_gpu(E, smp, hist, rng, pk)) {
+                    nx = pk;
+                    ++tm_gpu;
+                    if (host_timing) tm_copy += ms_since(t0);
+                } else {
+                    E.host_logits(lg);
+                    if (host_timing) { tm_copy += ms_since(t0); t0 = Clock::now(); }
+                    nx = sample(lg, smp, hist, rng);
+                    if (host_timing) tm_samp += ms_since(t0);
+                }
+                ++tm_n;
             }
             have_nx = false;
             auto emit = [&](int t) {   // false: the answer ends here
+                const auto te = Clock::now();
                 std::printf("T %d\n", t);
                 std::fflush(stdout);
+                if (host_timing) tm_emit += ms_since(te);
                 ++produced;
                 hist.push_back(t);
                 if (is_eos(t)) { finish = "stop"; return false; }
@@ -8789,7 +9042,9 @@ struct Serve {
             }
             if (E.pos + 1 > E.ctx) break;
             const int32_t one = nx;
+            const auto tp = Clock::now();
             E.process(&one, 1, [](int64_t) {});
+            if (host_timing) tm_proc += ms_since(tp);
             ss.live.push_back(nx);
             fix.clear();
             if (!smp.needs_logits()) nx = E.greedy();
@@ -8803,6 +9058,11 @@ struct Serve {
                      "%lld generated in %.0f ms (%.1f tok/s), drafts accepted %lld of %lld (%s)\n", s, ids.size(), reuse,
                      (long long) fresh, prompt_ms, prompt_ms > 0 ? 1000.0 * (double) fresh / prompt_ms : 0.0, produced,
                      decode_ms, decode_ms > 0 ? 1000.0 * (double) produced / decode_ms : 0.0, accepted, offered, finish);
+        if (host_timing && produced > 0)
+            std::fprintf(stderr, "strata-q36: host timing over %lld tokens (%lld sampled, %lld from GPU candidates), ms a token: "
+                         "process %.3f, wait for the GPU %.3f, logits copy %.3f, sample %.3f, emit %.3f; total decode %.3f\n",
+                         produced, tm_n, tm_gpu, tm_proc / produced, tm_wait / produced, tm_copy / produced, tm_samp / produced,
+                         tm_emit / produced, decode_ms / produced);
     }
 
     int run() {
@@ -9111,7 +9371,7 @@ int strata::qwen35::run(int argc, char** argv) {
     }
     const auto t0 = Clock::now();
     if (const int64_t cut = Engine::ck_on() && emb_file.empty() ? E.ck_cut(prompt.data(), (int64_t) prompt.size(), 0) : -1;
-        cut > 0 && E.lm_tail) {   // STRATA_Q36_CKPT + LM_TAIL: one read, the checkpoint taken inside it
+        cut > 0 && E.lm_tail && !Engine::ck_exact()) {   // STRATA_Q36_CKPT + LM_TAIL: one read, the checkpoint taken inside it
         E.ck_req = cut;
         E.ck_req_ids = prompt.data();
         E.ck_req_done = false;
