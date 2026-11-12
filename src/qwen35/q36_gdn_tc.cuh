@@ -5,6 +5,7 @@
 // head's key head is vh % nk (vmap built by the caller), and the state is [key row][value head][value column]. The conv output rows
 // are q | k | v with row stride C, as in the split. Output: o_raw [T][nv 128] x rsqrt(128), as k_gdn_seq_cols writes it.
 #pragma once
+#include <cstdlib>
 #include <cuda_fp16.h>
 #include <cstdint>
 namespace q36tc {
@@ -703,6 +704,7 @@ inline bool run(float* S, const float* hc, int C, const float* gate, const float
              (size_t) smem >= kTcScanSmemSplit;
         if (ok) {
             cudaFuncSetAttribute(gdn_tc_scan_kernel<false, true, 3, 1>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) kTcScanSmemSplit);
+            cudaFuncSetAttribute(gdn_tc_scan_kernel<false, true, 3, 2>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) kTcScanSmemSplit);
             cudaFuncSetAttribute(gdn_tc_prep_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) kTcPrepSmem);
         }
         cudaGetLastError();
@@ -720,8 +722,15 @@ inline bool run(float* S, const float* hc, int C, const float* gate, const float
         const int nch = (int) ((std::min<int64_t>(GTC_GSB, T - t0) + GCH - 1) / GCH);
         gdn_tc_prep_kernel<<<dim3((unsigned) nch, (unsigned) nv), 256, kTcPrepSmem, s>>>(hc, gate, beta, nullptr, vmap, ti, te, sc, kq, pi,
                                                                                         nk, nv, C, t0, T);
-        gdn_tc_scan_kernel<false, true, 3, 1><<<nv, GTC_CW * 32, kTcScanSmemSplit, s>>>(S, hc, ti, te, sc, kq, pi, o_raw, t0, nch, T, vmap,
-                                                                                         nk, nv, C);
+        // P-1 SP4 (STRATA_Q36_GDN_NTL=2): two column tiles a head, 2 nv blocks of half the warps (32 heads -> 64 blocks on 60
+        // SMs); the columns are independent, so the same values
+        static const int ntl = [] { const char* v = std::getenv("STRATA_Q36_GDN_NTL"); return v && v[0] == '2' ? 2 : 1; }();
+        if (ntl == 2)
+            gdn_tc_scan_kernel<false, true, 3, 2><<<nv * 2, GTC_CW / 2 * 32, kTcScanSmemSplit, s>>>(S, hc, ti, te, sc, kq, pi, o_raw, t0, nch,
+                                                                                                   T, vmap, nk, nv, C);
+        else
+            gdn_tc_scan_kernel<false, true, 3, 1><<<nv, GTC_CW * 32, kTcScanSmemSplit, s>>>(S, hc, ti, te, sc, kq, pi, o_raw, t0, nch, T, vmap,
+                                                                                             nk, nv, C);
     }
     return true;
 }

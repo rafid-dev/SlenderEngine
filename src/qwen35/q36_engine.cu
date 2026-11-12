@@ -36,7 +36,8 @@
 #include <cublas_v2.h>
 #if !defined(STRATA_USE_HIP)
 #include <algorithm>
-#include "q36_gdn_tc.cuh"   // R2: the tensor-core delta-rule scan (STRATA_Q36_GDN_TC)
+#include "q36_gdn_tc.cuh"
+#include "q36_fa2q.cuh"   // P-1: k_fa2q_prompt (STRATA_Q36_FA2Q)   // R2: the tensor-core delta-rule scan (STRATA_Q36_GDN_TC)
 #endif
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -89,6 +90,47 @@ namespace MMQ = strata::prefill::mmq;
     } while (0)
 
 using Clock = std::chrono::steady_clock;
+#if defined(_WIN32)
+#endif
+/// SP1 (Q36-S), STRATA_Q36_GGML_MOE=<q36_ggml_moe.dll>: the prompt's expert GEMMs (MUL_MAT_ID, SwiGLU, MUL_MAT_ID) on a current
+/// llama.cpp's ggml through that DLL (src/qwen35/q36_ggml_moe.cpp); the outputs in entry order t * K + k (no sorted rows)
+struct Q36MoeArgs {
+    int version;
+    int type_gu, type_d;
+    const void* w_gu;
+    const void* w_d;
+    size_t gu_row_bytes, d_row_bytes, expert_stride;
+    int n_expert, n_embd, n_ff, k_used;
+    int64_t n_tok;
+    const float* x;
+    const int32_t* ids;
+    float* gu_out;
+    float* h_out;
+    float* out;
+};
+using q36moe_run_fn = int (*)(const Q36MoeArgs*);
+q36moe_run_fn q36_ggml_moe() {
+    static q36moe_run_fn fn = [] () -> q36moe_run_fn {
+        const char* path = std::getenv("STRATA_Q36_GGML_MOE");
+        if (!path || !path[0] || path[0] == '0') return nullptr;
+        if (path[0] == '1' && path[1] == 0) path = std::getenv("STRATA_Q36_GGML_MOE_PATH");   // (=1: the path from there)
+        if (!path || !path[0]) return nullptr;
+#if defined(_WIN32)
+        HMODULE h = LoadLibraryExA(path, nullptr, 0x00000008 /* LOAD_WITH_ALTERED_SEARCH_PATH */);
+        if (!h) { std::fprintf(stderr, "strata-q36: STRATA_Q36_GGML_MOE: cannot load %s\n", path); std::exit(1); }
+        auto init = (int (*)(int)) (void*) GetProcAddress(h, "q36moe_init");
+        auto run = (q36moe_run_fn) (void*) GetProcAddress(h, "q36moe_run");
+        int dev = 0;
+        cudaGetDevice(&dev);
+        if (!init || !run || init(dev) != 0) { std::fprintf(stderr, "strata-q36: STRATA_Q36_GGML_MOE: %s did not start\n", path); std::exit(1); }
+        std::fprintf(stderr, "strata-q36: STRATA_Q36_GGML_MOE: prompt experts on %s\n", path);
+        return run;
+#else
+        return nullptr;
+#endif
+    }();
+    return fn;
+}
 #if defined(_WIN32)
 extern "C" __declspec(dllimport) unsigned long long __stdcall SetThreadAffinityMask(void* thread, unsigned long long mask);
 extern "C" __declspec(dllimport) void* __stdcall GetCurrentThread();
@@ -227,6 +269,56 @@ __global__ void k_moe_out(float* x, const float* parts, const int32_t* prow, con
     s = block_sum(s, sh);
     const float r = rsqrtf(s / (float) n + eps);
     for (int i = threadIdx.x; i < n; i += blockDim.x) h[(size_t) t * n + i] = xr[i] * r * wn[i];
+}
+/// P-1 (STRATA_Q36_MOE_OUT2=1): k_moe_out for the prompt with K and n / kThreads fixed at compile time: the same element
+/// ownership (i = threadIdx.x + j * kThreads), the same per-element arithmetic and order and the same block_sum, so the same
+/// bits; every load of a thread (KK expert rows, the shared expert and x, NI elements each) is issued before the first
+/// sum, where the runtime-K loop kept about one row's load in flight at a time.
+template <int KK, int NI>
+__global__ void __launch_bounds__(kThreads) k_moe_out2(float* x, const float* parts, const int32_t* prow, const float* wts,
+                                                       const float* shared, const float* sgate, int sg_stride,
+                                                       const float* wn, float* h, float eps) {
+    constexpr int n = NI * kThreads;
+    __shared__ float sh[kThreads];
+    const int t = blockIdx.x;
+    float* xr = x + (size_t) t * n;
+    const float* pk[KK];
+#pragma unroll
+    for (int k = 0; k < KK; ++k) pk[k] = parts + (size_t) (prow ? prow[t * KK + k] : t * KK + k) * n;
+    const float* wr = wts + (size_t) t * KK;
+    float wk[KK];
+#pragma unroll
+    for (int k = 0; k < KK; ++k) wk[k] = wr[k];
+    const float gs = sigm(sgate[(size_t) t * sg_stride]);
+    float pv[NI][KK], sv[NI], xv[NI];
+#pragma unroll
+    for (int j = 0; j < NI; ++j) {
+        const int i = threadIdx.x + j * kThreads;
+#pragma unroll
+        for (int k = 0; k < KK; ++k) pv[j][k] = __ldcs(pk[k] + i);
+        sv[j] = shared[(size_t) t * n + i];
+        xv[j] = xr[i];
+    }
+    float s = 0.f;
+#pragma unroll
+    for (int j = 0; j < NI; ++j) {
+        float acc = wk[0] * pv[j][0];
+#pragma unroll
+        for (int k = 1; k < KK; ++k) acc = fmaf(wk[k], pv[j][k], acc);
+        acc += gs * sv[j];
+        const float v = xv[j] + acc;
+        xr[threadIdx.x + j * kThreads] = v;
+        xv[j] = v;
+        s += v * v;
+    }
+    if (wn == nullptr) return;
+    s = block_sum(s, sh);
+    const float r = rsqrtf(s / (float) n + eps);
+#pragma unroll
+    for (int j = 0; j < NI; ++j) {
+        const int i = threadIdx.x + j * kThreads;
+        h[(size_t) t * n + i] = xv[j] * r * wn[i];
+    }
 }
 /// GDN alpha and beta for T <= 8 rows in one launch, their epilogues applied: rows [0, HV) of the output are
 /// softplus(alpha . x + dt) * ssm_a, rows [HV, 2 HV) sigmoid(beta . x).  Warp per row (grid (ceil(2 HV / 8), T)).
@@ -669,7 +761,7 @@ __global__ void k_attn_part_q8(const float* q, const int8_t* kc, const int8_t* v
 /// k_attn_part_q8), the 8 softmaxes run one after another on the same block reductions, and a thread's V value of a cell is
 /// read once for the 8 heads ((p x scale) x v as k_attn_part_q8): the same bits, K / V read once instead of 8 times.
 /// grid (chunks, rows x HKV), block 256 (= kChunkCells = HD).
-template <bool DOT8>
+template <bool DOT8, bool TR = false>
 __global__ void __launch_bounds__(256) k_attn_part_q8g(const float* q, const int8_t* kc, const int8_t* vc, const int32_t* pos0,
                                                        int t0, int H, int HKV, int ctx, float scale, int n_chunk, float* pacc,
                                                        float* pm, float* pl, RowSel rs, int qb, KvTab kt = KvTab(), int c_base = 0,
@@ -723,6 +815,40 @@ __global__ void __launch_bounds__(256) k_attn_part_q8g(const float* q, const int
                 }
             }
         }
+        if (DOT8 && TR) {   // D-2 SD6: the 8 heads' sums by a transposing butterfly (9 shuffles a cell instead of 40)
+            // each lane's 8 partial sums are halved at each xor step (it keeps the heads of its bit, adds the partner's); the
+            // pairs added are the plain butterfly's, so each head's sum has the same bits (IEEE addition commutes); after steps
+            // 16 / 8 / 4 lane l holds head 4 b16 + 2 b8 + b4, steps 2 / 1 finish it, lanes l % 4 == 0 write the 8 heads
+            const int b16 = (lane >> 4) & 1, b8 = (lane >> 3) & 1, b4 = (lane >> 2) & 1, hd = 4 * b16 + 2 * b8 + b4;
+            for (int cc = grp; cc < n; cc += n_grp) {
+                const size_t cell = (size_t) kvh * ctx + p0 + cc;
+                const int2 kq = *(const int2*) (kc + cell * HD + lane * 8);
+                const float dk = __half2float(ks[cell * nb + kb]);
+                float a8[G];
+#pragma unroll
+                for (int g = 0; g < G; ++g) a8[g] = (float) __dp4a(kq.y, q1[g], __dp4a(kq.x, q0[g], 0)) * dq[g] * dk;
+                float a4[4];
+#pragma unroll
+                for (int i = 0; i < 4; ++i) {
+                    const float send = b16 ? a8[i] : a8[4 + i], keep = b16 ? a8[4 + i] : a8[i];
+                    a4[i] = keep + __shfl_xor_sync(0xffffffffu, send, 16, 32);
+                }
+                float a2[2];
+#pragma unroll
+                for (int i = 0; i < 2; ++i) {
+                    const float send = b8 ? a4[i] : a4[2 + i], keep = b8 ? a4[2 + i] : a4[i];
+                    a2[i] = keep + __shfl_xor_sync(0xffffffffu, send, 8, 32);
+                }
+                float a1;
+                {
+                    const float send = b4 ? a2[0] : a2[1], keep = b4 ? a2[1] : a2[0];
+                    a1 = keep + __shfl_xor_sync(0xffffffffu, send, 4, 32);
+                }
+                a1 += __shfl_xor_sync(0xffffffffu, a1, 2, 32);
+                a1 += __shfl_xor_sync(0xffffffffu, a1, 1, 32);
+                if ((lane & 3) == 0) sc[hd][cc] = a1 * scale;
+            }
+        } else
         for (int cc = grp; cc < n; cc += n_grp) {
             const size_t cell = (size_t) kvh * ctx + p0 + cc;
             const int2 kq = *(const int2*) (kc + cell * HD + lane * 8);
@@ -2413,6 +2539,128 @@ __global__ void __launch_bounds__(256) k_sgemm_nt(const float* __restrict__ W, c
             if (m0 + tm + i < T && n0 + tn + j < n_out) out[(size_t) (m0 + tm + i) * ldo + n0 + tn + j] = acc[i][j];
 }
 
+/// P-1 (STRATA_Q36_SGEMM8=1): k_sgemm_nt for the router at prompt size without split-K (one K range): a 128 x 64 tile,
+/// 8 x 4 outputs a thread, the next K step's global loads in registers while this one is summed. Every output is still
+/// the sequential fmaf over k = 0 .. K-1 from 0, so the same bits as k_sgemm_nt with one split.  K % 16 == 0.
+__global__ void __launch_bounds__(256) k_sgemm_nt8(const float* __restrict__ W, const float* __restrict__ x,
+                                                   float* __restrict__ out, int K, int n_out, int T, int ldo) {
+    constexpr int TM = 8, BM = 128, BN = 64, BK = 16;
+    __shared__ float As[BK][BM + 4], Bs[BK][BN + 4];
+    const int tid = threadIdx.x;
+    const int m0 = blockIdx.y * BM, n0 = blockIdx.x * BN;
+    const int tm = (tid / 16) * TM, tn = (tid % 16) * 4;
+    const int lr = tid / 4, lk = (tid % 4) * 4;   // loads: rows lr and lr + 64 of x's tile, row lr of W's; k lk .. lk + 3
+    float acc[TM][4] = {};
+    float4 a0, a1, b;
+    auto fetch = [&](int k0) {
+        const float4 z = make_float4(0.f, 0.f, 0.f, 0.f);
+        a0 = m0 + lr < T ? *reinterpret_cast<const float4*>(x + (size_t) (m0 + lr) * K + k0 + lk) : z;
+        a1 = m0 + lr + 64 < T ? *reinterpret_cast<const float4*>(x + (size_t) (m0 + lr + 64) * K + k0 + lk) : z;
+        b = n0 + lr < n_out ? *reinterpret_cast<const float4*>(W + (size_t) (n0 + lr) * K + k0 + lk) : z;
+    };
+    fetch(0);
+    for (int k0 = 0; k0 < K; k0 += BK) {
+        As[lk][lr] = a0.x; As[lk + 1][lr] = a0.y; As[lk + 2][lr] = a0.z; As[lk + 3][lr] = a0.w;
+        As[lk][lr + 64] = a1.x; As[lk + 1][lr + 64] = a1.y; As[lk + 2][lr + 64] = a1.z; As[lk + 3][lr + 64] = a1.w;
+        Bs[lk][lr] = b.x; Bs[lk + 1][lr] = b.y; Bs[lk + 2][lr] = b.z; Bs[lk + 3][lr] = b.w;
+        __syncthreads();
+        if (k0 + BK < K) fetch(k0 + BK);
+#pragma unroll
+        for (int k = 0; k < BK; ++k) {
+            const float4 a4 = *reinterpret_cast<const float4*>(&As[k][tm]);
+            const float4 a5 = *reinterpret_cast<const float4*>(&As[k][tm + 4]);
+            const float ar[TM] = {a4.x, a4.y, a4.z, a4.w, a5.x, a5.y, a5.z, a5.w};
+            const float4 bv = *reinterpret_cast<const float4*>(&Bs[k][tn]);
+            const float br[4] = {bv.x, bv.y, bv.z, bv.w};
+#pragma unroll
+            for (int i = 0; i < TM; ++i)
+#pragma unroll
+                for (int j = 0; j < 4; ++j) acc[i][j] = fmaf(ar[i], br[j], acc[i][j]);
+        }
+        __syncthreads();
+    }
+#pragma unroll
+    for (int i = 0; i < TM; ++i)
+#pragma unroll
+        for (int j = 0; j < 4; ++j)
+            if (m0 + tm + i < T && n0 + tn + j < n_out) out[(size_t) (m0 + tm + i) * ldo + n0 + tn + j] = acc[i][j];
+}
+
+/// P-1 (STRATA_Q36_SGEMM8=1 too): the delta-net alpha and beta products (32 outputs each, FP32) in one pass over x: k_sgemm_nt<1>'s
+/// 16 x 64 tile with W rows 0-31 alpha's and 32-63 beta's, outputs to their own arrays. Each output the sequential fmaf
+/// over k from 0, as k_sgemm_nt<1> with one split: the same bits, x read once instead of twice.
+__global__ void __launch_bounds__(256) k_sgemm_ab(const float* __restrict__ Wa, const float* __restrict__ Wb,
+                                                  const float* __restrict__ x, float* __restrict__ oa, float* __restrict__ ob,
+                                                  int K, int T) {
+    constexpr int BM = 16, BN = 64, BK = 16, HV = 32;
+    __shared__ float As[BK][BM + 4], Bs[BK][BN + 4];
+    const int tid = threadIdx.x;
+    const int m0 = blockIdx.y * BM;
+    const int tm = tid / 16, tn = (tid % 16) * 4;
+    const int lr = tid / 4, lk = (tid % 4) * 4;
+    const float* wrow = lr < HV ? Wa + (size_t) lr * K : Wb + (size_t) (lr - HV) * K;
+    float acc[4] = {};
+    for (int k0 = 0; k0 < K; k0 += BK) {
+        if (lr < BM) {
+            float4 a = make_float4(0.f, 0.f, 0.f, 0.f);
+            if (m0 + lr < T) a = *reinterpret_cast<const float4*>(x + (size_t) (m0 + lr) * K + k0 + lk);
+            As[lk][lr] = a.x; As[lk + 1][lr] = a.y; As[lk + 2][lr] = a.z; As[lk + 3][lr] = a.w;
+        }
+        const float4 b = *reinterpret_cast<const float4*>(wrow + k0 + lk);
+        Bs[lk][lr] = b.x; Bs[lk + 1][lr] = b.y; Bs[lk + 2][lr] = b.z; Bs[lk + 3][lr] = b.w;
+        __syncthreads();
+#pragma unroll
+        for (int k = 0; k < BK; ++k) {
+            const float ar = As[k][tm];
+            const float4 bv = *reinterpret_cast<const float4*>(&Bs[k][tn]);
+            acc[0] = fmaf(ar, bv.x, acc[0]);
+            acc[1] = fmaf(ar, bv.y, acc[1]);
+            acc[2] = fmaf(ar, bv.z, acc[2]);
+            acc[3] = fmaf(ar, bv.w, acc[3]);
+        }
+        __syncthreads();
+    }
+    if (m0 + tm >= T) return;
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        const int c = tn + j;
+        if (c < HV) oa[(size_t) (m0 + tm) * HV + c] = acc[j];
+        else ob[(size_t) (m0 + tm) * HV + c - HV] = acc[j];
+    }
+}
+
+/// P-1 (STRATA_Q36_SGEMM8=1 too): one output a row (the shared expert's sigmoid gate, n_out 1) at prompt size: a thread a row,
+/// x staged 64 rows x 32 k at a time through shared memory (coalesced), the row's sum the sequential fmaf over k from 0 as
+/// k_sgemm_nt<1> with one split: the same bits. k_sgemm_nt<1> ran a 16 x 64 tile for it (63 of 64 columns idle, 128 blocks).
+__global__ void __launch_bounds__(64) k_gemv_rows1(const float* __restrict__ w, const float* __restrict__ x, float* __restrict__ out,
+                                                   int K, int T) {
+    __shared__ float xs[64][33];
+    __shared__ float ws[32];
+    const int t0 = blockIdx.x * 64, tid = threadIdx.x;
+    float acc = 0.f;
+    for (int k0 = 0; k0 < K; k0 += 32) {
+#pragma unroll
+        for (int m = 0; m < 8; ++m) {   // 64 rows x 32 k = 512 float4 / 64 threads
+            const int i = tid + 64 * m, r = i / 8, c = (i % 8) * 4;
+            float4 v = make_float4(0.f, 0.f, 0.f, 0.f);
+            if (t0 + r < T) v = *reinterpret_cast<const float4*>(x + (size_t) (t0 + r) * K + k0 + c);
+            xs[r][c] = v.x; xs[r][c + 1] = v.y; xs[r][c + 2] = v.z; xs[r][c + 3] = v.w;
+        }
+        if (tid < 32) ws[tid] = w[k0 + tid];
+        __syncthreads();
+#pragma unroll
+        for (int k = 0; k < 32; ++k) acc = fmaf(xs[tid][k], ws[k], acc);
+        __syncthreads();
+    }
+    if (t0 + tid < T) out[t0 + tid] = acc;
+}
+
+/// SP9: the one-expert bounds of the dense MMQ path, [0, rows).
+__global__ void k_dm_bounds(int32_t* d, int32_t rows) {
+    d[0] = 0;
+    d[1] = rows;
+}
+
 /// out[i] = the sum of the split-K partials part[z][i] in order (deterministic), n values each.
 __global__ void k_sum_splits(const float* part, float* out, int64_t n, int splits) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
@@ -3467,6 +3715,7 @@ struct Engine {
     struct GSet {
         cudaGraphExec_t g1 = nullptr, gv[kVerify + 1] = {}, gm1 = nullptr;
         std::map<int, cudaGraphExec_t> g1b;   // R1: decode graphs by chunk bucket
+        std::map<int, cudaGraphExec_t> gvb;   // SD7: verify-window graphs by (T, chunk bucket)
     };
     std::vector<GSet> gsets;
     GSet& gs() { return gsets[(size_t) cur]; }
@@ -3621,7 +3870,13 @@ struct Engine {
         }
     } hw;
     bool ho_thread = false;
+    /// SD7 debug (STRATA_Q36_HO_LOG=1): handoff jobs, graph launches and speculative-step stages to stderr.
+    static bool ho_log() {
+        static const bool on = [] { const char* v = std::getenv("STRATA_Q36_HO_LOG"); return v && v[0] == '1'; }();
+        return on;
+    }
     void ho_push(const HoJob& j) {
+        if (ho_log()) std::fprintf(stderr, "HOLOG push li %d T %d seq %u\n", j.li, j.T, j.seq), std::fflush(stderr);
         const unsigned h = hw.head.load(std::memory_order_relaxed);
         hw.ring[h % HoWorker::kCap] = j;
         hw.head.store(h + 1, std::memory_order_release);
@@ -3652,6 +3907,18 @@ struct Engine {
             ho_one(hw.ring[hw.tail % HoWorker::kCap]);
             ++hw.tail;
             hw.done.store(hw.tail, std::memory_order_release);
+        }
+    }
+    /// D-1 (STRATA_Q36_HO_DMA=1): the CPU rows and miss flags copied to VRAM by DMA (a copy node in the graph) and merged
+    /// there (k_merge_cpu), instead of k_merge_host reading host-mapped memory a float at a time (~33 us a layer): the same values
+    void ho_merge(size_t slot, int n_ent, int N) {
+        static const bool dma = [] { const char* v = std::getenv("STRATA_Q36_HO_DMA"); return v && v[0] == '1'; }();
+        if (dma) {
+            CK(cudaMemcpyAsync(ecpu, ho_out_h + slot * N, (size_t) n_ent * N * 4, cudaMemcpyHostToDevice, st));
+            CK(cudaMemcpyAsync(d_miss, ho_miss_h + slot, (size_t) n_ent * 4, cudaMemcpyHostToDevice, st));
+            k_merge_cpu<<<n_ent, kThreads, 0, st>>>(eparts, ecpu, d_miss, N);
+        } else {
+            k_merge_host<<<n_ent, kThreads, 0, st>>>(eparts, ho_out_d + slot * N, ho_miss_d + slot, N);
         }
     }
     bool ho_active(size_t li, int T, bool graph_mode) const { return ho && (!graph_mode || ho_graph) && !rows_mode && T <= kHoRows && li < ho_ids.size(); }
@@ -4532,6 +4799,15 @@ struct Engine {
             const int kz = (n_in / want + 15) / 16 * 16;
             const int splits = (n_in + kz - 1) / kz;
             float* dst = splits > 1 ? sk_part : out;
+            static const bool sg8 = [] { const char* v = std::getenv("STRATA_Q36_SGEMM8"); return v && v[0] == '1'; }();
+            if (sg8 && n_out == 1 && splits == 1 && n_in % 32 == 0) {   // P-1: one output a row, a thread a row (same sums)
+                k_gemv_rows1<<<(T + 63) / 64, 64, 0, st>>>(W, xin, out, n_in, T);
+                return;
+            }
+            if (sg8 && tm == 4 && splits == 1 && n_in % 16 == 0) {   // P-1: the same sums, a bigger tile
+                k_sgemm_nt8<<<dim3(gx, (T + 127) / 128), 256, 0, st>>>(W, xin, out, n_in, n_out, T, n_out);
+                return;
+            }
             if (tm == 4) k_sgemm_nt<4><<<dim3(gx, gy, splits), 256, 0, st>>>(W, xin, dst, n_in, n_out, T, n_out, kz);
             else k_sgemm_nt<1><<<dim3(gx, gy, splits), 256, 0, st>>>(W, xin, dst, n_in, n_out, T, n_out, kz);
             if (splits > 1)
@@ -4550,12 +4826,41 @@ struct Engine {
     /// blocks dequantized to FP16, the activations FP16); a decode batch on the native MMVQ (q8_1 activations).
     static constexpr int kGemmT = 8;
     void prep(const float* xin, int n, int T, void* q) {
-        if (T > kGemmT) k_to_f16<<<grid1((int64_t) n * T), kThreads, 0, st>>>(xin, x16, (int64_t) n * T);
-        else quant(xin, n, T, q);
+        if (T > kGemmT) {
+            k_to_f16<<<grid1((int64_t) n * T), kThreads, 0, st>>>(xin, x16, (int64_t) n * T);
+            dm_x = xin;            // SP9: the FP32 input, for the dense MMQ path
+            dm_q_type = -1;        // (its q8_1 image is made on the first product that needs it)
+        } else quant(xin, n, T, q);
     }
     void apply(const Mat& w, const void* q, float* out, int T) {
-        if (T > kGemmT) gemm.native((const uint16_t*) x16, w.type, w.d, out, T, w.n_out, w.n_in);
-        else mmq(w, q, out, T);
+        if (T > kGemmT) {
+            if (!dense_mmq(w, out, T)) gemm.native((const uint16_t*) x16, w.type, w.d, out, T, w.n_out, w.n_in);
+        } else mmq(w, q, out, T);
+    }
+    /// P-3 SP9 (STRATA_Q36_DENSE_MMQ=1): a prompt chunk's dense projection on llama.cpp's int8 MMQ (q8_1 activations from
+    /// the FP32 input, as the experts and as decode's MMVQ) instead of FP16 activations on cuBLAS / CUTLASS: one "expert"
+    /// of all T rows. Another rounding of the activations: an output change, behind the KL gate. The q8_1 image goes into
+    /// the experts' mq_x (free until the layer's routed experts quantize into it), made once per prep() and weight type.
+    const float* dm_x = nullptr;
+    int dm_q_type = -1, dm_q_k = 0;
+    int32_t* dm_bounds = nullptr;
+    bool dense_mmq(const Mat& w, float* out, int T) {
+        static const bool on = [] { const char* v = std::getenv("STRATA_Q36_DENSE_MMQ"); return v && v[0] == '1'; }();
+        if (!on || !use_mmq || !mq_x || !mctx || !dm_x || w.n_in % 256 != 0 || !MMQ::fits(w.type, w.n_out)) return false;
+        if (!dm_bounds) CK(cudaMalloc((void**) &dm_bounds, 64));
+        if (dm_q_type != w.type || dm_q_k != w.n_in) {
+            MMQ::quantize(dm_x, nullptr, mq_x, w.type, w.n_in, w.n_in, T, st);
+            dm_q_type = w.type;
+            dm_q_k = w.n_in;
+        }
+        k_dm_bounds<<<1, 1, 0, st>>>(dm_bounds, T);   // (mmq::set_bounds is built for HIP only)
+        MMQ::Product p;
+        p.w = w.d; p.type = w.type; p.w_rows = w.n_out; p.w_cols = w.n_in;
+        p.expert_bytes = MMQ::matrix_bytes(w.type, w.n_out, w.n_in);
+        p.n = 1; p.xq = mq_x; p.bounds = dm_bounds; p.ids = ident; p.total_rows = T; p.max_rows = T;
+        p.dst = out; p.ld_dst = w.n_out;
+        mctx->run(p, st);
+        return true;
     }
     /// x [T][n] -> its q8_1 image (T contiguous columns: one vector of T * n), for every matrix that reads x.
     void quant(const float* xin, int n, int T, void* q) { K::native_quantize_q8_1(xin, q, n * T, 1, st); }
@@ -4591,8 +4896,13 @@ struct Engine {
         const void* wp = w.d;
         const half* dpl = nullptr;
         const int NJ = nb <= 32 ? 1 : 2;
+        // SD1 (STRATA_Q36_Q8ST=1): the row read as aligned 16-byte words through shared memory, the same bits
+        static const bool q8st = [] { const char* v = std::getenv("STRATA_Q36_Q8ST"); return v && v[0] == '1'; }();
 #define Q36_Q8(NCV)                                                                                          \
     case NCV:                                                                                                \
+        if (q8st && (NJ == 1 ? q36k::launch_q8_rows_s<NCV, 1>(wp, q, out, nb, w.n_out, st)                   \
+                             : q36k::launch_q8_rows_s<NCV, 2>(wp, q, out, nb, w.n_out, st)))                 \
+            break;                                                                                           \
         if (NJ == 1) q36k::launch_q8_rows<NCV, 1, false>(wp, dpl, q, out, nb, w.n_out, st);                  \
         else q36k::launch_q8_rows<NCV, 2, false>(wp, dpl, q, out, nb, w.n_out, st);                          \
         break;
@@ -4821,6 +5131,40 @@ struct Engine {
         }
         group_old(L, slot_of, T, grp_ptr, grp_start, n_groups, ent_dst, ent_tok);
     }
+    /// P-1 (STRATA_Q36_EXPERT_HIST=1): the prompt's rows an expert at each MMQ pass (a layer, a chunk), as buckets of
+    /// experts and of entries, and the tiles' fill at 128 rows a tile (entries / (tiles x 128)): what the skewed routing
+    /// costs the MMQ. Printed at exit. Nothing else changes.
+    static bool ehist_on() {
+        static const bool on = [] { const char* v = std::getenv("STRATA_Q36_EXPERT_HIST"); return v && v[0] == '1'; }();
+        return on;
+    }
+    static constexpr int kEhB = 10;   // rows: 0, 1-7, 8-15, 16-31, 32-63, 64-127, 128-255, 256-511, 512-1023, >= 1024
+    long long eh_exp[kEhB] = {}, eh_ent[kEhB] = {}, eh_tiles = 0, eh_rows = 0, eh_passes = 0, eh_tok = 0;
+    void ehist_add(const int32_t* cnt, int ne, int T) {
+        ++eh_passes;
+        eh_tok += T;
+        for (int x = 0; x < ne; ++x) {
+            const int r = cnt[x];
+            int b = 0;
+            if (r > 0) { b = 1; for (int lim = 8; r >= lim && b < kEhB - 1; lim *= 2) ++b; }
+            ++eh_exp[b];
+            eh_ent[b] += r;
+            eh_rows += r;
+            eh_tiles += (r + 127) / 128;
+        }
+    }
+    void ehist_print() const {
+        if (!eh_passes) return;
+        static const char* nm[kEhB] = {"0", "1-7", "8-15", "16-31", "32-63", "64-127", "128-255", "256-511", "512-1023", ">=1024"};
+        long long ne = 0;
+        for (long long v : eh_exp) ne += v;
+        std::fprintf(stderr, "strata-q36 expert rows (prompt MMQ passes: %lld, %.0f tokens a pass): rows an expert -> share of experts / of entries\n",
+                     eh_passes, (double) eh_tok / eh_passes);
+        for (int b = 0; b < kEhB; ++b)
+            std::fprintf(stderr, "  %-9s %6.2f%%  %6.2f%%\n", nm[b], 100.0 * eh_exp[b] / std::max(1LL, ne), 100.0 * eh_ent[b] / std::max(1LL, eh_rows));
+        std::fprintf(stderr, "  tile fill at 128 rows a tile: %.1f%% (%lld entries in %lld tiles)\n", 100.0 * eh_rows / std::max(1LL, eh_tiles * 128),
+                     eh_rows, eh_tiles);
+    }
     void* vgrp = nullptr;
     float *vx_ = nullptr, *vh_ = nullptr;
     /// The MoE block's end (k_moe_out) for T rows.
@@ -4848,6 +5192,11 @@ struct Engine {
             return;
         }
         xq_ready = false;
+        static const bool mo2 = [] { const char* v = std::getenv("STRATA_Q36_MOE_OUT2"); return v && v[0] == '1'; }();
+        if (mo2 && Kp == 8 && N == 8 * kThreads) {   // P-1: the same bits, all loads in flight
+            k_moe_out2<8, 8><<<T, kThreads, 0, st>>>(x, eparts, prow, ewts, shared, sgate, sgs, wn, hout, m->eps);
+            return;
+        }
         k_moe_out<<<T, kThreads, 0, st>>>(x, eparts, prow, ewts, Kp, shared, sgate, sgs, wn, hout, N, m->eps);
     }
     /// y [T][n_out] = W x from x's q8_1 image, 8 columns per launch.
@@ -4897,12 +5246,17 @@ struct Engine {
             CK(cudaFuncSetAttribute(k_fa2_prompt<false>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) fa2::kSmem));
             CK(cudaFuncSetAttribute(k_fa2_prompt<true>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) fa2::kSmem));
             CK(cudaFuncSetAttribute(k_fa2p_prompt, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) fa2p::kSmem));
+            CK(cudaFuncSetAttribute(k_fa2q_prompt, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) fa2q::kSmem));
             return true;
         }();
         return on && m->g.n_head == fa2::G * m->g.n_head_kv && m->g.head_dim == fa2::HD;
 #endif
     }
     /// R3, STRATA_Q36_FA2P=1 (with FA2): k_fa2p_prompt, 32-cell tiles with K / V staged by cp.async during the products
+    static bool fa2q_on() {
+        static const bool on = [] { const char* v = std::getenv("STRATA_Q36_FA2Q"); return v && v[0] == '1'; }();
+        return on;
+    }
     bool fa2p_on() const {
 #if defined(STRATA_USE_HIP)
         return false;
@@ -5247,8 +5601,14 @@ struct Engine {
                 k_gdn_ab<<<dim3(rows8(2 * HV), T), kThreads, 0, st>>>(L.alpha, L.beta, h, L.dt, L.ssm_a, al_b, be_b, N,
                                                                       HV);
             } else {
-                f32mm(L.alpha, h, al_b, N, HV, T);
-                f32mm(L.beta, h, be_b, N, HV, T);
+                static const bool sg8 = [] { const char* v = std::getenv("STRATA_Q36_SGEMM8"); return v && v[0] == '1'; }();
+                // P-1: alpha and beta in one pass when k_sgemm_nt would not split K (T >= 2048 here: 128+ blocks)
+                if (sg8 && HV == 32 && N % 16 == 0 && (T + 15) / 16 >= 128) {
+                    k_sgemm_ab<<<dim3(1, (T + 15) / 16), 256, 0, st>>>(L.alpha, L.beta, h, al_b, be_b, N, T);
+                } else {
+                    f32mm(L.alpha, h, al_b, N, HV, T);
+                    f32mm(L.beta, h, be_b, N, HV, T);
+                }
                 k_gdn_gb<<<grid1((int64_t) HV * T), kThreads, 0, st>>>(al_b, L.dt, L.ssm_a, be_b, HV, T);
             }
             pmark("delta-net: qkv / z / a / b projections");
@@ -5386,10 +5746,17 @@ struct Engine {
                                 k_kv_q8_f16_seg<<<grid1((int64_t) HKV * n * HD), kThreads, 0, st>>>((const int8_t*) kc[li],
                                     (const int8_t*) vc[li], k16, v16, ctx, lo, n, seg, HD, HKV, kv_qb());
                             }
+                            if (fa2q_on())   // P-1: two blocks a SM, the same bits
+                                k_fa2q_prompt<<<dim3((T + fa2q::Q - 1) / fa2q::Q, HKV), 256, fa2q::kSmem, st>>>(q16, k16, v16, T, H, ld,
+                                    (int) p0, 1.0f / sqrtf((float) HD), att, lo, hi, (lo == 0 ? 1 : 0) | (hi >= P ? 2 : 0), fa2_sml);
+                            else
                             k_fa2p_prompt<<<dim3((T + fa2p::Q - 1) / fa2p::Q, HKV), 256, fa2p::kSmem, st>>>(q16, k16, v16, T, H, ld,
                                 (int) p0, 1.0f / sqrtf((float) HD), att, lo, hi, (lo == 0 ? 1 : 0) | (hi >= P ? 2 : 0), fa2_sml);
                         }
-                    } else if (fa2p_on())   // R3
+                    } else if (fa2p_on() && fa2q_on())   // P-1
+                        k_fa2q_prompt<<<dim3((T + fa2q::Q - 1) / fa2q::Q, HKV), 256, fa2q::kSmem, st>>>(q16, kbase, vbase, T, H,
+                            (int) (kv_head / HD), (int) p0, 1.0f / sqrtf((float) HD), att);
+                    else if (fa2p_on())   // R3
                         k_fa2p_prompt<<<dim3((T + fa2p::Q - 1) / fa2p::Q, HKV), 256, fa2p::kSmem, st>>>(q16, kbase, vbase, T, H,
                             (int) (kv_head / HD), (int) p0, 1.0f / sqrtf((float) HD), att);
                     else
@@ -5509,7 +5876,14 @@ struct Engine {
                                 return;
                             }
                             static const bool q8g = [] { const char* v = std::getenv("STRATA_Q36_ATT_Q8G"); return v && v[0] == '1'; }();
-                            if (q8g && kv_dot8() && H == 8 * HKV) {   // R6: a block per (chunk, KV head), the same bits
+                            // D-1: from STRATA_Q36_ATT_Q8G_MIN (64) chunks only (at short contexts its grid is too small)
+                            static const int q8g_min = [] { const char* v = std::getenv("STRATA_Q36_ATT_Q8G_MIN"); return v ? std::atoi(v) : 64; }();
+                            if (q8g && kv_dot8() && H == 8 * HKV && c1 - c0 >= q8g_min) {   // R6: a block per (chunk, KV head), the same bits
+                                static const bool tr = [] { const char* v = std::getenv("STRATA_Q36_ATT_TR"); return v && v[0] == '1'; }();
+                                if (tr)   // D-2 SD6: the transposing butterfly for the 8 heads' scores (the same bits)
+                                    k_attn_part_q8g<true, true><<<dim3(c1 - c0, nt * HKV), kChunkCells, 0, st>>>(q, kq, vq, dpos, t0, H,
+                                        HKV, ctx, 1.0f / sqrtf((float) HD), n_chunk, pacc, pm, pl, rs, kv_qb(), tb, c0);
+                                else
                                 k_attn_part_q8g<true><<<dim3(c1 - c0, nt * HKV), kChunkCells, 0, st>>>(q, kq, vq, dpos, t0, H, HKV,
                                     ctx, 1.0f / sqrtf((float) HD), n_chunk, pacc, pm, pl, rs, kv_qb(), tb, c0);
                                 return;
@@ -5629,6 +6003,7 @@ struct Engine {
             CK(cudaStreamSynchronize(st));
             if (lhy(li))
                 for (int x = 0; x < ne; ++x) hy[li].score[(size_t) x] += h_cnt[li * g.n_expert + x];
+            if (lhy(li) && ehist_on()) ehist_add(h_cnt + li * g.n_expert, ne, T);
             const int64_t maxr = hpin[10];
             pmark("moe: routing sort + host sync");
             // layer-major prompts (STRATA_Q36_LM): a layer's streamed experts are taken by its first chunk of the
@@ -5637,7 +6012,17 @@ struct Engine {
                                  : !lm_active ? stream_take((int) li)
                                  : lm_first ? (lm_wbase = stream_take((int) li)) : lm_wbase;
             pmark("moe: waiting for the stream");
+            if (q36moe_run_fn gm = q36_ggml_moe()) {   // SP1: the current llama.cpp's MUL_MAT_ID (outputs in entry order)
+                Q36MoeArgs ga{1, L.L.gu_type, L.L.d_type, wbase, wbase + L.L.down_off, 0, 0, L.stride, ne, N, FF, Kp,
+                              (int64_t) T, h, ids, mq_gu, mq_h, eparts};
+                CK(cudaStreamSynchronize(st));
+                if (gm(&ga) != 0) { std::fprintf(stderr, "strata-q36: STRATA_Q36_GGML_MOE: the expert product failed\n"); std::exit(1); }
+                pmark("moe: experts (ggml MUL_MAT_ID)");
+                if (lhy(li) && (!lm_active || lm_last)) stream_done();
+                prow = nullptr;
+            } else {
             MMQ::quantize(h, ent_tok, mq_x, L.L.gu_type, N, N, n_ent, st);
+            dm_q_type = -1;   // (SP9: mq_x now holds the experts' rows)
             MMQ::Product gu;
             gu.w = wbase; gu.type = L.L.gu_type; gu.w_rows = 2 * FF; gu.w_cols = N; gu.expert_bytes = L.stride;
             gu.n = ne; gu.xq = mq_x; gu.bounds = rbounds; gu.ids = ident; gu.total_rows = n_ent; gu.max_rows = maxr;
@@ -5654,6 +6039,7 @@ struct Engine {
             pmark("moe: swiglu + down MMQ");
             if (lhy(li) && (!lm_active || lm_last)) stream_done();
             prow = rinv;
+            }
         } else {
             group_entries(L, nullptr, T);
             if (!xq_post) quant(h, N, T, xq);   // the experts' and the shared expert's input
@@ -5662,7 +6048,11 @@ struct Engine {
         }
         pmark("routed experts (incl. waiting for the stream)");
         // the shared expert, scaled by sigmoid(w . h)
-        if (T > kGemmT) k_to_f16<<<grid1((int64_t) N * T), kThreads, 0, st>>>(h, x16, (int64_t) N * T);
+        if (T > kGemmT) {
+            k_to_f16<<<grid1((int64_t) N * T), kThreads, 0, st>>>(h, x16, (int64_t) N * T);
+            dm_x = h;              // (SP9: the shared expert's input)
+            dm_q_type = -1;
+        }
         if (T <= kGemmT) {
             if (!shared_gu(L, T)) {
                 apply(L.sh_gate, xq, sg, T);
@@ -6123,7 +6513,7 @@ struct Engine {
         if (ho_active(li, T, cur_graph_mode) && cur_graph_mode) {   // R1: captured; the jobs queued at each launch
             const size_t slot = li * (size_t) kHoRows * Kp;
             k_ho_wait<<<1, 32, 0, st>>>(ho_flag_d + li, 0, ho_ep_d);
-            k_merge_host<<<n_ent, kThreads, 0, st>>>(eparts, ho_out_d + slot * N, ho_miss_d + slot, N);
+            ho_merge(slot, n_ent, N);
             if (ho_tmpl_cur) ho_tmpl_cur->jobs.push_back({(int) li, T});
             return;
         }
@@ -6131,7 +6521,7 @@ struct Engine {
             const unsigned seq = ++ho_seq;
             const size_t slot = li * (size_t) kHoRows * Kp;
             k_ho_wait<<<1, 32, 0, st>>>(ho_flag_d + li, seq);
-            k_merge_host<<<n_ent, kThreads, 0, st>>>(eparts, ho_out_d + slot * N, ho_miss_d + slot, N);
+            ho_merge(slot, n_ent, N);
             if (ho_thread) {   // the worker thread takes it; the queued launches to the GPU now (WDDM batches them)
                 ho_push({(int) li, T, seq});
                 (void) cudaStreamQuery(st);
@@ -6183,6 +6573,8 @@ struct Engine {
 #if defined(STRATA_Q36_CPU_POOL)
         const int Kp = (int) m->top_k, N = (int) m->g.n_embd;
         const auto tw = Clock::now();
+        if (ho_log()) std::fprintf(stderr, "HOLOG job li %d T %d seq %u: waiting for routing (rflag %u)\n", j.li, j.T, j.seq,
+                                   *(volatile unsigned*) (ho_rflag_h + j.li)), std::fflush(stderr);
         while (*(volatile unsigned*) (ho_rflag_h + j.li) != j.seq) {
         }
         std::atomic_thread_fence(std::memory_order_acquire);
@@ -6363,10 +6755,34 @@ struct Engine {
         for (GSet& gset : gsets)
             for (auto& kv : gset.g1b)
                 if (kv.second) CK(cudaGraphExecDestroy(kv.second));
-        for (GSet& gset : gsets) gset.g1b.clear();
+        for (GSet& gset : gsets)
+            for (auto& kv : gset.gvb)
+                if (kv.second) CK(cudaGraphExecDestroy(kv.second));
+        for (GSet& gset : gsets) gset.g1b.clear(), gset.gvb.clear();
         ho_tmpls.clear();
     }
 
+    /// The verify window [x, drafts] through the main model. SD7: with HO_GRAPH a graph per (T, context bucket) and the
+    /// window grown first, as the decode step does (R1 / R7), past the window eager. The one graph per T it used before
+    /// covered the whole context (graph_nc 0: every chunk of a 262K cache, the KV_RAM window's too) and hung at the
+    /// first verify window (--mtp N with HO_GRAPH stalled at warm-up). STRATA_Q36_GV_BUCKET=0: that old path.
+    void verify_run(int T) {
+        static const bool bucket = [] { const char* v = std::getenv("STRATA_Q36_GV_BUCKET"); return !(v && v[0] == '0'); }();
+        if (!(bucket && ho_graph)) { graph_run(gs().gv[T], [&] { forward(T, pos, T, use_graph, true); }); return; }
+        int b = 16;
+        const int need = (int) ((pos + T + kChunkCells - 1) / kChunkCells);
+        while (b < need) b *= 2;
+        b = std::min(b, (int) ((ctx + kChunkCells - 1) / kChunkCells));
+        kvr_ensure(pos + T);
+        if (kvr_on) b = std::max(need, std::min(b, kvr_nwin * (KvRam::kSeg / kChunkCells)));
+        if (kvr_on && (int64_t) b * kChunkCells > (int64_t) kvr_nwin * KvRam::kSeg) {
+            forward(T, pos, T, false, true);
+            return;
+        }
+        graph_nc = b;
+        graph_run(gs().gvb[T * 65536 + b], [&] { forward(T, pos, T, use_graph, true); });
+        graph_nc = 0;
+    }
     template <class F> void graph_run(cudaGraphExec_t& gx, F body) {
         if (!use_graph) { body(); return; }
         if (!gx) {
@@ -6382,6 +6798,11 @@ struct Engine {
             CK(cudaGraphDestroy(graph));
         }
         CK(cudaGraphLaunch(gx, st));
+        if (ho_log()) {
+            const auto it = ho_tmpls.find(&gx);
+            std::fprintf(stderr, "HOLOG graph launch eps %d jobs %zu ho_ep %u\n", it != ho_tmpls.end() ? it->second.eps : -1,
+                         it != ho_tmpls.end() ? it->second.jobs.size() : (size_t) 0, ho_ep), std::fflush(stderr);
+        }
         if (ho_graph) {   // R1: this launch's epoch; its CPU jobs, then wait for them (as ho_run() at a forward's end)
             const auto it = ho_tmpls.find(&gx);
             if (it != ho_tmpls.end() && it->second.eps > 0) {
@@ -6926,7 +7347,9 @@ struct Engine {
         CK(cudaMemcpyAsync(tok, hpin + 16, (size_t) T * 4, cudaMemcpyHostToDevice, st));
         CK(cudaMemcpyAsync(pos0, hpin + 1, 4, cudaMemcpyHostToDevice, st));
         rows_deferred = true;
-        graph_run(gs().gv[T], [&] { forward(T, pos, T, use_graph, true); });
+        if (ho_log()) std::fprintf(stderr, "HOLOG verify window T %d\n", T), std::fflush(stderr);
+        verify_run(T);
+        if (ho_log()) std::fprintf(stderr, "HOLOG verify window done\n"), std::fflush(stderr);
         rows_deferred = false;
         int a = 0;
         if (sample_row) {
@@ -6972,7 +7395,9 @@ struct Engine {
         if (!fix.empty())
             CK(cudaMemcpyAsync(seeds, hmain, fix.size() * (size_t) N * 4, cudaMemcpyDeviceToDevice, st));
         CK(cudaMemcpyAsync(seeds + fix.size() * (size_t) N, hlast, (size_t) N * 4, cudaMemcpyDeviceToDevice, st));
+        if (ho_log()) std::fprintf(stderr, "HOLOG spec: first MTP call T0 %d at %lld\n", T0, (long long) pos), std::fflush(stderr);
         forward_mtp(T0, pos - (int64_t) fix.size(), seeds, D > 0, false);
+        if (ho_log()) std::fprintf(stderr, "HOLOG spec: first MTP call queued\n"), std::fflush(stderr);
         drafts.assign((size_t) D, 0);
         if (D > 0) {
             CK(cudaMemcpyAsync(hpin + 2, pick_m, 4, cudaMemcpyDeviceToHost, st));
@@ -7001,7 +7426,9 @@ struct Engine {
         CK(cudaMemcpyAsync(tok, hpin + 16, (size_t) T * 4, cudaMemcpyHostToDevice, st));
         CK(cudaMemcpyAsync(pos0, hpin + 1, 4, cudaMemcpyHostToDevice, st));
         rows_deferred = true;
-        graph_run(gs().gv[T], [&] { forward(T, pos, T, use_graph, true); });
+        if (ho_log()) std::fprintf(stderr, "HOLOG verify window T %d\n", T), std::fflush(stderr);
+        verify_run(T);
+        if (ho_log()) std::fprintf(stderr, "HOLOG verify window done\n"), std::fflush(stderr);
         rows_deferred = false;
         int a = 0;
         if (sample_row) {
@@ -8612,11 +9039,21 @@ int strata::qwen35::run(int argc, char** argv) {
                     std::fprintf(stderr, "strata-q36 dprof: %8.0f %7.2f  host %8.0f  %s\n", kv.second, kv.second / E.dprof_n,
                                  E.dprof_host[kv.first], kv.first.c_str());
             }
+            E.ehist_print();
             if (!E.m->hybrid) return;
             const long long n = E.hy_cpu + E.hy_gpu;
             std::fprintf(stderr, "strata-q36: hybrid experts: %lld of %lld batch entries on the GPU (%.1f%%), %lld on the "
                          "CPU pool in %.0f ms, %lld slot replacements\n", E.hy_gpu, n, n ? 100.0 * E.hy_gpu / n : 0.0,
                          E.hy_cpu, E.hy_cpu_ms, E.hy_swaps);
+#if defined(STRATA_Q36_CPU_POOL)
+            if (E.pool && std::getenv("STRATA_POOL_PHASE_TIMING")) {   // SD2: the pool's phases (work vs synchronisation)
+                const auto& P = *E.pool;
+                std::fprintf(stderr, "strata-q36: pool phases: gate/up %.0f ms, h quant %.0f ms, down %.0f ms; %lld phases: wall %.0f ms "
+                             "(tail %.0f), park waits %.0f ms, threads busy %.0f%% of %d\n", P.ms_multi_gu, P.ms_multi_q, P.ms_multi_down,
+                             (long long) P.pt_phases, P.pt_wall_ms, P.pt_tail_ms, P.pt_park_ms,
+                             100.0 * P.pt_busy_ms / std::max(1e-9, P.pt_wall_ms * P.pt_threads()), P.pt_threads());
+            }
+#endif
             std::fprintf(stderr, "strata-q36: %lld small forwards (decode, verify, MTP) in %.0f ms host time (%.1f ms each), "
                          "of it %.0f ms waiting for the GPU's routing; %lld decode rebalances in %.0f ms (%.0f ms waiting for async copies)\n", E.fwd_small_n,
                          E.fwd_small_ms, E.fwd_small_n ? E.fwd_small_ms / E.fwd_small_n : 0.0, E.hy_wait_ms, E.rebal_n, E.rebal_ms,
