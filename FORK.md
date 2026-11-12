@@ -209,4 +209,8 @@ replaces it, and the next turn of the first conversation reads its whole history
 - Tokens per step moves about 8% between runs of the same settings, so a small gain needs many runs. Numbers before 2026-11-05 in the worklog mostly use temperature 0.6.
 - On the 0.1.55 base, with all switches off, this branch gave byte-identical answers to the installed engine on 6 prompts at the settings under Answers, with `--adapt-swaps 1 --adapt-every 1000000`. `tools/test_setup_choices.py` has 2 errors in `test_the_encoder_is_built_native`, in code this branch doesn't change.
 
+## Qwen3.6-35B-A3B on a 12 GB card
+
+The `src/qwen35` path runs Qwen3.6-35B-A3B in hybrid mode on a 12 GB card with 32 GB of RAM at the full 262K context with an 8-bit K/V cache: short decode ~79-87 tok/s, a 50K-token prompt read at ~3,900-4,300 tok/s, ~1 s follow-ups (RTX 4070 Ti, i7-14700KF, DDR5). The switches (all opt-in), the configuration and the measurements: [docs/fork/QWEN36-12GB.md](docs/fork/QWEN36-12GB.md).
+
 The license is upstream's MIT license, unchanged.
