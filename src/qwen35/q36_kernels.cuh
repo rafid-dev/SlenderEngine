@@ -13,6 +13,7 @@
 #include <cfloat>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 
 namespace q36k {
 
@@ -160,6 +161,60 @@ template <int NC, int NJ, bool PK>
 /// 5.2 us as 1024 (a grid above 32768 threads is several times slower there; the same rows, the same sums).
 inline void launch_q8_rows(const void* w, const half* dpl, const void* x, float* y, int nb, int n_out, cudaStream_t s) {
     launch_q8_rows_t<NC, NJ, PK>(w, dpl, x, y, nb, n_out, 8, 1024, s);
+}
+
+/// SD1 (STRATA_Q36_Q8ST=1): k_q8_rows for GGUF-layout Q8_0 rows whose length is a multiple of 16 bytes (nb % 8 == 0): the
+/// warp reads its row as aligned 16-byte words (the 34-byte blocks only allow 2-byte loads in place) into a shared-memory
+/// copy, prefetching its next row's words into registers meanwhile, and q8_row_dot runs on the copy: the same bytes, the
+/// same arithmetic and order, the same bits.  8192 x 2048 on an RTX 4070 Ti: 47.6 -> ~42 us (375 -> ~425 GB/s; a plain
+/// read of the matrix 454).  ML = 16-byte words a lane holds: nb * 34 / 16 <= 32 ML.
+template <int NC, int NJ, int ML>
+__global__ void __launch_bounds__(256) k_q8_rows_s(const uint8_t* __restrict__ w, const QB* __restrict__ x, float* __restrict__ y,
+                                                   int nb, int n_out) {
+    extern __shared__ int4 q8st_sm[];
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int R16 = nb * 34 / 16;
+    int4* buf = q8st_sm + (size_t) warp * 2 * R16;
+    const int stride = gridDim.x * (blockDim.x >> 5);
+    int row = blockIdx.x * (blockDim.x >> 5) + warp;
+    int4 r[ML];
+    auto load = [&](int rw) {
+        const int4* src = reinterpret_cast<const int4*>(w + (size_t) rw * nb * 34);
+#pragma unroll
+        for (int k = 0; k < ML; ++k) {
+            const int i = lane + 32 * k;
+            if (i < R16) r[k] = __ldcs(src + i);
+        }
+    };
+    if (row < n_out) load(row);
+    for (int b = 0; row < n_out; row += stride, b ^= 1) {
+        int4* sb = buf + b * R16;   // (two copies: the one written here was last read two rows ago, a __syncwarp between)
+#pragma unroll
+        for (int k = 0; k < ML; ++k) {
+            const int i = lane + 32 * k;
+            if (i < R16) sb[i] = r[k];
+        }
+        __syncwarp();
+        if (row + stride < n_out) load(row + stride);
+        float res[NC];
+        q8_row_dot<NC, NJ, false>(reinterpret_cast<const uint8_t*>(sb), nullptr, x, 0, nb, lane, res);
+        if (lane == 0)
+#pragma unroll
+            for (int c = 0; c < NC; ++c) y[(size_t) c * n_out + row] = res[c];
+    }
+}
+/// false: not this kernel's shape (the caller keeps k_q8_rows).  The base must be 16-byte aligned.
+template <int NC, int NJ>
+inline bool launch_q8_rows_s(const void* w, const void* x, float* y, int nb, int n_out, cudaStream_t s) {
+    if (nb % 8 != 0 || nb * 34 / 16 > 32 * 5 || (reinterpret_cast<uintptr_t>(w) & 15) != 0) return false;
+    // D-2: a row a warp up to 1024 blocks (8192 x 2048: 41.0 -> 40.1 us, 4096 x 2048: 22.2 -> 21.6 against 360 blocks, whose
+    // 2,880 warps left a tail of two-row warps); STRATA_Q36_Q8ST_BLOCKS caps it
+    static const int blocks = [] { const char* v = std::getenv("STRATA_Q36_Q8ST_BLOCKS"); return v ? std::atoi(v) : 1024; }();
+    const int rows = (n_out + 7) / 8;
+    const int g = rows < blocks ? rows : blocks;
+    const size_t smem = (size_t) 8 * 2 * (nb * 34 / 16) * 16;
+    k_q8_rows_s<NC, NJ, 5><<<(unsigned) g, 256, smem, s>>>(static_cast<const uint8_t*>(w), static_cast<const QB*>(x), y, nb, n_out);
+    return true;
 }
 
 /// The shared expert's gate and up products and SwiGLU + q8_1 in one launch: 32 rows (one q8_1 block of h) per 1024-thread

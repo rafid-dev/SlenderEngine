@@ -543,6 +543,23 @@ bool try_rocblas_f16o(void* opaque_state, const uint16_t* X, const uint16_t* W, 
         if (const auto* row = state->table.closest((int) N, (int) K, (int) ldy, (int) T); row && row->tuned) {
             pick.tuned = true;
             pick.solution = row->solution;
+            // A row applies to the token counts nearest its bucket, where its solution was not measured.  rocBLAS runs a
+            // solution index as given (flags 0) even on a shape that kernel cannot handle - on gfx1032 that faulted the
+            // GPU once (the q36 attention tuner, 2026-11-09).  So ask first, once per shape:
+            // rocblas_gemm_flags_check_solution_index runs nothing and answers success only where the kernel can run it.
+            const float qa = 1.0f, qb = 0.0f;
+            const rocblas_status q = rocblas_gemm_ex(
+                state->handle, rocblas_operation_transpose, rocblas_operation_none, (int) N, (int) T, (int) K, &qa, W,
+                rocblas_datatype_f16_r, (int) K, X, rocblas_datatype_f16_r, (int) K, &qb, Y, rocblas_datatype_f16_r,
+                (int) (2 * ldy), Y, rocblas_datatype_f16_r, (int) (2 * ldy), rocblas_datatype_f32_r,
+                rocblas_gemm_algo_solution_index, pick.solution, rocblas_gemm_flags_check_solution_index);
+            if (q != rocblas_status_success) {
+                pick.tuned = false;
+                if (std::getenv("STRATA_ROCBLAS_VERBOSE"))
+                    std::fprintf(stderr, "prefill gemm: rocBLAS solution %d cannot run T=%lld N=%lld K=%lld ldy=%lld "
+                                         "(status %d); the default kernel\n", pick.solution, (long long) T, (long long) N,
+                                 (long long) K, (long long) ldy, (int) q);
+            }
         }
         if (std::getenv("STRATA_ROCBLAS_VERBOSE")) {
             if (pick.tuned)

@@ -4,7 +4,7 @@
 
 Run **Qwen3.8-Flash-Next IQ3_S locally on a Windows PC with 32 GB of RAM**. SlenderEngine is a speed fork of [Strata](https://github.com/Niko1221/Strata) that tunes how the model uses your GPU, RAM and SSD, with an optional second SSD for faster reads. The model files are unchanged.
 
-**Start here:** [Requirements](#what-you-need) · [Setup](#easy-setup) · [Troubleshooting](#troubleshooting) · [Measurements](docs/fork/PERFORMANCE.md)
+**Start here:** [Requirements](#what-you-need) · [Setup](#easy-setup) · [Qwen3.6-35B-A3B](#qwen36-35b-a3b) · [Troubleshooting](#troubleshooting) · [Measurements](docs/fork/PERFORMANCE.md)
 
 ## What you need
 
@@ -76,6 +76,30 @@ These results are from one PC: i7-14700KF, 32 GB DDR5-6000, RTX 4070 Ti 12 GB, t
 At the default 10 GiB cache, 2.7-2.8 GB of RAM stayed free in those tests and nothing was written to the page file. On the GPU, the engine sizes its expert cache to fill the card and keeps about 0.7 GB free. Giving it more RAM cache can leave too little memory for Windows and slow it down: 14 GiB was faster here but paged heavily. Start at 10 GiB and close other large apps.
 
 See [performance, memory measurements and updates](docs/fork/PERFORMANCE.md) for the test conditions and older comparisons. Answer quality has not been measured with a task suite.
+
+## Qwen3.6-35B-A3B
+
+The same fork also runs **[Qwen3.6-35B-A3B](https://huggingface.co/Qwen/Qwen3.6-35B-A3B)** (35B parameters, 3B active a token) at its full 262K context on the same 32 GB PC with a 12 GB card. Its experts stay in RAM as a mapped file instead of streaming from the SSD, so it is much faster than Flash-Next, and smaller.
+
+In the SlenderEngine folder from [step 1](#1-download-this-fork):
+
+```powershell
+.\FAST-SETUP-35B.bat
+.\run-qwen36-fast.bat
+```
+
+The first run downloads Unsloth's UD-Q4_K_M file with its MTP block (about 23 GB) and builds the engine for your card. Then it writes `run-qwen36-fast.bat` with the settings chosen for your card, RAM and CPU. The browser page and API are the same as Flash-Next's, on the same port, so run one model at a time.
+
+Measured 2026-11-13 on the PC above, thinking on, 262K context, 8-bit cache, two runs each:
+
+| | With MTP (the launcher's setting) | Without MTP |
+|---|---:|---:|
+| Short answers | 106-119 tokens/s | 94-96 tokens/s |
+| An answer after a 50K-token prompt | 78-88 tokens/s | 75-83 tokens/s |
+| Reading a 50K-token prompt | 4,100-4,300 tokens/s | 4,400-4,560 tokens/s |
+| A follow-up question | reads only its new tokens (about 0.2 s after a 50K prompt) | the same |
+
+The experts take about 18.7 GB of RAM as a mapped file. With a browser and a few apps open, it ran at full speed. A program above about 4 GB beside it made Windows page, and the speed fell by a third or more. Setup warns when your RAM or VRAM is short; a 16 GB PC is expected to page heavily. The switches, quality checks and limits are in [QWEN36-12GB.md](docs/fork/QWEN36-12GB.md). Like the Flash-Next setup, this path has **not yet been tested from a clean clone**.
 
 ## Troubleshooting
 
@@ -153,6 +177,7 @@ Written by Qwen3.8-Flash-Next IQ3_S through OpenCode on the PC described above. 
 ## More details
 
 - [FORK.md](FORK.md): engine changes, switches and measurements.
+- [Qwen3.6-35B-A3B on a 12 GB card](docs/fork/QWEN36-12GB.md): its configuration, measurements and quality checks.
 - [The web app](docs/WEB_APP.md): the chat page at the server's address, where its data is kept, and its security.
 - [Sharing over Tailscale](docs/TAILSCALE.md): use the page from your phone or another PC, HTTPS and private, with `TAILSCALE-SHARE.bat`.
 - [Worklog](docs/fork/WORKLOG.md): recorded tests, including failed experiments.
@@ -167,6 +192,6 @@ SlenderEngine is [Strata](https://github.com/Niko1221/Strata), by Niko1221 and t
 - **Still Strata underneath.** The program is still `strata`, its switches are still `STRATA_*` and its config files are still `strata-*.json`, so Strata's documentation applies. [FORK.md](FORK.md) lists what this fork changes, and [compare with upstream v0.2.11](https://github.com/rafid-dev/SlenderEngine/compare/c3b3f50...speed-fork) shows every changed line.
 - **Upstream's credits** for the model, llama.cpp / ggml and the projects Strata learned from are in [docs/HOW_IT_WORKS.md](docs/HOW_IT_WORKS.md#credits).
 - **Contributors to this fork:** [Gamination](https://github.com/Gamination), the 8 GB card switches and the RTX 4060 laptop measurements.
-- **The model:** [Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next) by the Qwen team.
+- **The models:** [Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next) and [Qwen3.6-35B-A3B](https://huggingface.co/Qwen/Qwen3.6-35B-A3B) by the Qwen team; the Qwen3.6 GGUFs with the MTP block by [Unsloth](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-MTP-GGUF).
 
 Code is [MIT licensed](LICENSE), keeping Niko1221's copyright alongside this fork's; model weights and optional components have their own licenses. SlenderEngine is not made or endorsed by the Strata project. Problems with this fork belong in [this repository's issues](https://github.com/rafid-dev/SlenderEngine/issues), not upstream's.
