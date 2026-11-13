@@ -7,25 +7,42 @@ differ.
 "Short" is the mean speed of six thinking-on coding answers. "After 50K" is the answer to a question about a 50K-token file, and
 "follow-up" is the next question in that conversation. Every test uses a fresh engine, the model card's sampling and alternating runs.
 
-## Where it stands (2026-11-08/09, skip 0)
+## Where it stands (2026-11-13, skip 0)
 
 | | Speed | Runs |
 |---|---:|---|
-| Short answers | 46.5-49.5 tok/s | 3 |
-| After a 50K prompt | 35.5-41.4 tok/s | 3 |
-| Follow-up | 34.6-41.8 tok/s | 3 |
-| Reading a 50K prompt, this PC's launcher | 2,258-2,296 tok/s | 2 |
-| Reading a 50K prompt, the fork's defaults only | 2,064-2,145 tok/s | 2 |
-| Lowest free RAM during the decode runs | 3.5-4.4 GB | 3 |
-| Written to the page file | 0 GB/h | 3 |
+| Short answers | 42.8-44.1 tok/s | 3 |
+| After a 50K prompt | 36.6-43.0 tok/s | 3 |
+| Follow-up | 34.1-39.6 tok/s | 3 |
+| Reading a 50K prompt, this PC's launcher | 2,864-2,881 tok/s | 3 |
+| Reading a 30K prompt, this PC's launcher | 2,684-2,712 tok/s | 2 |
+| Reading a 50K prompt, the fork's defaults only (2026-11-08/09) | 2,064-2,145 tok/s | 2 |
+| Lowest free RAM during the decode runs | 2.7-2.8 GB | 3 |
+| Written to the page file | 0.0-0.01 GB/h | 3 |
 
 - Skip 0: every expert is computed, so answers are the full model's.
-- Decode speed moves with how many drafted tokens are accepted (1.6-1.9 a step in these runs), which is why its ranges are wide.
-- "This PC's launcher" adds two settings that aren't fork defaults (see 2026-11-08 below): a 192-slot GPU staging ring and a 95% lend
-  cap. The fork's defaults use 96 slots and 90%.
-- Decode didn't change in the 2026-11-08/09 work; only prompt reading did.
+- Decode speed moves with how many drafted tokens are accepted (1.66-1.78 a step in these runs), which is why its ranges are wide.
+- "This PC's launcher" adds settings that aren't fork defaults (see 2026-11-12 and 2026-11-13 below): fused expert kernels, the
+  tensor-core GDN scan, larger prompt chunks (up to 16,896 tokens) and a 256-slot GPU staging ring with a 95% lend cap.
+- Short answers measured 46.5-49.5 tok/s on 2026-11-08/09 and are about 8% lower now, at the same share of drafts accepted. It was
+  already lower on 2026-11-12, before the prompt changes below, which showed no decode change in back-to-back runs. The cause isn't
+  found yet: the SSDs read as fast as on 2026-11-08 (same probe, same byte ranges) and nothing was paged. After a 50K prompt and
+  follow-ups are within their old ranges.
+- The 30K figure is through the server with timing logs on; the other rows are plain runs of the launcher.
 
 ## Updates
+
+### 2026-11-12 and 2026-11-13
+
+| Change | Switch | Result | Answers |
+|---|---|---|---|
+| Tensor-core GDN scan, this PC's launcher | `STRATA_GDN_TC=1` | The prompt path's GDN recurrence as a chunked scan on the tensor cores: 50K prompt 2,418 → 2,481 tok/s (+2.6%, every run above every run without it), 29K +2.0%. Decode not touched | Rounding only: KL at the chunk-regrouping floor on 4 prompts, 128 steps, same top choice |
+| Fused expert kernels, this PC's launcher | `STRATA_PF_FUSED=1`, `STRATA_PREFILL_RING=288` | The prompt's IQ3_S experts through fused int8 kernels: 50K prompt 2,326-2,337 → 2,735-2,828 tok/s (+18.7%, the engine alone) | Rounding only: KL at the chunk-regrouping floor on 4 prompts, 128 steps |
+| Larger prompt chunks, this PC's launcher | `STRATA_PF_HC_REGION=1`, `STRATA_EMB_REUSE_ACCOUNT=1`, `STRATA_PREFILL_RING=256`, `STRATA_PREFILL_AUTO_MAX=32768`, `--prefill auto:32768` | A scratch buffer moved into memory that is already shared and the reused embedding counted once free room for chunks of up to 16,896 tokens instead of 12,544. Through the server: 30K prompt 2,366-2,392 → 2,684-2,712 tok/s (+13.5%, one pass fewer), 50K +0.8%, decode unchanged | The two memory changes are byte-identical. The larger chunks are rounding only: on 16 chat examples, 256 steps each, the 45-50K ones scored KL 0.00072 against 0.00069 for a chunk-size change alone, with no confident token changed; the 12K ones are byte-identical |
+| Q8 hyper-connection weights, tried and left out | `STRATA_HC_Q8=1` | Frees about 0.4 GiB of VRAM: 50K prompt about +2%, short answers about +2% | Changes the weights: on 48 chat examples coding text scored 0.28% worse in perplexity. Off until it passes on independent text |
+
+- The larger chunks help prompts that then need one pass fewer over the experts (here about 12.5-17K and 25-34K tokens). At 50K the
+  engine alone gained 4%, but through the server the copy wait grew and the gain was within noise.
 
 ### 2026-11-08 and 2026-11-09
 

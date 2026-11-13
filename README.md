@@ -62,18 +62,18 @@ To stop, press **Ctrl+C** in the server window. Next time, just run `run-fast.ba
 
 ## Speed and memory
 
-With expert skipping off and thinking enabled, the 2026-11-08/09 tests measured:
+With expert skipping off and thinking enabled, the 2026-11-13 tests measured:
 
 | | Speed |
 |---|---:|
-| Short answers | 46-50 tokens/s |
-| An answer after a 50K-token prompt | 36-41 tokens/s |
-| A follow-up question | 35-42 tokens/s |
-| Reading a 50K-token prompt | about 2,100 tokens/s |
+| Short answers | 43-44 tokens/s |
+| An answer after a 50K-token prompt | 37-43 tokens/s |
+| A follow-up question | 34-40 tokens/s |
+| Reading a 50K-token prompt | about 2,100 tokens/s with the fork's defaults; 2,860-2,880 with this PC's own launcher |
 
-These results are from one PC: i7-14700KF, 32 GB DDR5-6000, RTX 4070 Ti 12 GB, two Samsung 990 PRO SSDs, Windows 11, IQ3_S and 262K context, 3 runs each. Generation speed moves with how many drafted tokens are accepted, so the ranges are wide. Your speed will differ.
+These results are from one PC: i7-14700KF, 32 GB DDR5-6000, RTX 4070 Ti 12 GB, two Samsung 990 PRO SSDs, Windows 11, IQ3_S and 262K context, 3 runs each. Generation speed moves with how many drafted tokens are accepted, so the ranges are wide. Short answers measured 46-50 tokens/s on 2026-11-08/09; why they are lower now isn't known yet. This PC's launcher adds opt-in prompt settings that aren't defaults (fused expert kernels, the tensor-core GDN scan, larger prompt chunks), listed with their quality checks on the measurements page. Your speed will differ.
 
-At the default 10 GiB cache, 3.5-4.4 GB of RAM stayed free in those tests and nothing was written to the page file. On the GPU, the engine sizes its expert cache to fill the card and keeps about 0.7 GB free. Giving it more RAM cache can leave too little memory for Windows and slow it down: 14 GiB was faster here but paged heavily. Start at 10 GiB and close other large apps.
+At the default 10 GiB cache, 2.7-2.8 GB of RAM stayed free in those tests and nothing was written to the page file. On the GPU, the engine sizes its expert cache to fill the card and keeps about 0.7 GB free. Giving it more RAM cache can leave too little memory for Windows and slow it down: 14 GiB was faster here but paged heavily. Start at 10 GiB and close other large apps.
 
 See [performance, memory measurements and updates](docs/fork/PERFORMANCE.md) for the test conditions and older comparisons. Answer quality has not been measured with a task suite.
 
