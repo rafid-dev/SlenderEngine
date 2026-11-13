@@ -18,12 +18,24 @@ constexpr int Q = 4, G = 8, R = Q * G, BK = 32, HD = 256, LDH = HD + 8, LDS = BK
 constexpr size_t kSmem = (size_t) R * LDH * 2 + (size_t) BK * LDH * 2 + (size_t) R * LDS * 4 + (size_t) R * LDP * 2 + 3 * R * 4 +
                          256 * 4;   // + the row-number matrix
 __device__ __forceinline__ void cp16(void* smem, const void* gmem, bool valid) {
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
     const unsigned sa = (unsigned) __cvta_generic_to_shared(smem);
     const int n = valid ? 16 : 0;   // 0: zero-fill
     asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(sa), "l"(gmem), "r"(n));
+#else   // before sm_80 (GTX 16, RTX 20): a plain copy, the same bytes (this kernel is off there by default: H3)
+    *reinterpret_cast<uint4*>(smem) = valid ? *reinterpret_cast<const uint4*>(gmem) : make_uint4(0, 0, 0, 0);
+#endif
 }
-__device__ __forceinline__ void commit() { asm volatile("cp.async.commit_group;\n" ::); }
-__device__ __forceinline__ void wait_all() { asm volatile("cp.async.wait_all;\n" ::); }
+__device__ __forceinline__ void commit() {
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
+    asm volatile("cp.async.commit_group;\n" ::);
+#endif
+}
+__device__ __forceinline__ void wait_all() {
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
+    asm volatile("cp.async.wait_all;\n" ::);
+#endif
+}
 }  // namespace fa2q
 
 __global__ void __launch_bounds__(256, 2) k_fa2q_prompt(const __half* __restrict__ q16, const __half* __restrict__ k16,

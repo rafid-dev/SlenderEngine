@@ -93,6 +93,7 @@ namespace MMQ = strata::prefill::mmq;
 
 using Clock = std::chrono::steady_clock;
 #if defined(_WIN32)
+#include <psapi.h>   // K32GetProcessMemoryInfo (the summary's page faults)
 #endif
 /// SP1 (Q36-S), STRATA_Q36_GGML_MOE=<q36_ggml_moe.dll>: the prompt's expert GEMMs (MUL_MAT_ID, SwiGLU, MUL_MAT_ID) on a current
 /// llama.cpp's ggml through that DLL (src/qwen35/q36_ggml_moe.cpp); the outputs in entry order t * K + k (no sorted rows)
@@ -132,6 +133,44 @@ q36moe_run_fn q36_ggml_moe() {
 #endif
     }();
     return fn;
+}
+/// V-TRIM (Q36-V, STRATA_Q36_TRIM=1): a host expert range out of the process's working set. The blob cache is a read-only
+/// file mapping, so its pages go to the standby list with nothing written and come back from the cache file (or standby)
+/// on the next read. Only whole pages inside the range, so a neighbour's pages stay.
+static void q36_fault_mark(const char* where) {   // STRATA_Q36_FAULTS=1: the process's page faults so far
+#if defined(_WIN32)
+    static const bool on = [] { const char* v = std::getenv("STRATA_Q36_FAULTS"); return v && v[0] == '1'; }();
+    if (!on) return;
+    PROCESS_MEMORY_COUNTERS pmc{};
+    pmc.cb = sizeof(pmc);
+    if (K32GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof(pmc)))
+        std::fprintf(stderr, "strata-q36: faults %s: %lu, working set %.2f GiB\n", where, (unsigned long) pmc.PageFaultCount,
+                     pmc.WorkingSetSize / 1073741824.0);
+#else
+    (void) where;
+#endif
+}
+static void q36_trim_range(const uint8_t* p, size_t n) {
+#if defined(_WIN32)
+    const uintptr_t pg = 4096, a = ((uintptr_t) p + pg - 1) & ~(pg - 1), b = ((uintptr_t) p + n) & ~(pg - 1);
+    if (b > a) (void) VirtualUnlock((LPVOID) a, (SIZE_T) (b - a));   // pages not locked: removed from the working set
+#else
+    (void) p;
+    (void) n;
+#endif
+}
+/// V-TRIM: experts that just left VRAM, read ahead from the cache file (asynchronous I/O into the standby list), so the CPU
+/// pool's first use of them is a soft fault, not a read from the SSD.
+static void q36_prefetch_ranges(const std::vector<std::pair<const uint8_t*, size_t>>& r) {
+#if defined(_WIN32)
+    if (r.empty()) return;
+    std::vector<WIN32_MEMORY_RANGE_ENTRY> e;
+    e.reserve(r.size());
+    for (const auto& [p, n] : r) e.push_back({(PVOID) p, (SIZE_T) n});
+    (void) PrefetchVirtualMemory(GetCurrentProcess(), (ULONG_PTR) e.size(), e.data(), 0);
+#else
+    (void) r;
+#endif
 }
 #if defined(_WIN32)
 extern "C" __declspec(dllimport) unsigned long long __stdcall SetThreadAffinityMask(void* thread, unsigned long long mask);
@@ -2064,12 +2103,24 @@ namespace fa2p {
 constexpr int Q = 8, G = 8, R = Q * G, BK = 32, HD = 256, LDH = HD + 8, LDS = BK + 4, LDP = BK + 8;
 constexpr size_t kSmem = (size_t) R * LDH * 2 + 2 * (size_t) BK * LDH * 2 + (size_t) R * LDS * 4 + (size_t) R * LDP * 2 + 3 * R * 4;
 __device__ __forceinline__ void cp16(void* smem, const void* gmem, bool valid) {
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
     const unsigned sa = (unsigned) __cvta_generic_to_shared(smem);
     const int n = valid ? 16 : 0;   // 0: zero-fill
     asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(sa), "l"(gmem), "r"(n));
+#else   // before sm_80 (GTX 16, RTX 20): a plain copy, the same bytes (this kernel is off there by default: H3)
+    *reinterpret_cast<uint4*>(smem) = valid ? *reinterpret_cast<const uint4*>(gmem) : make_uint4(0, 0, 0, 0);
+#endif
 }
-__device__ __forceinline__ void commit() { asm volatile("cp.async.commit_group;\n" ::); }
-__device__ __forceinline__ void wait_all() { asm volatile("cp.async.wait_all;\n" ::); }
+__device__ __forceinline__ void commit() {
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
+    asm volatile("cp.async.commit_group;\n" ::);
+#endif
+}
+__device__ __forceinline__ void wait_all() {
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
+    asm volatile("cp.async.wait_all;\n" ::);
+#endif
+}
 }  // namespace fa2p
 // R5 segments (STRATA_Q36_FA2_SEG): cells [c_lo, c_hi) only, k16 / v16 holding those cells from c_lo (ld_cells apart a KV
 // head); flags bit 0: the first segment (start from nothing), bit 1: the last (out = O / l). Between segments out holds the
@@ -3707,7 +3758,7 @@ struct ExpertStreamer {
             int alt = 0;
             for (const Seg& sg : j.segs) {
                 if (sg.dev) {
-                    CK(cudaMemcpyAsync(sg.dst, sg.src, sg.n, cudaMemcpyDeviceToDevice, cst));
+                    CK(cudaMemcpyAsync(sg.dst, sg.src, sg.n, cudaMemcpyDefault, cst));   // VRAM, or pinned host (V-TIER)
                     continue;
                 }
                 for (size_t off = 0; off < sg.n; off += chunk) {
@@ -3842,6 +3893,11 @@ struct Engine {
         std::vector<double> score;   // routing counts, halved at each rebalance
         std::vector<double> cum;     // decode routing counts, never halved (STRATA_Q36_SLOT_SAVE)
         int32_t* slot_of_d = nullptr;
+        // V-TIER (STRATA_Q36_TIER_GIB): pinned host copies of non-resident experts, tier_n slots `stride` apart
+        uint8_t* tier = nullptr;
+        int tier_n = 0;
+        std::vector<int> tier_of, tier_exp, tier_free;   // expert -> tier slot (-1), slot -> expert (-1), free slots
+        std::vector<char> tier_pend;                     // expert: a fill into the tier is under way
 #if defined(STRATA_Q36_CPU_POOL)
         strata::kernels::cpu::NativeFmt fmt;
 #endif
@@ -3991,13 +4047,14 @@ struct Engine {
     /// placement every run. Placement only (GPU and CPU experts round differently): not the same tokens as the
     /// synchronous rebalance.
     struct RaCopy { void* dst; const void* src; size_t bytes; };
-    struct RaPend { int li, x, s; };
+    struct RaPend { int li, x, s, y = -1, k = -1; };   // (V-TIER: y, evicted from s, copied to tier slot k by DMA)
     struct RaWorker {
         std::thread thr;
         std::mutex mu;
         std::condition_variable cv;
         std::vector<RaCopy> work;
-        bool has = false, stop = false;
+        std::vector<std::pair<const uint8_t*, size_t>> trims;   // V-TRIM: host ranges to drop from the working set
+        bool has = false, stop = false, aux = false;
         std::atomic<bool> done{true};
         cudaStream_t rs = nullptr;
         int dev = 0;
@@ -4021,17 +4078,272 @@ struct Engine {
         CK(cudaSetDevice(ra.dev));
         for (;;) {
             std::vector<RaCopy> w;
+            std::vector<std::pair<const uint8_t*, size_t>> tr;
+            bool copy = false;
             {
                 std::unique_lock<std::mutex> lk(ra.mu);
-                ra.cv.wait(lk, [&] { return ra.stop || ra.has; });
-                if (!ra.has) return;
-                w.swap(ra.work);
-                ra.has = false;
+                ra.cv.wait(lk, [&] { return ra.stop || ra.has || ra.aux; });
+                if (!ra.has && !ra.aux) return;
+                if (ra.has) {
+                    w.swap(ra.work);
+                    ra.has = false;
+                    copy = true;
+                }
+                tr.swap(ra.trims);
+                ra.aux = false;
             }
-            for (const RaCopy& c : w) CK(cudaMemcpyAsync(c.dst, c.src, c.bytes, cudaMemcpyHostToDevice, ra.rs));
-            CK(cudaStreamSynchronize(ra.rs));
-            ra.done.store(true, std::memory_order_release);
+            if (copy) {
+                for (const RaCopy& c : w) CK(cudaMemcpyAsync(c.dst, c.src, c.bytes, cudaMemcpyDefault, ra.rs));   // (V-TIER: D2H too)
+                CK(cudaStreamSynchronize(ra.rs));
+                ra.done.store(true, std::memory_order_release);
+            }
+            for (const auto& [p, n] : tr) q36_trim_range(p, n);
         }
+    }
+    /// V-TRIM (STRATA_Q36_TRIM=1, set at load with the file-mapped blob cache): the host copies of experts in a main VRAM slot
+    /// stay out of the working set. Nothing reads them while the expert is resident (prompts stream resident experts from
+    /// their slots under it, the TS1 copy list); if the expert leaves VRAM they come back from the cache file. Extra slots
+    /// (staging, given up at every streamed prompt) are left alone. Placement and every output are unchanged.
+    bool trim_on = false;
+    int trim_mode = 0;          // 1: also on every decode swap (V-TRIM, slower); 2: at load and after streamed prompts (V-TRIM2)
+    bool trim_streamed = false; // V-TRIM2: a prompt streamed whole layers from host memory (resident experts' pages read again)
+    long long trim_n = 0, trim_pf = 0, trim_prompts = 0;
+    void trim_post(std::vector<std::pair<const uint8_t*, size_t>>& v) {   // off the engine thread when the rebalance worker runs
+        if (v.empty()) return;
+        trim_n += (long long) v.size();
+        if (ra.thr.joinable()) {
+            {
+                std::lock_guard<std::mutex> lk(ra.mu);
+                ra.trims.insert(ra.trims.end(), v.begin(), v.end());
+                ra.aux = true;
+            }
+            ra.cv.notify_one();
+        } else {
+            for (const auto& [p, n] : v) q36_trim_range(p, n);
+        }
+        v.clear();
+    }
+    void trim_prefetch(std::vector<std::pair<const uint8_t*, size_t>>& v) {
+        if (v.empty()) return;
+        trim_pf += (long long) v.size();
+        q36_prefetch_ranges(v);
+        v.clear();
+    }
+    /// V-TRIM2 (STRATA_Q36_TRIM=2): after a prompt that streamed whole layers (which reads every resident expert's host copy
+    /// again), the main-slot residents' host copies leave the working set once more. Decode swaps are left alone.
+    void trim_after_prompt() {
+        if (trim_mode != 2 || !trim_streamed) return;
+        trim_streamed = false;
+        ++trim_prompts;
+        std::vector<std::pair<const uint8_t*, size_t>> v;
+        for (size_t li = 0; li < hy.size(); ++li) {
+            const Hy& H = hy[li];
+            const Layer& L = layer_at((int) li);
+            if (!L.hblobs) continue;
+            for (int s_ = 0; s_ < H.n_main && s_ < (int) H.exp_in_slot.size(); ++s_) {
+                const int x = H.exp_in_slot[(size_t) s_];
+                if (x >= 0) v.push_back({L.hblobs + (size_t) x * L.stride, L.L.bytes});
+            }
+        }
+        trim_post(v);
+    }
+    /// V-TIER (Q36-V, STRATA_Q36_TIER_GIB=<GiB>, with the file-mapped blob cache): pinned host copies of the experts that are
+    /// not in a VRAM slot, up to the budget, per layer (Hy::tier). The CPU pool, slot uploads and the prompt stream read an
+    /// expert from its tier copy when it has one (pinned: the stream and the uploads go by DMA), else from the mapped file.
+    /// At every rebalance an expert that entered VRAM gives its tier slot back and the free slots (then, with a budget under
+    /// all the non-resident experts, the lowest scores) go to the highest-scoring experts without a copy, filled from the
+    /// mapped file on a thread of their own (the mapped pages dropped from the working set after). The same bytes everywhere:
+    /// placement and every output are unchanged. The engine holds the tier and what it streams of the rest, a fixed amount,
+    /// instead of the whole mapped file.
+    bool tier_on = false;
+    int tier_swaps = 8;   // replacements a layer a rebalance when the budget is under the non-resident experts
+    struct TierFill { int li, x, k; };
+    struct TierWorker {
+        std::thread thr;
+        std::mutex mu;
+        std::condition_variable cv;
+        std::vector<TierFill> todo, done;
+        std::vector<std::pair<const uint8_t*, size_t>> trims;   // mapped ranges of committed fills
+        bool stop = false;
+        ~TierWorker() {
+            if (!thr.joinable()) return;
+            {
+                std::lock_guard<std::mutex> lk(mu);
+                stop = true;
+            }
+            cv.notify_all();
+            thr.join();
+        }
+    } tw;
+    long long tier_fills = 0, tier_released = 0, tier_replaced = 0, tier_dma = 0;
+    int tier_fill_cap = 256;   // fills from the mapped file a rebalance (a burst of CPU copies slows the CPU pool)
+    static int tier_take(Hy& H) {
+        if (H.tier_free.empty()) return -1;
+        const int k = H.tier_free.back();
+        H.tier_free.pop_back();
+        return k;
+    }
+    /// A tier slot for expert y, which is leaving VRAM (its copy goes there by DMA from its old slot): a free one, else the
+    /// coldest member's if that is colder than y (the member reads the mapped file from here, its pages read ahead); -1: y
+    /// itself is the coldest (its mapped pages read ahead instead). Experts whose tier copy an async upload reads are kept.
+    int tier_slot_for(size_t li, int y) {
+        Hy& H = hy[li];
+        if (!tier_on || H.tier_n <= 0 || H.tier_of[(size_t) y] >= 0) return -1;
+        int k = tier_take(H);
+        const Layer& L = layer_at((int) li);
+        std::vector<std::pair<const uint8_t*, size_t>> pf;
+        if (k < 0) {
+            int best = -1;
+            double bs = H.score[(size_t) y];
+            for (int kk = 0; kk < H.tier_n; ++kk) {
+                const int v = H.tier_exp[(size_t) kk];
+                if (v < 0 || H.score[(size_t) v] >= bs) continue;
+                bool busy = false;
+                for (const RaPend& q : ra_pend)
+                    if ((size_t) q.li == li && q.x == v) busy = true;
+                if (busy) continue;
+                best = kk;
+                bs = H.score[(size_t) v];
+            }
+            if (best >= 0) {
+                const int v = H.tier_exp[(size_t) best];
+                H.tier_of[(size_t) v] = -1;
+                H.tier_exp[(size_t) best] = -1;
+                ++tier_replaced;
+                pf.push_back({L.hblobs + (size_t) v * L.stride, L.L.bytes});
+                k = best;
+            } else {
+                pf.push_back({L.hblobs + (size_t) y * L.stride, L.L.bytes});
+            }
+        }
+        if (!pf.empty()) q36_prefetch_ranges(pf);
+        return k;
+    }
+    const uint8_t* hptr(size_t li, const Layer& L, int x) const {
+        if (tier_on) {
+            const Hy& H = hy[li];
+            if (!H.tier_of.empty()) {
+                const int k = H.tier_of[(size_t) x];
+                if (k >= 0) return H.tier + (size_t) k * L.stride;
+            }
+        }
+        return L.hblobs + (size_t) x * L.stride;
+    }
+    void tier_loop() {
+        for (;;) {
+            TierFill f{};
+            bool have = false;
+            std::vector<std::pair<const uint8_t*, size_t>> tr;
+            {
+                std::unique_lock<std::mutex> lk(tw.mu);
+                tw.cv.wait(lk, [&] { return tw.stop || !tw.todo.empty() || !tw.trims.empty(); });
+                if (tw.todo.empty() && tw.trims.empty()) return;
+                tr.swap(tw.trims);
+                if (!tw.todo.empty()) {
+                    f = tw.todo.back();
+                    tw.todo.pop_back();
+                    have = true;
+                }
+            }
+            for (const auto& [p, n] : tr) q36_trim_range(p, n);   // committed: the CPU pool reads the tier copy now
+            if (!have) continue;
+            const Layer& L = layer_at(f.li);
+            const Hy& H = hy[(size_t) f.li];
+            std::memcpy(H.tier + (size_t) f.k * L.stride, L.hblobs + (size_t) f.x * L.stride, L.L.bytes);
+            std::lock_guard<std::mutex> lk(tw.mu);
+            tw.done.push_back(f);
+        }
+    }
+    void tier_commit() {   // finished fills into the tables (engine thread, between steps)
+        if (!tier_on) return;
+        std::vector<TierFill> d;
+        {
+            std::lock_guard<std::mutex> lk(tw.mu);
+            d.swap(tw.done);
+        }
+        if (d.empty()) return;
+        std::vector<std::pair<const uint8_t*, size_t>> tr;
+        for (const TierFill& f : d) {
+            Hy& H = hy[(size_t) f.li];
+            H.tier_pend[(size_t) f.x] = 0;
+            if (H.slot_of[(size_t) f.x] >= 0 || H.tier_of[(size_t) f.x] >= 0) {
+                H.tier_free.push_back(f.k);
+                continue;
+            }
+            H.tier_of[(size_t) f.x] = f.k;
+            H.tier_exp[(size_t) f.k] = f.x;
+            ++tier_fills;
+            const Layer& L = layer_at(f.li);
+            tr.push_back({L.hblobs + (size_t) f.x * L.stride, L.L.bytes});
+        }
+        if (tr.empty()) return;
+        {
+            std::lock_guard<std::mutex> lk(tw.mu);
+            tw.trims.insert(tw.trims.end(), tr.begin(), tr.end());
+        }
+        tw.cv.notify_all();
+    }
+    void tier_plan() {   // after a rebalance's uploads: give back, fill, replace
+        static const bool frozen = [] { const char* v = std::getenv("STRATA_Q36_TIER_ADAPT"); return v && v[0] == '0'; }();
+        if (!tier_on || frozen) return;   // STRATA_Q36_TIER_ADAPT=0: the first fill only (tests)
+        const int ne = (int) m->g.n_expert;
+        std::vector<TierFill> add;
+        for (size_t li = 0; li < hy.size(); ++li) {
+            Hy& H = hy[li];
+            if (H.tier_n <= 0) continue;
+            for (int k = 0; k < H.tier_n; ++k) {   // residents (slot_of is set only after their uploads) give their slots back
+                const int x = H.tier_exp[(size_t) k];
+                if (x >= 0 && H.slot_of[(size_t) x] >= 0) {
+                    H.tier_of[(size_t) x] = -1;
+                    H.tier_exp[(size_t) k] = -1;
+                    H.tier_free.push_back(k);
+                    ++tier_released;
+                }
+            }
+            std::vector<char> busy((size_t) ne, 0);   // an async upload still reads its tier copy
+            for (const RaPend& q : ra_pend)
+                if ((size_t) q.li == li) busy[(size_t) q.x] = 1;
+            std::vector<int> want;
+            for (int x = 0; x < ne; ++x)
+                if (H.slot_of[(size_t) x] < 0 && H.tier_of[(size_t) x] < 0 && !H.tier_pend[(size_t) x] && !busy[(size_t) x])
+                    want.push_back(x);
+            if (want.empty()) continue;
+            std::stable_sort(want.begin(), want.end(), [&](int a, int b) { return H.score[(size_t) a] > H.score[(size_t) b]; });
+            size_t wi = 0;
+            for (; wi < want.size() && !H.tier_free.empty() && (int) add.size() < tier_fill_cap; ++wi) {
+                const int k = H.tier_free.back();
+                H.tier_free.pop_back();
+                H.tier_pend[(size_t) want[wi]] = 1;
+                add.push_back({(int) li, want[wi], k});
+            }
+            if (wi < want.size()) {
+                std::vector<int> mem;
+                for (int k = 0; k < H.tier_n; ++k) {
+                    const int x = H.tier_exp[(size_t) k];
+                    if (x >= 0 && !busy[(size_t) x]) mem.push_back(k);
+                }
+                std::stable_sort(mem.begin(), mem.end(), [&](int a, int b) {
+                    return H.score[(size_t) H.tier_exp[(size_t) a]] < H.score[(size_t) H.tier_exp[(size_t) b]];
+                });
+                int cap = tier_swaps;
+                for (size_t mi = 0; mi < mem.size() && wi < want.size() && cap > 0 && (int) add.size() < tier_fill_cap;
+                     ++mi, ++wi, --cap) {
+                    const int k = mem[mi], v = H.tier_exp[(size_t) k], x = want[wi];
+                    if (H.score[(size_t) v] >= H.score[(size_t) x]) break;
+                    H.tier_of[(size_t) v] = -1;   // v reads the mapped file from here
+                    H.tier_exp[(size_t) k] = -1;
+                    H.tier_pend[(size_t) x] = 1;
+                    add.push_back({(int) li, x, k});
+                    ++tier_replaced;
+                }
+            }
+        }
+        if (add.empty()) return;
+        {
+            std::lock_guard<std::mutex> lk(tw.mu);
+            tw.todo.insert(tw.todo.end(), add.begin(), add.end());
+        }
+        tw.cv.notify_all();
     }
     void ra_start() {   // the copies planned by rebalance(.., async) to the worker
         if (ra_build.empty()) return;
@@ -4053,12 +4365,25 @@ struct Engine {
         ra_wait_ms += ms_since(t0);
         CK(cudaStreamSynchronize(st));   // (no upload of a slot table still in flight)
         std::vector<char> ch(hy.size(), 0);
+        std::vector<std::pair<const uint8_t*, size_t>> tr;
         for (const RaPend& q : ra_pend) {
             Hy& H = hy[(size_t) q.li];
             H.slot_of[(size_t) q.x] = q.s;
             H.exp_in_slot[(size_t) q.s] = q.x;
             ch[(size_t) q.li] = 1;
+            if (q.k >= 0 && H.tier_of[(size_t) q.y] < 0 && H.slot_of[(size_t) q.y] < 0) {   // V-TIER: y's copy from its old slot is in
+                H.tier_of[(size_t) q.y] = q.k;
+                H.tier_exp[(size_t) q.k] = q.y;
+                ++tier_dma;
+            } else if (q.k >= 0) {
+                H.tier_free.push_back(q.k);
+            }
+            if (trim_mode == 1 && q.s < H.n_main) {   // V-TRIM: resident now, the CPU pool no longer reads it
+                const Layer& L = layer_at(q.li);
+                tr.push_back({L.hblobs + (size_t) q.x * L.stride, L.L.bytes});
+            }
         }
+        trim_post(tr);
         for (size_t li = 0; li < hy.size(); ++li)
             if (ch[li]) CK(cudaMemcpyAsync(hy[li].slot_of_d, hy[li].slot_of.data(), (size_t) m->g.n_expert * 4,
                                            cudaMemcpyHostToDevice, st));
@@ -4126,6 +4451,7 @@ struct Engine {
     void after_rows(int n) {   // a decode step / verify window kept n rows: count them, rebalance at the boundary
         if (!m->hybrid) return;
         count_rows(n);
+        tier_commit();   // V-TIER: finished fills take over at once (they read the mapped file until then)
         if (!ra_pend.empty() && pos >= ra_commit_at) {
             const auto t0 = Clock::now();
             ra_finish();
@@ -4406,11 +4732,25 @@ struct Engine {
             Hy& H = hy[d];
             const int k = (int) ((2 * vb + D.stride - 1) / D.stride);
             const int top = H.n_main - k;   // slot ids [top, n_main): the main ids are 0 .. n_main - 1, first in H.slots
+            std::vector<std::pair<const uint8_t*, size_t>> pf;   // V-TRIM: the evicted experts read ahead for the CPU pool
             for (int id = top; id < H.n_main; ++id) {
                 const int y = H.exp_in_slot[(size_t) id];
-                if (y >= 0) H.slot_of[(size_t) y] = -1;
+                if (y >= 0) {
+                    H.slot_of[(size_t) y] = -1;
+                    if (trim_mode == 1) pf.push_back({D.hblobs + (size_t) y * D.stride, D.L.bytes});
+                    const int tk = tier_slot_for(d, y);   // V-TIER: its copy to the tier by DMA, before the slot is cleared
+                    if (tk >= 0) {
+                        CK(cudaMemcpyAsync(H.tier + (size_t) tk * D.stride, D.blobs + (size_t) id * D.stride, D.L.bytes,
+                                           cudaMemcpyDeviceToHost, st));
+                        H.tier_of[(size_t) y] = tk;
+                        H.tier_exp[(size_t) tk] = y;
+                        ++tier_dma;
+                    }
+                }
                 H.exp_in_slot[(size_t) id] = -1;
             }
+            if (tier_on) CK(cudaStreamSynchronize(st));
+            trim_prefetch(pf);
             H.slots.erase(H.slots.begin() + top, H.slots.begin() + H.n_main);
             H.n_main = top;
             CK(cudaMemcpy(H.slot_of_d, H.slot_of.data(), (size_t) m->g.n_expert * 4, cudaMemcpyHostToDevice));
@@ -6521,9 +6861,43 @@ struct Engine {
         // STRATA_Q36_STREAM_SPLIT=N > 1: a resident run of under N consecutive-slot experts is copied from host memory with its
         // neighbours (fewer, longer copies: after a long prompt's rebalance the resident experts sit in short runs)
         static const int split_n = [] { const char* v = std::getenv("STRATA_Q36_STREAM_SPLIT"); return v ? std::max(0, std::atoi(v)) : 0; }();
-        static const bool split_res = split_n > 0;
+        // V-TRIM: the resident experts' host copies are out of the working set, so they come from their slots too
+        const bool split_res = split_n > 0 || trim_mode == 1;
         const int ne = (int) m->g.n_expert;
         const Hy& H = hy[(size_t) stream_seq[(size_t) i]];
+        if (tier_on && !all) {   // V-TIER: each expert from its VRAM slot, its pinned tier copy (both by DMA) or the mapped file
+            std::vector<ExpertStreamer::Seg> segs;
+            for (int x = 0; x < ne; ++x) {
+                const uint8_t* src;
+                bool direct = true;
+                const int s_ = H.slot_of[(size_t) x];
+                if (s_ >= 0) src = L.blobs + (size_t) s_ * L.stride;
+                else if (!H.tier_of.empty() && H.tier_of[(size_t) x] >= 0) src = H.tier + (size_t) H.tier_of[(size_t) x] * L.stride;
+                else {
+                    src = L.hblobs + (size_t) x * L.stride;
+                    direct = false;
+                }
+                uint8_t* dst = stage[b] + (size_t) x * L.stride;
+                if (!segs.empty() && segs.back().dev == direct && segs.back().src + segs.back().n == src &&
+                    segs.back().dst + segs.back().n == dst)
+                    segs.back().n += L.stride;
+                else
+                    segs.push_back({dst, src, L.stride, direct});
+            }
+            if (streamer) {
+                kick_job[b] = streamer->submit(std::move(segs), ev_used[b], ev_copy[b]);
+                if (prof_on()) prof_host_ms += ms_since(kick_t0);
+                return;
+            }
+            for (const auto& sg : segs)
+                CK(cudaMemcpyAsync(sg.dst, sg.src, sg.n, sg.dev ? cudaMemcpyDefault : cudaMemcpyHostToDevice, cst));
+            if (prof_on()) {
+                CK(cudaEventRecord(prof_ev[prof_n++].second, cst));
+                prof_host_ms += ms_since(kick_t0);
+            }
+            CK(cudaEventRecord(ev_copy[b], cst));
+            return;
+        }
         // the copy list: runs [x, y) from the VRAM slots (dev) or from host memory
         std::vector<std::array<int, 3>> runs;
         {
@@ -6552,6 +6926,7 @@ struct Engine {
             std::vector<ExpertStreamer::Seg> segs;
             if (all || (!split_res && 2 * L.n_slots < ne)) {
                 segs.push_back({stage[b], L.hblobs, L.stride * (size_t) ne, false});
+                trim_streamed = true;
             } else {
                 for (const auto& [x, y, dev] : runs) {
                     const size_t n = (size_t) (y - x) * L.stride;
@@ -6566,6 +6941,7 @@ struct Engine {
         }
         if (all || (!split_res && 2 * L.n_slots < ne)) {
             CK(cudaMemcpyAsync(stage[b], L.hblobs, L.stride * (size_t) ne, cudaMemcpyHostToDevice, cst));
+            trim_streamed = true;
         } else {
             for (const auto& [x, y, dev] : runs) {   // (consecutive slots holding consecutive experts, or host runs)
                 const size_t n = (size_t) (y - x) * L.stride;
@@ -6743,7 +7119,7 @@ struct Engine {
             auto it = open.find(x);
             if (it == open.end() || jobs[it->second].nt == C::MAXT) {
                 C::ExpertJobMulti j;
-                j.blob = L.hblobs + (size_t) x * L.stride;
+                j.blob = hptr(li, L, x);   // (V-TIER: its pinned copy when it has one)
                 jobs.push_back(j);
                 it = open.insert_or_assign(x, jobs.size() - 1).first;
             }
@@ -6776,6 +7152,7 @@ struct Engine {
         if (!m->hybrid || off || warming) return;
         ra_finish();
         const int64_t ne = m->g.n_expert;
+        std::vector<std::pair<const uint8_t*, size_t>> tr_in, pf_out;   // V-TRIM: incoming main-slot experts, evicted ones
         if (!xs_active && with_extras) {
             for (Hy& H : hy) H.slots.insert(H.slots.end(), H.xslots.begin(), H.xslots.end());
             xs_active = true;
@@ -6810,20 +7187,38 @@ struct Engine {
                     if (H.score[(size_t) y] >= H.score[(size_t) x] || left <= 0) break;
                     --left;
                     H.slot_of[(size_t) y] = -1;
+                    if (trim_mode == 1 && s_ < H.n_main) pf_out.push_back({L.hblobs + (size_t) y * L.stride, L.L.bytes});
                 }
                 ++vi;
+                int tk = -1;   // V-TIER: the evicted expert's tier slot, filled from its VRAM slot by DMA
+                if (tier_on && y >= 0) tk = tier_slot_for(li, y);
                 if (async) {   // the slot stays empty until ra_finish(); x on the CPU pool until then
                     H.exp_in_slot[(size_t) s_] = -1;
-                    ra_build.push_back({L.blobs + (size_t) s_ * L.stride, L.hblobs + (size_t) x * L.stride, L.L.bytes});
-                    ra_pend.push_back({(int) li, x, s_});
+                    if (tk >= 0) ra_build.push_back({H.tier + (size_t) tk * L.stride, L.blobs + (size_t) s_ * L.stride, L.L.bytes});
+                    ra_build.push_back({L.blobs + (size_t) s_ * L.stride, hptr(li, L, x), L.L.bytes});
+                    ra_pend.push_back({(int) li, x, s_, y, tk});
                     ++hy_swaps;
                     changed = changed || y >= 0;
                     continue;
                 }
+                if (tk >= 0) {   // (stream order: this copy lands before the upload below overwrites the slot)
+                    CK(cudaMemcpyAsync(H.tier + (size_t) tk * L.stride, L.blobs + (size_t) s_ * L.stride, L.L.bytes,
+                                       cudaMemcpyDeviceToHost, st));
+                    H.tier_of[(size_t) y] = tk;   // (read only after this rebalance's synchronize)
+                    H.tier_exp[(size_t) tk] = y;
+                    ++tier_dma;
+                }
+                const int kx = tier_on && H.tier_n > 0 ? H.tier_of[(size_t) x] : -1;
                 H.slot_of[(size_t) x] = s_;
                 H.exp_in_slot[(size_t) s_] = x;
-                CK(cudaMemcpyAsync(L.blobs + (size_t) s_ * L.stride, L.hblobs + (size_t) x * L.stride, L.L.bytes,
-                                   cudaMemcpyHostToDevice, st));
+                CK(cudaMemcpyAsync(L.blobs + (size_t) s_ * L.stride, hptr(li, L, x), L.L.bytes, cudaMemcpyHostToDevice, st));
+                if (kx >= 0) {   // x's tier slot is free once its upload is done: stream order covers a later DMA into it
+                    H.tier_of[(size_t) x] = -1;
+                    H.tier_exp[(size_t) kx] = -1;
+                    H.tier_free.push_back(kx);
+                    ++tier_released;
+                }
+                if (trim_mode == 1 && s_ < H.n_main) tr_in.push_back({L.hblobs + (size_t) x * L.stride, L.L.bytes});
                 ++hy_swaps;
                 changed = true;
             }
@@ -6833,6 +7228,10 @@ struct Engine {
         }
         CK(cudaStreamSynchronize(st));   // slot_of's host copy is pageable: the upload is done before it changes
         if (async) ra_start();           // (after the evictions' tables: no forward reads those slots any more)
+        trim_prefetch(pf_out);           // V-TRIM (the synchronous copies above are done: their sources can go)
+        trim_post(tr_in);
+        tier_commit();                   // V-TIER
+        tier_plan();
     }
     /// A streamed prompt forward overwrites the staging buffers: the extra slots there give their experts up first
     /// (those experts are read from host memory again until rebalance() refills them).
@@ -6841,13 +7240,26 @@ struct Engine {
         if (!xs_active) return;
         CK(cudaStreamSynchronize(st));
         const int64_t ne = m->g.n_expert;
-        for (Hy& H : hy) {
+        for (size_t li = 0; li < hy.size(); ++li) {
+            Hy& H = hy[li];
             if (H.xslots.empty()) continue;
+            const Layer& L = layer_at((int) li);
             for (int s_ : H.xslots) {
                 const int y = H.exp_in_slot[(size_t) s_];
+                if (y >= 0 && tier_on) {   // V-TIER: its copy to the tier by DMA
+                    const int k = tier_slot_for(li, y);
+                    if (k >= 0) {
+                        CK(cudaMemcpyAsync(H.tier + (size_t) k * L.stride, L.blobs + (size_t) s_ * L.stride, L.L.bytes,
+                                           cudaMemcpyDeviceToHost, st));
+                        H.tier_of[(size_t) y] = k;
+                        H.tier_exp[(size_t) k] = y;
+                        ++tier_dma;
+                    }
+                }
                 if (y >= 0) H.slot_of[(size_t) y] = -1;
                 H.exp_in_slot[(size_t) s_] = -1;
             }
+            if (tier_on) CK(cudaStreamSynchronize(st));
             H.slots.resize((size_t) H.n_main);
             CK(cudaMemcpy(H.slot_of_d, H.slot_of.data(), (size_t) ne * 4, cudaMemcpyHostToDevice));
         }
@@ -7062,7 +7474,7 @@ struct Engine {
                 CK(cudaStreamSynchronize(st));
                 if (ck_req == pos && !ck_req_done) { ck_save(ck_req_ids, ck_req); ck_req_done = true; }
                 if (!on_chunk(i)) {
-                    if (m->hybrid) { rebalance(hybrid_swaps_after_prompt, false); prompt_decay(n); } r6_after_prompt();
+                    if (m->hybrid) { rebalance(hybrid_swaps_after_prompt, false); prompt_decay(n); } r6_after_prompt(); trim_after_prompt(); q36_fault_mark("after a prompt");
                     return i;
                 }
                 continue;
@@ -7090,12 +7502,12 @@ struct Engine {
             mtab_now = nullptr;
             map_on = false;
             if (!on_chunk(i + T)) {
-                if (m->hybrid) { rebalance(hybrid_swaps_after_prompt, false); prompt_decay(n); } r6_after_prompt();
+                if (m->hybrid) { rebalance(hybrid_swaps_after_prompt, false); prompt_decay(n); } r6_after_prompt(); trim_after_prompt(); q36_fault_mark("after a prompt");
                 return i + T;
             }
             i += T;
         }
-        if (m->hybrid) { rebalance(hybrid_swaps_after_prompt, false); prompt_decay(n); } r6_after_prompt();
+        if (m->hybrid) { rebalance(hybrid_swaps_after_prompt, false); prompt_decay(n); } r6_after_prompt(); trim_after_prompt(); q36_fault_mark("after a prompt");
         return n;
     }
     /// STRATA_Q36_PROMPT_DECAY=1 (opt-in): after a prompt of more than a few hundred tokens, its routing counts are
@@ -7178,6 +7590,7 @@ struct Engine {
         rows_G_last = G;
         if (m->hybrid) {
             count_rows(T);
+            tier_commit();
             if (++win_count % rebal_every() == 0) rebalance(rebal_swaps());
         }
     }
@@ -8076,6 +8489,114 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
         if (H.fmt.up_off != L.L.up_off || H.fmt.down_off != L.L.down_off || H.fmt.bytes != L.L.bytes) {
             err = "the CPU and GPU expert layouts differ";
             return false;
+        }
+    }
+    // V-TIER (Q36-V, STRATA_Q36_TIER_GIB=<GiB>): pinned copies of the non-resident experts up to the budget; see Engine::tier_on
+    if (const char* gv = std::getenv("STRATA_Q36_TIER_GIB"); gv && std::atof(gv) > 0) {
+        if (!mapped) {
+            std::fprintf(stderr, "strata-q36: STRATA_Q36_TIER_GIB needs the file-mapped blob cache (the experts are %s): off\n",
+                         pinned ? "pinned" : "a private copy");
+        } else {
+            const auto tt0 = Clock::now();
+            const double budget = std::atof(gv) * 1073741824.0;
+            size_t per_all = 0;
+            int max_non = 0;
+            for (size_t li = 0; li < all.size() && li < E.hy.size(); ++li)
+                if (all[li]->hblobs) {
+                    per_all += all[li]->stride;
+                    max_non = std::max(max_non, (int) ne - E.hy[li].n_main);
+                }
+            const int K = per_all ? (int) std::min<double>((double) max_non, budget / (double) per_all) : 0;
+            struct Job { size_t li; int x, k; };
+            std::vector<Job> fill;
+            size_t got = 0;
+            int layers = 0, layers_short = 0;
+            for (size_t li = 0; li < all.size() && li < E.hy.size() && K > 0; ++li) {
+                const Layer& L = *all[li];
+                Engine::Hy& H = E.hy[li];
+                if (!L.hblobs) continue;
+                static const int spare = [] { const char* v = std::getenv("STRATA_Q36_TIER_SPARE"); return v ? std::max(0, std::atoi(v)) : 4; }();
+                const int k = std::min(K, (int) ne - H.n_main) + spare;   // + spares: the slots evicted experts are copied into
+                if (k <= spare) continue;
+                if (cudaHostAlloc((void**) &H.tier, (size_t) k * L.stride, cudaHostAllocDefault) != cudaSuccess) {
+                    (void) cudaGetLastError();
+                    H.tier = nullptr;
+                    ++layers_short;
+                    continue;
+                }
+                H.tier_n = k;
+                H.tier_of.assign((size_t) ne, -1);
+                H.tier_exp.assign((size_t) k, -1);
+                H.tier_pend.assign((size_t) ne, 0);
+                H.tier_free.clear();
+                int kk = 0;
+                for (int x = 0; x < (int) ne && kk < k; ++x)
+                    if (H.slot_of[(size_t) x] < 0) {
+                        H.tier_of[(size_t) x] = kk;
+                        H.tier_exp[(size_t) kk] = x;
+                        fill.push_back({li, x, kk});
+                        ++kk;
+                    }
+                for (int r = k - 1; r >= kk; --r) H.tier_free.push_back(r);
+                got += (size_t) k * L.stride;
+                ++layers;
+            }
+            {   // the first fill from the mapped file, in parallel; then its pages and the residents' leave the working set
+                const int nt = 8;
+                std::atomic<size_t> next{0};
+                std::vector<std::thread> th;
+                for (int t = 0; t < nt; ++t)
+                    th.emplace_back([&] {
+                        for (size_t j; (j = next.fetch_add(1)) < fill.size();) {
+                            const Layer& L = *all[fill[j].li];
+                            const uint8_t* src = L.hblobs + (size_t) fill[j].x * L.stride;
+                            std::memcpy(E.hy[fill[j].li].tier + (size_t) fill[j].k * L.stride, src, L.L.bytes);
+                            q36_trim_range(src, L.L.bytes);
+                        }
+                    });
+                for (auto& t : th) t.join();
+            }
+            // (the VRAM residents' mapped pages stay: an expert leaving VRAM is read from them until its tier copy is filled, and
+            // the fill drops them then; trimming them here made every eviction a read from the SSD)
+            if (const char* sv = std::getenv("STRATA_Q36_TIER_SWAPS")) E.tier_swaps = std::max(0, std::atoi(sv));
+            if (const char* fv = std::getenv("STRATA_Q36_TIER_FILLS")) E.tier_fill_cap = std::max(0, std::atoi(fv));
+            E.tier_on = layers > 0;
+            if (E.tier_on) {
+                Engine* pe = &E;
+                E.tw.thr = std::thread([pe] { pe->tier_loop(); });
+            }
+            q36_fault_mark("after the tier fill");
+            std::fprintf(stderr, "strata-q36: STRATA_Q36_TIER_GIB=%s: %d of up to %d non-resident experts a layer in pinned memory "
+                         "(%.2f GiB, %d layers%s), %zu filled in %.1f s\n", gv, K, max_non, got / 1073741824.0, layers,
+                         layers_short ? ", some layers without: pinning failed" : "", fill.size(), ms_since(tt0) / 1000.0);
+        }
+    }
+    // V-TRIM (Q36-V, STRATA_Q36_TRIM=1): with the file-mapped blob cache, the first slots' host copies (just read by the
+    // uploads above) leave the working set; see Engine::trim_on
+    if (const char* tv = std::getenv("STRATA_Q36_TRIM"); tv && (tv[0] == '1' || tv[0] == '2')) {
+        if (!mapped) {
+            std::fprintf(stderr, "strata-q36: STRATA_Q36_TRIM=1 needs the file-mapped blob cache (the experts are %s): off\n",
+                         pinned ? "pinned" : "a private copy");
+        } else {
+            E.trim_on = true;
+            E.trim_mode = tv[0] - '0';
+            size_t n = 0, bytes = 0;
+            for (size_t li = 0; li < all.size() && li < E.hy.size(); ++li) {
+                const Layer& L = *all[li];
+                const Engine::Hy& H = E.hy[li];
+                if (!L.hblobs) continue;
+                for (int s_ = 0; s_ < H.n_main && s_ < (int) H.exp_in_slot.size(); ++s_) {
+                    const int x = H.exp_in_slot[(size_t) s_];
+                    if (x < 0) continue;
+                    q36_trim_range(L.hblobs + (size_t) x * L.stride, L.L.bytes);
+                    ++n;
+                    bytes += L.L.bytes;
+                }
+            }
+            std::fprintf(stderr, "strata-q36: STRATA_Q36_TRIM=%d: %zu resident experts' host copies out of the working set "
+                         "(%.2f GiB); %s\n", E.trim_mode, n, bytes / 1073741824.0,
+                         E.trim_mode == 1 ? "prompts stream them from their slots, decode swaps trimmed"
+                                          : "again after each streamed prompt, decode swaps left alone");
         }
     }
     const size_t T = (size_t) E.tmax, N = (size_t) g.n_embd, Kp = (size_t) m.top_k;
@@ -9305,6 +9826,22 @@ int strata::qwen35::run(int argc, char** argv) {
             std::fprintf(stderr, "strata-q36: hybrid experts: %lld of %lld batch entries on the GPU (%.1f%%), %lld on the "
                          "CPU pool in %.0f ms, %lld slot replacements\n", E.hy_gpu, n, n ? 100.0 * E.hy_gpu / n : 0.0,
                          E.hy_cpu, E.hy_cpu_ms, E.hy_swaps);
+#if defined(_WIN32)
+            {   // V-TIER diagnosis: the process's page faults and working set
+                PROCESS_MEMORY_COUNTERS pmc{};
+                pmc.cb = sizeof(pmc);
+                if (K32GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof(pmc)))
+                    std::fprintf(stderr, "strata-q36: process: %lu page faults, working set %.2f GiB (peak %.2f), pagefile %.2f GiB\n",
+                                 (unsigned long) pmc.PageFaultCount, pmc.WorkingSetSize / 1073741824.0,
+                                 pmc.PeakWorkingSetSize / 1073741824.0, pmc.PagefileUsage / 1073741824.0);
+            }
+#endif
+            if (E.tier_on)
+                std::fprintf(stderr, "strata-q36: STRATA_Q36_TIER_GIB: %lld fills, %lld by DMA from VRAM, %lld slots given back to VRAM residents, %lld "
+                             "replacements (since load)\n", E.tier_fills, E.tier_dma, E.tier_released, E.tier_replaced);
+            if (E.trim_on)
+                std::fprintf(stderr, "strata-q36: STRATA_Q36_TRIM: %lld host copies trimmed, %lld evicted experts read ahead, %lld "
+                             "prompt trims (since load)\n", E.trim_n, E.trim_pf, E.trim_prompts);
 #if defined(STRATA_Q36_CPU_POOL)
             if (E.pool && std::getenv("STRATA_POOL_PHASE_TIMING")) {   // SD2: the pool's phases (work vs synchronisation)
                 const auto& P = *E.pool;
