@@ -6,19 +6,35 @@ switches that give the best measured speed, what each does and what was measured
 such a card, so the engine runs in its hybrid mode: some experts in VRAM, the rest computed on the CPU from RAM.
 
 > **Measured on:** RTX 4070 Ti 12 GB, i7-14700KF, 32 GB DDR5-6000, two NVMe SSDs, Windows 11, CUDA 13.4 (sm_89).
-> Unsloth's `Qwen3.6-35B-A3B-UD-Q4_K_M.gguf` (no MTP block), thinking on, the model card's sampling (temperature
-> 1.0, top-p 0.95, top-k 20, presence penalty 1.5), server runs, no MTP. Other cards and PCs will differ.
+> Unsloth's `Qwen3.6-35B-A3B-UD-Q4_K_M.gguf` (the plain file for the tables below, the MTP repo's file for the MTP
+> results), thinking on, the model card's sampling (temperature 1.0, top-p 0.95, top-k 20, presence penalty 1.5),
+> server runs. Other cards and PCs will differ.
+
+## Quick setup
+
+`FAST-SETUP-35B.bat` installs and tunes it in one go. The first run is setup's own Qwen3.6 install (`START-HERE.bat
+--family qwen36 --model UD-Q4_K_M --build --context 262144 --no-start`: the Unsloth MTP GGUF, an engine built for your
+card, the tokenizer). Then `tools/fast_setup_q36.py` reads your card (VRAM, compute capability), RAM and CPU and writes
+`strata-qwen36-fast.json` and `run-qwen36-fast.bat` beside setup's files with the configuration below: every switch,
+`--mtp 2`, `--hybrid-rows 256`, the context by VRAM (262K from 10 GB, 128K from 6 GB, else 64K) and `--pool-workers`
+by CPU. On a card before Ampere (GTX 16, RTX 20: compute capability under 8.0) it leaves out the five tensor-core
+prompt switches (`FA2`, `FA2P`, `FA2Q`, `FA2_SEG`, `GDN_TC`); the engine builds for sm_75 and, run on this PC through
+its compute_75 code with those switches off, gave the same bits as the sm_89 build. It warns when the RAM is short for
+the experts' mapped file (about 28 GB with Windows and a few apps) and when a small card also drives the desktop.
+`--dry-run` shows the plan; `--simulate "gpu=...,cc=7.5,vram=4,ram=16,p=6,e=4"` plans for another PC. Only this PC
+was measured; a 16 GB PC with a 4 GB card is expected to page (see Limits).
 
 ## The configuration
 
 Engine arguments (the run config's `args`):
 
 ```
---native <path>\Qwen3.6-35B-A3B-UD-Q4_K_M.gguf --max-context 262144 --prefill auto --mtp 0 --pool-workers 19 --hybrid-rows 256
+--native <path>\Qwen3.6-35B-A3B-UD-Q4_K_M.gguf --max-context 262144 --prefill auto --mtp 2 --pool-workers 19 --hybrid-rows 256
 ```
 
 The config also needs `"arch": "qwen35moe"` and a `tokenizer` folder made by `tools/strata_tokenizer.py --gguf <file>
---out <folder>`. A GGUF without the MTP block loads (the `nextn_predict_layers` key is optional); use `--mtp 0`.
+--out <folder>`. `--mtp 2` needs the file with the MTP block (Unsloth's `Qwen3.6-35B-A3B-MTP-GGUF`); a GGUF without
+it loads too (the `nextn_predict_layers` key is optional): use `--mtp 0` there.
 
 Environment (all off by default; set them before starting the server). Most switches give the same output bits as
 the engine without them, or change only where an expert is computed. Three settings change the arithmetic or the
@@ -74,6 +90,12 @@ For output bits identical to the engine without switches, leave out `STRATA_Q36_
 `STRATA_Q36_CK_EXACT` and keep `--hybrid-rows` at its default (128): the "Bit-identical set" column below.
 
 ## Results
+
+**With MTP** (the MTP repo's UD-Q4_K_M, the configuration above, 262K, quiet PC, runs of 2026-11-13): short questions
+105.8-118.7 tok/s against 94.1-95.7 with `--mtp 0` on the same file (+15%), a 50K prompt read 4,124-4,304 against
+4,393-4,556 (-5%: the prompt also runs the MTP layer), decode after it 77.7-88.4 against 75.4-83.2, follow-ups the same.
+66% of the drafted tokens are accepted under the model card's sampling. MTP drafts are checked by the full model, so
+the output distribution is the model's own.
 
 Server runs at 262K context, two alternated runs each. "Before" is the engine before this work at 65K (its f32 cache
 did not fit 131K); llama.cpp is b8abe41a5 with `--fit on` at 131K.
@@ -185,12 +207,23 @@ in host memory; the packed Q8_0 decode copy is off. `STRATA_Q36_BLOB_CACHE=0`, `
   is garbage; it is for measuring only. `STRATA_Q36_HOST_TIMING=1`: the host part of each decoded token.
   `STRATA_Q36_HO_LOG=1`: a trace of the handoff.
 - `STRATA_Q36_LOOKUP=N`: drafts copied from the context: a loss on this card (each verified row brings CPU experts).
+- `STRATA_Q36_TRIM=1` / `=2`: drop the host copies of the experts held in VRAM from the working set (on every slot change /
+  at load and after each streamed prompt). Same bits. `=1` freed 3-6 GB of RAM but cost ~20% decode (evicted experts
+  fault back); `=2` freed nothing that lasts, because each streamed prompt reads every expert's host copy again.
+- `STRATA_Q36_TIER_GIB=N`: N GiB of pinned host copies of the experts not in VRAM, refilled by DMA from VRAM as experts
+  leave it, the rest read from the mapped file. Same bits. On this PC (13.5 GiB): -12 to -16% short decode and -8% on
+  a 50K read, because Windows pins only about half the RAM and what the tier cannot hold comes back from the SSD; meant
+  for PCs whose RAM cannot hold the experts at all, where it still needs a stickier policy and direct SSD reads.
+  `STRATA_Q36_TIER_ADAPT=0`, `STRATA_Q36_TIER_SWAPS`, `STRATA_Q36_TIER_FILLS`, `STRATA_Q36_TIER_SPARE` tune it.
+- `STRATA_Q36_FAULTS=1`: the process's page faults and working set after load and after each prompt (the summary prints
+  them at the end in any case).
 
 ## Limits
 
-- **RAM.** 32 GB is tight: the engine maps the 18 GB expert file and holds 3-4 GB of its own. With other programs open
-  (browsers, several desktop apps, a download) runs dropped to under 1 GB free, the expert file paged and speeds fell
-  by a third or more. Close large programs for the best speed.
+- **RAM.** 32 GB is tight: the engine maps the 18.7 GB expert file and holds about 4.3 GB of its own (23-24 GB working
+  set). With Claude, a browser and a 4 GB program beside it, runs stayed at full speed (page-file writes 0.5-2.4 GB/h);
+  with a larger program open, the expert file paged and speeds fell by a third or more. Close large programs for the
+  best speed. Trimming or pinning the experts did not help on 32 GB (`TRIM`, `TIER_GIB` above).
 - **Short reads.** A read of 257 to about 2,000 new tokens streams every expert of every layer and takes 1.0-1.2 s
   whatever its length.
 - **What bounds the speed now** (timed with `STRATA_Q36_ORACLE`). Decode: the GPU part of a step alone runs 120-127
@@ -200,7 +233,8 @@ in host memory; the packed Q8_0 decode copy is off. `STRATA_Q36_BLOB_CACHE=0`, `
 - **VRAM margin.** At 262K with 4096-token chunks and no growing window, ~0.5 GiB stayed free and the driver demoted
   engine memory to system RAM once (heavy paging). The growing window avoids that.
 - **Full-length prompts.** Prompt reading at 262K is limited by attention (it grows with the square of the length).
-- **Builds.** Measured on CUDA only. The HIP build of this code was not compiled here; `STRATA_Q36_GDN_TC` needs
-  sm_80+.
-- **MTP.** Not part of these numbers. `--mtp N` runs with the decode graph since the verify-window fix; measurements
-  with Unsloth's MTP GGUF are not finished.
+- **Builds.** Measured on CUDA only, on sm_89. The engine also builds for sm_75 (`cp.async` and the tensor-core
+  kernels are guarded; the fast setup turns those switches off there), not run on such a card. The HIP build of this
+  code was not compiled here.
+- **MTP.** A verify step of 3 rows costs about 2x a plain step, so `--mtp 2` gains ~15% on short answers and less
+  after a long prompt (each draft row reads the whole cache in attention).

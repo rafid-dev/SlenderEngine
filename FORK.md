@@ -211,6 +211,6 @@ replaces it, and the next turn of the first conversation reads its whole history
 
 ## Qwen3.6-35B-A3B on a 12 GB card
 
-The `src/qwen35` path runs Qwen3.6-35B-A3B in hybrid mode on a 12 GB card with 32 GB of RAM at the full 262K context with an 8-bit K/V cache, without MTP: short decode 93-99 tok/s, ~82 after a 50K-token prompt, a 50K prompt read at ~4,500 tok/s, and a follow-up that reads only its new tokens (~0.2 s) (RTX 4070 Ti, i7-14700KF, DDR5). The switches (all opt-in), the configuration and the measurements: [docs/fork/QWEN36-12GB.md](docs/fork/QWEN36-12GB.md).
+The `src/qwen35` path runs Qwen3.6-35B-A3B in hybrid mode on a 12 GB card with 32 GB of RAM at the full 262K context with an 8-bit K/V cache, short decode ~94-96 tok/s without MTP and ~106-119 with `--mtp 2`, ~80-88 after a 50K-token prompt, a 50K prompt read at ~4,100-4,500 tok/s, and a follow-up that reads only its new tokens (~0.2 s) (RTX 4070 Ti, i7-14700KF, DDR5). `FAST-SETUP-35B.bat` installs and tunes it. The switches (all opt-in), the configuration and the measurements: [docs/fork/QWEN36-12GB.md](docs/fork/QWEN36-12GB.md).
 
 The license is upstream's MIT license, unchanged.
