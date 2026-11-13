@@ -1,0 +1,16 @@
+{
+ "note": "Q-STD arms (docs/fork/QUALITY.md). R = the accepted setup (the launcher + server config as they are); R2 = R again, placement pinned to R's auto budget: must be byte-identical. P1-P3 = prompt-chunk regroupings (the same GPU kernels, prompt cut into other-sized chunks): the rounding controls. D1-D3 / X1-X2 = placement STRESS panel, not rounding controls: CPU experts quantize activations per 256 values (Q8_K), GPU experts per 32 (q8_1), so moving experts between the tiers is a small precision change. Window size is not a control: with placement pinned, --spec 4 gave byte-identical logits (an exactness sentinel). The budgets assume R's auto budget of 1716 on the reference PC: re-derive them from R.<lane>.json facts.auto_budget on another machine.",
+ "arms": {
+  "R":  {"env": {}, "args": []},
+  "R2": {"env": {}, "args": []},
+  "P1": {"env": {"STRATA_PREFILL_RING": "448"}, "args": [], "kind": "prompt"},
+  "P2": {"env": {"STRATA_PREFILL_RING": "384"}, "args": [], "kind": "prompt"},
+  "P3": {"env": {"STRATA_PREFILL_AUTO_MAX": "16384"}, "args": ["--prefill", "auto:16384"], "kind": "prompt"},
+  "S1": {"env": {}, "args": ["--spec", "4"], "kind": "sentinel"},
+  "D1": {"env": {}, "args": ["--expert-cache", "1700"], "kind": "placement-stress"},
+  "D2": {"env": {}, "args": ["--expert-cache", "1690"], "kind": "placement-stress"},
+  "D3": {"env": {}, "args": ["--expert-cache", "1740"], "kind": "placement-stress"},
+  "X1": {"env": {"STRATA_PREFILL_RING": "448"}, "args": ["--expert-cache", "1700"], "kind": "placement-stress"},
+  "X2": {"env": {"STRATA_PREFILL_AUTO_MAX": "16384"}, "args": ["--prefill", "auto:16384", "--expert-cache", "1740"], "kind": "placement-stress"}
+ }
+}

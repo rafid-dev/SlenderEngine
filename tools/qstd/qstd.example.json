@@ -1,0 +1,8 @@
+{
+ "launcher": "D:/path/to/run-strata.bat",
+ "daily_config": "D:/path/to/strata/strata-daily.json",
+ "sol_cases": "D:/path/to/quality/cases.json",
+ "bf16_dir": "D:/path/to/bf16ref",
+ "work_dir": "D:/path/to/qstd-work",
+ "runlog_dir": null
+}
