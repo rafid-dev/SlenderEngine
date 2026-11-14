@@ -767,10 +767,13 @@ OWN_PATH_FAMILIES = {
                # card, 18.75 GiB of experts pinned)
                "models": {"UD-Q4_K_M": {"about": "4-bit (Unsloth Dynamic), the size this fork's 35B speed work was measured on "
                                                   "(FAST-SETUP-35B.bat)", "ram_gb": 32},
-                          "UD-Q4_K_XL": {"about": "4-bit (Unsloth Dynamic), the smallest", "ram_gb": 32},
+                          "UD-Q4_K_XL": {"about": "4-bit (Unsloth Dynamic)", "ram_gb": 32},
                           "UD-Q6_K_XL": {"about": "6-bit (Unsloth Dynamic), closer to the full model", "ram_gb": 44},
                           "Q8_0": {"about": "8-bit, the closest to the full model", "ram_gb": 52}},
                "sha256": QWEN36_FILES,
+               # below ram_gb it still starts: the experts are a read-only mapped file, so what does not fit in RAM is read
+               # back from the SSD as it is needed (slow, no page-file writes); 16 GB PCs ask with "yes" as the answer
+               "pages_ok_gb": 15,
                # the engine's KV cache per context token: 10 attention layers + the MTP block, 2 KV heads x 256, K and
                # V in fp32 (strata-q36)
                "kv_bytes_per_token": 11 * 2 * 256 * 2 * 4,
@@ -8524,19 +8527,30 @@ def install_own_path(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopte
     say()
     for i, m in enumerate(names, 1):
         d = fam["models"][m]
-        size = fam["sha256"][fam["file"].format(q=m)][0]
-        fit = "" if ram >= d["ram_gb"] else f"   <- needs {d['ram_gb']} GB RAM, you have {ram:.0f}"
-        say(f"  {i}) {m:10s} {d['about']}; download {size / 1e9:.1f} GB{fit}")
+        fname = fam["file"].format(q=m)
+        size = fam["sha256"][fname][0]
+        fit = "" if ram >= d["ram_gb"] else f"   <- {d['ram_gb']} GB RAM for full speed, you have {ram:.0f}"
+        local = Path(a.gguf_dir or Path(a.models_dir) / (fam["tag"] + m)) / fname
+        where = ("already here" if local.is_file() and local.stat().st_size == size else
+                 "in your Hugging Face cache, no download" if hf_cached_file(fam["hf"] + fname, size) else
+                 f"download {size / 1e9:.1f} GB (or give its path if you have it)")
+        say(f"  {i}) {m:10s} {d['about']}; {size / 1e9:.1f} GB, {where}{fit}")
     rec = own_path_size(fam, ram)
     if not a.model:
-        say(f"  Recommended for {ram:.0f} GB of RAM: {rec} (the largest that fits; any size can be chosen)")
+        fits = any(ram >= d["ram_gb"] for d in fam["models"].values())
+        say(f"  Recommended for {ram:.0f} GB of RAM: {rec} " + ("(the largest that fits; any size can be chosen)" if fits else
+            "(no size runs at full speed with this RAM; this is the one measured here; any size can be chosen)"))
     model = a.model or names[int(ask("Which size?", [str(i) for i in range(1, len(names) + 1)],
                                      str(names.index(rec) + 1), a.yes)) - 1]
     if ram < fam["models"][model]["ram_gb"]:
-        confirm_risk(f"{model} needs about {fam['models'][model]['ram_gb']} GB of RAM; this PC has {ram:.0f} GB: the "
-                     "OS may page and it may not start", bool(a.model), a.yes,
-                     f"{model} needs about {fam['models'][model]['ram_gb']} GB of RAM",
-                     f"choose a smaller size, or --model {model} --yes to install it anyway", "  Install it anyway?")
+        full = fam["models"][model]["ram_gb"]
+        runs = ram >= fam.get("pages_ok_gb", full)
+        msg = (f"{model} runs at full speed with {full} GB of RAM; this PC has {ram:.0f} GB, so the experts that do not fit "
+               "are read back from the SSD as they are needed: it starts and answers, but slowly"
+               if runs else f"{model} needs about {full} GB of RAM; this PC has {ram:.0f} GB: the OS may page and it may not start")
+        confirm_risk(msg, bool(a.model) or runs, a.yes, f"{model} needs about {full} GB of RAM",
+                     f"choose a smaller size, or --model {model} --yes to install it anyway", "  Install it anyway?",
+                     "y" if runs else "n")
         warn(f"installing {model} with {ram:.0f} GB of RAM, as you chose")
     ok(f"size: {model}")
     tag = fam["tag"] + model
@@ -10443,6 +10457,10 @@ def main() -> int:
     cpu, avx2, avx512 = cpu_info()
     need = min(d["ram_gb"] for d in MODELS.values() if not d.get("mem_total"))   # Gyro counts VRAM + RAM: not a RAM floor
     low_ok = low_ram_fits("IQ1_M", ram, low_ram_vram(gpu)) and a.low_ram != "off"   # the smallest model, mapped
+    own_family = getattr(a, "family", None) in OWN_PATH_FAMILIES   # Qwen3.6-35B-A3B: its size step checks RAM against its own files
+    if own_family:
+        need = min(d["ram_gb"] for d in OWN_PATH_FAMILIES[a.family]["models"].values())
+        low_ok = ram >= OWN_PATH_FAMILIES[a.family].get("pages_ok_gb", need)
     if ram < need - 4 and not a.check and not low_ok:
         # every model keeps ALL its experts in RAM (23+ GB); VRAM only holds a copy of the most-used ones, so a
         # bigger GPU does not lower this.  The owner's rule: a stop by default, a risk the user can take (--model
@@ -10456,7 +10474,8 @@ def main() -> int:
                      "NAME --yes installs one anyway")
         warn(f"going on with {ram:.0f} GB of RAM, as you chose")
     ram_msg = (f"RAM: {ram:.0f} GB" if ram >= need - 4 else f"RAM: {ram:.0f} GB (less than the {need} GB the smallest model needs)"
-               + ("; the GPU's VRAM makes up for it (the low-RAM mode)" if ram < need - 4 and low_ok else ""))
+               + ("; the GPU's VRAM makes up for it (the low-RAM mode)" if ram < need - 4 and low_ok and not own_family else "")
+               + ("; it runs, with the experts partly read from the SSD (slow)" if ram < need - 4 and low_ok and own_family else ""))
     (ok if ram >= need - 4 or low_ok else warn)(ram_msg)       # #977: a RAM below every model's floor is not [ok]
     pf = page_file_gb()
     if pf is not None and pf < 4:
