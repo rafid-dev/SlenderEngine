@@ -3817,6 +3817,8 @@ struct Engine {
         cudaGraphExec_t g1 = nullptr, gv[kVerify + 1] = {}, gm1 = nullptr;
         std::map<int, cudaGraphExec_t> g1b;   // R1: decode graphs by chunk bucket
         std::map<int, cudaGraphExec_t> gvb;   // SD7: verify-window graphs by (T, chunk bucket)
+        std::map<int, cudaGraphExec_t> gmb;   // WD1: MTP draft passes by (draft head, T, chunk bucket)
+        cudaGraphExec_t gc[kVerify + 1] = {};   // WC1: commit() by kept rows
     };
     std::vector<GSet> gsets;
     GSet& gs() { return gsets[(size_t) cur]; }
@@ -4038,6 +4040,59 @@ struct Engine {
     uint64_t kick_job[2] = {};                  // the streamer job that fills staging buffer b
     long long hy_cpu = 0, hy_gpu = 0, hy_swaps = 0;   // entries computed on the CPU / GPU, slot replacements
     double hy_cpu_ms = 0;
+    // Q36-W W0 / W0c (diagnostics, never defaults). STRATA_Q36_W0=1: a speculative step's parts timed on the host with a
+    // sync at each part's end, and the CPU experts' time of a call against its jobs. STRATA_Q36_W0C=1: each draft head's
+    // logits kept on the host for the serve loop's acceptance counters.
+    bool w0t = std::getenv("STRATA_Q36_W0") != nullptr, w0c = std::getenv("STRATA_Q36_W0C") != nullptr;
+    double w0_ms[6] = {};
+    long long w0_steps = 0, w0_acc = 0, w0_rows0 = 0, w0_d = 0;
+    struct W0Cpu {
+        long long n = 0, zero = 0, bn[9] = {};
+        double sx = 0, sy = 0, sxx = 0, sxy = 0, sm = 0, bms[9] = {};
+    } w0_cpu[3];   // [0] one row, [1] 2-4 rows, [2] the MTP block's layer
+    std::vector<std::vector<float>> w0_dl;
+    void w0_grab(int d) {
+        if (draft_n != 0) return;
+        if ((int) w0_dl.size() <= d) w0_dl.resize((size_t) d + 1);
+        w0_dl[(size_t) d].resize((size_t) m->g.n_vocab);
+        CK(cudaMemcpyAsync(w0_dl[(size_t) d].data(), logits_m, (size_t) m->g.n_vocab * 4, cudaMemcpyDeviceToHost, st));
+        CK(cudaStreamSynchronize(st));
+    }
+    void w0_cpu_add(size_t li, int T, int n_jobs, int n_miss, double ms) {
+        if (T > 4) return;
+        W0Cpu& c = w0_cpu[li >= m->layers.size() ? 2 : (T == 1 ? 0 : 1)];
+        if (n_miss == 0) { ++c.zero; return; }
+        ++c.n;
+        c.sx += n_jobs; c.sy += ms; c.sxx += (double) n_jobs * n_jobs; c.sxy += n_jobs * ms; c.sm += n_miss;
+        const int b = n_jobs < 8 ? n_jobs : 8;
+        ++c.bn[b]; c.bms[b] += ms;
+    }
+    void w0_print_reset(double ms_copy, double ms_samp) {
+        if (w0_steps > 0) {
+            const double n = (double) w0_steps;
+            std::fprintf(stderr, "strata-q36: W0 %lld speculative steps, %.2f drafts offered, %.2f accepted, first MTP call %.2f rows; "
+                         "ms a step: tail of the last step %.3f, draft pass 0 %.3f, later draft passes %.3f, verify window %.3f, "
+                         "draws %.3f (logits copy %.3f, sample %.3f), commit %.3f; sum %.3f\n", w0_steps, (double) w0_d / n,
+                         (double) w0_acc / n, (double) w0_rows0 / n, w0_ms[0] / n, w0_ms[1] / n, w0_ms[2] / n, w0_ms[3] / n,
+                         w0_ms[4] / n, ms_copy / n, ms_samp / n, w0_ms[5] / n,
+                         (w0_ms[0] + w0_ms[1] + w0_ms[2] + w0_ms[3] + w0_ms[4] + w0_ms[5]) / n);
+        }
+        static const char* nm[3] = {"1 row", "2-4 rows", "MTP layer"};
+        for (int k = 0; k < 3; ++k) {
+            const W0Cpu& c = w0_cpu[k];
+            if (c.n + c.zero == 0) continue;
+            const double n = (double) c.n, den = n * c.sxx - c.sx * c.sx;
+            const double slope = den > 0 ? (n * c.sxy - c.sx * c.sy) / den : 0.0, icpt = n > 0 ? (c.sy - slope * c.sx) / n : 0.0;
+            std::fprintf(stderr, "strata-q36: W0 CPU experts (%s): %lld calls with misses, %lld with none; a call: %.2f jobs, "
+                         "%.2f missed entries, %.1f us; fit %.1f us + %.1f us a job; us by jobs 1..8+:", nm[k], c.n, c.zero,
+                         n > 0 ? c.sx / n : 0.0, n > 0 ? c.sm / n : 0.0, n > 0 ? 1000.0 * c.sy / n : 0.0, 1000.0 * icpt, 1000.0 * slope);
+            for (int b = 1; b <= 8; ++b) std::fprintf(stderr, " %.0f(%lld)", c.bn[b] ? 1000.0 * c.bms[b] / c.bn[b] : 0.0, c.bn[b]);
+            std::fprintf(stderr, "\n");
+        }
+        for (double& v : w0_ms) v = 0;
+        w0_steps = w0_acc = w0_rows0 = w0_d = 0;
+        for (W0Cpu& c : w0_cpu) c = W0Cpu();
+    }
     double rebal_ms = 0;   // host time in after_rows' rebalances (their copies run on the engine stream)
     long long rebal_n = 0;
     /// STRATA_Q36_REBAL_ASYNC=1: a decode rebalance's expert copies (pageable, file-mapped host memory: ~40 ms of copies
@@ -6765,6 +6820,10 @@ struct Engine {
         r6_rewind(p0);
         if (T <= kGemmT) sp_build(p0);
         ensure_set(T);
+        if (graph_mode && ho_graph) {   // WD1: the pass's epoch, as forward()'s
+            k_ho_epoch<<<1, 1, 0, st>>>(ho_ep_d);
+            if (ho_tmpl_cur) ++ho_tmpl_cur->eps;
+        }
         if (main_hybrid && lhy(m->layers.size()) && T > hybrid_t && use_mmq && (!lm_active || lm_first)) {
             drop_xslots();   // the stream overwrites the staging buffers that hold extra slots
             stream_begin({(int) m->layers.size()});
@@ -6782,7 +6841,13 @@ struct Engine {
 
     /// After a verify window of T rows: the GDN state takes the first n_keep rows (conv history and recurrence run
     /// again over the rows' kept inputs).
+    /// WC1 (STRATA_Q36_COMMIT_GRAPH=1): the same 60 launches as one graph per n_keep (the same kernels and arguments).
     void commit(int n_keep) {
+        static const bool cg = [] { const char* v = std::getenv("STRATA_Q36_COMMIT_GRAPH"); return v && v[0] == '1'; }();
+        if (cg && use_graph && n_keep >= 1 && n_keep <= kVerify) graph_run(gs().gc[n_keep], [&] { commit_rows(n_keep); });
+        else commit_rows(n_keep);
+    }
+    void commit_rows(int n_keep) {
         const auto& g = m->g;
         const int HK = (int) g.ssm_k_heads, HV = (int) g.ssm_v_heads, C = (int) g.ssm_conv_channels;
         for (size_t l = 0; l < m->layers.size(); ++l) {
@@ -7130,9 +7195,14 @@ struct Engine {
         }
         hy_cpu += n_miss;
         hy_gpu += n_ent - n_miss;
-        if (n_miss == 0) return 0;
+        if (n_miss == 0) {
+            if (w0t) w0_cpu_add(li, T, 0, 0, 0.0);
+            return 0;
+        }
         pool->run_split_multi_native(H.fmt, jobs.data(), (int) jobs.size());
-        hy_cpu_ms += ms_since(t0);
+        const double w0ms = ms_since(t0);
+        hy_cpu_ms += w0ms;
+        if (w0t) w0_cpu_add(li, T, (int) jobs.size(), n_miss, w0ms);
         return n_miss;
 #else
         (void) li; (void) T; (void) h_ids; (void) h_h; (void) cpu_out; (void) h_miss;
@@ -7291,8 +7361,36 @@ struct Engine {
         for (GSet& gset : gsets)
             for (auto& kv : gset.gvb)
                 if (kv.second) CK(cudaGraphExecDestroy(kv.second));
+        for (GSet& gset : gsets) {
+            for (auto& kv : gset.gmb)
+                if (kv.second) CK(cudaGraphExecDestroy(kv.second));
+            gset.gmb.clear();
+            for (auto& g : gset.gc)
+                if (g) { CK(cudaGraphExecDestroy(g)); g = nullptr; }
+        }
         for (GSet& gset : gsets) gset.g1b.clear(), gset.gvb.clear();
         ho_tmpls.clear();
+    }
+
+    /// WD1 (STRATA_Q36_MTP_GRAPH=1): an MTP pass of T rows at p0 as a graph per (draft head, T, context bucket), with the
+    /// handoff of its hybrid layer captured as the verify windows' are (HO_GRAPH); past the KV_RAM window eager, as there.
+    /// A draft only proposes: the main model's logits do not depend on this path.
+    void mtp_run(int T, int64_t p0, const float* seeds, bool draft) {
+        static const bool on = [] { const char* v = std::getenv("STRATA_Q36_MTP_GRAPH"); return v && v[0] == '1'; }();
+        if (!(on && ho_graph && use_graph) || T > kVerify) { forward_mtp(T, p0, seeds, draft, false); return; }
+        int b = 16;
+        const int need = (int) ((p0 + T + kChunkCells - 1) / kChunkCells);
+        while (b < need) b *= 2;
+        b = std::min(b, (int) ((ctx + kChunkCells - 1) / kChunkCells));
+        kvr_ensure(p0 + T);
+        if (kvr_on) b = std::max(need, std::min(b, kvr_nwin * (KvRam::kSeg / kChunkCells)));
+        if (kvr_on && (int64_t) b * kChunkCells > (int64_t) kvr_nwin * KvRam::kSeg) {
+            forward_mtp(T, p0, seeds, draft, false);
+            return;
+        }
+        graph_nc = b;
+        graph_run(gs().gmb[(draft ? 1 << 28 : 0) + T * (1 << 22) + b], [&] { forward_mtp(T, p0, seeds, draft, true); });
+        graph_nc = 0;
     }
 
     /// The verify window [x, drafts] through the main model. SD7: with HO_GRAPH a graph per (T, context bucket) and the
@@ -7925,7 +8023,15 @@ struct Engine {
         const int N = (int) m->g.n_embd;
         if (main_hybrid) D = std::min<int>(D, (int) (rebal_every() - pos % rebal_every()) - 1);
         const int T0 = (int) fix.size() + 1;   // the redo rows and the row of x
+        auto w0a = Clock::now();
         CK(cudaStreamSynchronize(st));
+        auto w0lap = [&](int k) {   // (W0: the part ends when its GPU work has)
+            if (!w0t) return;
+            CK(cudaStreamSynchronize(st));
+            w0_ms[k] += ms_since(w0a);
+            w0a = Clock::now();
+        };
+        w0lap(0);
         // rows of the first MTP call: (hmain row i, fix[i]) at positions pos - fix.size() + i, then (hlast, x) at pos
         for (int i = 0; i < (int) fix.size(); ++i) hpin[16 + i] = fix[(size_t) i];
         hpin[16 + fix.size()] = x_tok;
@@ -7938,7 +8044,7 @@ struct Engine {
             CK(cudaMemcpyAsync(seeds, hmain, fix.size() * (size_t) N * 4, cudaMemcpyDeviceToDevice, st));
         CK(cudaMemcpyAsync(seeds + fix.size() * (size_t) N, hlast, (size_t) N * 4, cudaMemcpyDeviceToDevice, st));
         if (ho_log()) std::fprintf(stderr, "HOLOG spec: first MTP call T0 %d at %lld\n", T0, (long long) pos), std::fflush(stderr);
-        forward_mtp(T0, pos - (int64_t) fix.size(), seeds, D > 0, false);
+        mtp_run(T0, pos - (int64_t) fix.size(), seeds, D > 0);
         if (ho_log()) std::fprintf(stderr, "HOLOG spec: first MTP call queued\n"), std::fflush(stderr);
         drafts.assign((size_t) D, 0);
         if (D > 0) {
@@ -7946,6 +8052,8 @@ struct Engine {
             CK(cudaStreamSynchronize(st));
             drafts[0] = hpin[2];
         }
+        w0lap(1);
+        if (w0c && D > 0) w0_grab(0);
         int last_row = T0 - 1;   // the row of the previous MTP call whose output seeds the next draft
         for (int d = 1; d < D; ++d) {   // chained: (the block's own output, the last draft) at the next position
             hpin[0] = drafts[(size_t) d - 1];
@@ -7955,11 +8063,13 @@ struct Engine {
             CK(cudaMemcpyAsync(seeds, hmtp + (size_t) last_row * N, (size_t) N * 4, cudaMemcpyDeviceToDevice, st));
             last_row = 0;
             if (mtp_graph) graph_run(gs().gm1, [&] { forward_mtp(1, pos + d, seeds, true, use_graph); });
-            else forward_mtp(1, pos + d, seeds, true, false);
+            else mtp_run(1, pos + d, seeds, true);
             CK(cudaMemcpyAsync(hpin + 2, pick_m, 4, cudaMemcpyDeviceToHost, st));
             CK(cudaStreamSynchronize(st));
             drafts[(size_t) d] = hpin[2];
+            if (w0c) w0_grab(d);
         }
+        w0lap(2);
         // the verify window
         const int T = D + 1;
         hpin[16] = x_tok;
@@ -7972,6 +8082,7 @@ struct Engine {
         verify_run(T);
         if (ho_log()) std::fprintf(stderr, "HOLOG verify window done\n"), std::fflush(stderr);
         rows_deferred = false;
+        w0lap(3);
         int a = 0;
         if (sample_row) {
             int t = (*sample_row)(0);
@@ -7992,10 +8103,13 @@ struct Engine {
             if (cancel != nullptr && cancel->load()) a = 0;
             for (int i = 0; i <= a; ++i) picks[i] = hpin[2 + i];
         }
+        w0lap(4);
         commit(a + 1);
         CK(cudaMemcpyAsync(hlast, hmain + (size_t) a * N, (size_t) N * 4, cudaMemcpyDeviceToDevice, st));
         pos += a + 1;
         after_rows(a + 1);
+        w0lap(5);
+        if (w0t) { ++w0_steps; w0_acc += a; w0_rows0 += T0; w0_d += D; }
         return a;
     }
 
@@ -8048,8 +8162,9 @@ struct Engine {
     unsigned long long *tk_a = nullptr, *tk_b = nullptr, *tk_h = nullptr;
     int32_t *tk_did = nullptr, *tk_hid = nullptr;
     float *tk_dv = nullptr, *tk_hv = nullptr;
-    const unsigned long long* host_topk(int K, const int32_t* ids, int P, const float** vals) {
+    const unsigned long long* host_topk(int K, const int32_t* ids, int P, const float** vals, int row = 0) {
         const int n = (int) m->g.n_vocab;
+        const float* lrow = logits + (size_t) row * n;   // (WS1: row r of a verify window)
         if (!tk_a) {
             const size_t cap = (size_t) ((n + kTkN - 1) / kTkN) * kTkMax;
             CK(cudaMalloc(&tk_a, cap * 8));
@@ -8063,11 +8178,11 @@ struct Engine {
         if (P > 0) {
             std::memcpy(tk_hid, ids, (size_t) P * 4);
             CK(cudaMemcpyAsync(tk_did, tk_hid, (size_t) P * 4, cudaMemcpyHostToDevice, st));
-            k_gather_f<<<grid1(P), kThreads, 0, st>>>(logits, tk_did, P, tk_dv);
+            k_gather_f<<<grid1(P), kThreads, 0, st>>>(lrow, tk_did, P, tk_dv);
             CK(cudaMemcpyAsync(tk_hv, tk_dv, (size_t) P * 4, cudaMemcpyDeviceToHost, st));
         }
         int cnt = n;
-        const float* x = logits;
+        const float* x = lrow;
         const unsigned long long* kin = nullptr;
         unsigned long long* out = tk_a;
         for (;;) {
@@ -8794,11 +8909,73 @@ int sample(std::vector<float>& lg, const Sampling& s, const std::vector<int32_t>
     return draw_cands(idx, v, s, rng);
 }
 
+/// Q36-W W0c (diagnostic): sample()'s distribution as (id, probability), the most likely first
+std::vector<std::pair<int, double>> cand_dist(std::vector<float> lg, const Sampling& s, const std::vector<int32_t>& hist) {
+    strata::qwen35::apply_penalties(lg, s, hist);
+    std::vector<std::pair<int, double>> out;
+    if (s.temperature <= 0.f) {
+        out.push_back({(int) (std::max_element(lg.begin(), lg.end()) - lg.begin()), 1.0});
+        return out;
+    }
+    const int kk = std::max(1, std::min(s.top_k > 0 ? s.top_k : 64, (int) lg.size()));
+    std::vector<int> idx(lg.size());
+    for (size_t i = 0; i < idx.size(); ++i) idx[i] = (int) i;
+    std::partial_sort(idx.begin(), idx.begin() + kk, idx.end(), [&](int a, int b) { return lg[a] > lg[b] || (lg[a] == lg[b] && a < b); });
+    idx.resize((size_t) kk);
+    std::vector<double> p(idx.size());
+    const double mx = lg[(size_t) idx[0]];
+    double sum = 0;
+    for (size_t i = 0; i < idx.size(); ++i) sum += (p[i] = std::exp((lg[(size_t) idx[i]] - mx) / s.temperature));
+    size_t keep = idx.size();
+    double cum = 0;
+    for (size_t i = 0; i < idx.size(); ++i) {
+        if (p[i] / sum < s.min_p * (p[0] / sum)) { keep = i; break; }
+        cum += p[i] / sum;
+        if (cum >= s.top_p) { keep = i + 1; break; }
+    }
+    keep = std::max<size_t>(1, keep);
+    double tot = 0;
+    for (size_t i = 0; i < keep; ++i) tot += p[i];
+    for (size_t i = 0; i < keep; ++i) out.push_back({idx[i], p[i] / tot});
+    return out;
+}
+/// Q36-W W0c: a verify row's acceptance probability under three draft rules, on the same context: the raw argmax (today),
+/// the argmax after the request's penalties (WA1), a draft sampled like the main token and kept with min(1, p / q) (WA2);
+/// top = the main distribution's largest probability (the bound of any one-token draft)
+struct W0cStat {
+    long long n[4] = {}, same[4] = {}, bad[4] = {};
+    double raw[4] = {}, pen[4] = {}, ss[4] = {}, top[4] = {};
+};
+void w0c_row(W0cStat& S, int r, const std::vector<float>& lg_main, const std::vector<float>& lg_draft, int draft, const Sampling& s,
+             const std::vector<int32_t>& hist) {
+    r = std::max(0, std::min(r, 3));
+    const auto p = cand_dist(lg_main, s, hist);
+    const auto q = cand_dist(lg_draft, s, hist);
+    std::vector<float> dp = lg_draft;
+    strata::qwen35::apply_penalties(dp, s, hist);
+    const int d_pen = (int) (std::max_element(dp.begin(), dp.end()) - dp.begin());
+    const int d_raw = (int) (std::max_element(lg_draft.begin(), lg_draft.end()) - lg_draft.begin());
+    auto P = [&](int id) {
+        for (const auto& [i, v] : p)
+            if (i == id) return v;
+        return 0.0;
+    };
+    double ss = 0;
+    for (const auto& [i, v] : q) ss += std::min(v, P(i));
+    ++S.n[r];
+    S.raw[r] += P(draft);
+    S.pen[r] += P(d_pen);
+    S.ss[r] += ss;
+    S.top[r] += p[0].second;
+    S.same[r] += d_pen == draft;
+    S.bad[r] += d_raw != draft;
+}
+
 /// TD1 (STRATA_Q36_GPU_TOPK=1): sample() from the GPU's candidates: the raw top kk + P logits and the P penalized
 /// history tokens' logits. The penalties only lower a logit here (repeat >= 1, freq >= 0, present >= 0), so the penalized
 /// row's top kk is among them: the same candidates, order and draw as sample() on the whole row. false: not this case
 /// (the caller reads the whole row).
-bool sample_gpu(Engine& E, const Sampling& s, const std::vector<int32_t>& hist, std::mt19937_64& rng, int& pick) {
+bool sample_gpu(Engine& E, const Sampling& s, const std::vector<int32_t>& hist, std::mt19937_64& rng, int& pick, int row = 0) {
     if (s.repeat < 1.f || s.freq < 0.f || s.present < 0.f) return false;
     const int n = (int) E.m->g.n_vocab;
     std::vector<int32_t> pid;
@@ -8815,7 +8992,7 @@ bool sample_gpu(Engine& E, const Sampling& s, const std::vector<int32_t>& hist, 
     const int K = kk + P;
     if (K > kTkMax) return false;
     const float* pv = nullptr;
-    const unsigned long long* keys = E.host_topk(K, pid.data(), P, &pv);
+    const unsigned long long* keys = E.host_topk(K, pid.data(), P, &pv, row);
     std::vector<std::pair<float, int>> c;
     c.reserve((size_t) K + P);
     auto penalized = [&](int id) { return std::binary_search(pid.begin(), pid.end(), id); };   // (pid ascending: a map's order)
@@ -9472,6 +9649,8 @@ struct Serve {
         static const bool host_timing = std::getenv("STRATA_Q36_HOST_TIMING") != nullptr;
         static const bool gpu_topk = [] { const char* v = std::getenv("STRATA_Q36_GPU_TOPK"); return v && v[0] == '1'; }();
         double tm_wait = 0, tm_copy = 0, tm_samp = 0, tm_emit = 0, tm_proc = 0;
+        double w0_copy = 0, w0_samp = 0;   // (W0: the speculative path's draws)
+        W0cStat w0s;
         long long tm_n = 0, tm_gpu = 0;
         for (;;) {
             if (smp.needs_logits() && !have_nx) {
@@ -9540,8 +9719,24 @@ struct Serve {
                     draw = [&](int r) {   // row r follows x and drafts 0 .. r - 1: they join the penalty history
                         std::vector<int32_t> h2 = hist;
                         for (int i = 0; i < r; ++i) h2.push_back(drafts[(size_t) i]);
+                        const auto w0t0 = Clock::now();
+                        // WS1 (STRATA_Q36_SPEC_TOPK=1): the row's draw from the GPU's candidates, as the plain step's (TD1)
+                        static const bool spec_topk = [] { const char* v = std::getenv("STRATA_Q36_SPEC_TOPK"); return v && v[0] == '1'; }();
+                        if (spec_topk && !E.w0c) {
+                            int pk = -1;
+                            if (sample_gpu(E, smp, h2, rng, pk, r)) {
+                                w0_copy += ms_since(w0t0);
+                                return pk;
+                            }
+                        }
                         E.host_logits_row(r, lg_row);
-                        return sample(lg_row, smp, h2, rng);
+                        w0_copy += ms_since(w0t0);
+                        if (E.w0c && r < (int) drafts.size() && r < (int) E.w0_dl.size() && !E.w0_dl[(size_t) r].empty())
+                            w0c_row(w0s, r, lg_row, E.w0_dl[(size_t) r], drafts[(size_t) r], smp, h2);
+                        const auto w0t1 = Clock::now();
+                        const int w0tk = sample(lg_row, smp, h2, rng);
+                        w0_samp += ms_since(w0t1);
+                        return w0tk;
                     };
                 const int a = E.spec_step(nx, fix, E.mtp_d, drafts, picks, &stop, smp.needs_logits() ? &draw : nullptr);
                 offered += E.mtp_d;
@@ -9579,6 +9774,17 @@ struct Serve {
                      "%lld generated in %.0f ms (%.1f tok/s), drafts accepted %lld of %lld (%s)\n", s, ids.size(), reuse,
                      (long long) fresh, prompt_ms, prompt_ms > 0 ? 1000.0 * (double) fresh / prompt_ms : 0.0, produced,
                      decode_ms, decode_ms > 0 ? 1000.0 * (double) produced / decode_ms : 0.0, accepted, offered, finish);
+        if (E.w0t) E.w0_print_reset(w0_copy, w0_samp);
+        if (E.w0c)
+            for (int r = 0; r < 4; ++r)
+                if (w0s.n[r] > 0)
+                    std::fprintf(stderr, "strata-q36: W0c draft %d: %lld rows (penalty window %d, present %.2f, repeat %.2f, top_k %d, "
+                                 "top_p %.2f, temperature %.2f); mean acceptance: raw argmax %.4f, penalized argmax %.4f (same token "
+                                 "on %.1f%% of rows), min(1, p/q) rule %.4f, bound of a one-token draft %.4f; logits check: %lld "
+                                 "rows whose kept argmax is not the draft\n", r, w0s.n[r], smp.last_n, (double) smp.present,
+                                 (double) smp.repeat, smp.top_k, (double) smp.top_p, (double) smp.temperature,
+                                 w0s.raw[r] / w0s.n[r], w0s.pen[r] / w0s.n[r], 100.0 * w0s.same[r] / w0s.n[r], w0s.ss[r] / w0s.n[r],
+                                 w0s.top[r] / w0s.n[r], w0s.bad[r]);
         if (host_timing && produced > 0)
             std::fprintf(stderr, "strata-q36: host timing over %lld tokens (%lld sampled, %lld from GPU candidates), ms a token: "
                          "process %.3f, wait for the GPU %.3f, logits copy %.3f, sample %.3f, emit %.3f; total decode %.3f\n",

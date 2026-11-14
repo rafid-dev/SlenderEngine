@@ -14,7 +14,9 @@ such a card, so the engine runs in its hybrid mode: some experts in VRAM, the re
 
 `FAST-SETUP-35B.bat` installs and tunes it in one go. The first run is setup's own Qwen3.6 install (`START-HERE.bat
 --family qwen36 --model UD-Q4_K_M --build --context 262144 --no-start`: the Unsloth MTP GGUF, an engine built for your
-card, the tokenizer). Then `tools/fast_setup_q36.py` reads your card (VRAM, compute capability), RAM and CPU and writes
+card, the tokenizer). A copy of the GGUF already in the Hugging Face cache (`hf download`, huggingface_hub; `HF_HUB_CACHE` /
+`HF_HOME` are honoured) is used instead of downloading it: hard-linked on the same drive, read where it is on another. When neither
+folder has it, setup asks for its path (the file or its folder) and downloads only on Enter (`--yes`: no question). Then `tools/fast_setup_q36.py` reads your card (VRAM, compute capability), RAM and CPU and writes
 `strata-qwen36-fast.json` and `run-qwen36-fast.bat` beside setup's files with the configuration below: every switch,
 `--mtp 2`, `--hybrid-rows 256`, the context by VRAM (262K from 10 GB, 128K from 6 GB, else 64K) and `--pool-workers`
 by CPU. On a card before Ampere (GTX 16, RTX 20: compute capability under 8.0) it leaves out the five tensor-core
@@ -61,6 +63,11 @@ set STRATA_Q36_Q8ST=1
 set STRATA_Q36_GEMV_ILP=1
 set STRATA_POOL_FUSED=1
 set STRATA_Q36_GPU_TOPK=1
+rem the MTP step
+set STRATA_Q36_SPEC_TOPK=1
+set STRATA_Q36_COMMIT_GRAPH=1
+set STRATA_Q36_MTP_GRAPH=1
+set STRATA_Q36_DRAFT_VOCAB=131072
 rem prompts
 set STRATA_Q36_LM=1
 set STRATA_Q36_LM_TAIL=1
@@ -91,11 +98,16 @@ For output bits identical to the engine without switches, leave out `STRATA_Q36_
 
 ## Results
 
-**With MTP** (the MTP repo's UD-Q4_K_M, the configuration above, 262K, quiet PC, runs of 2026-11-13): short questions
-105.8-118.7 tok/s against 94.1-95.7 with `--mtp 0` on the same file (+15%), a 50K prompt read 4,124-4,304 against
-4,393-4,556 (-5%: the prompt also runs the MTP layer), decode after it 77.7-88.4 against 75.4-83.2, follow-ups the same.
-66% of the drafted tokens are accepted under the model card's sampling. MTP drafts are checked by the full model, so
-the output distribution is the model's own.
+**With MTP** (the MTP repo's UD-Q4_K_M, 262K, quiet PC, runs of 2026-11-13, before the four MTP-step switches): short
+questions 105.8-118.7 tok/s against 94.1-95.7 with `--mtp 0` on the same file (+15%), a 50K prompt read 4,124-4,304
+against 4,393-4,556 (-5%: the prompt also runs the MTP layer), decode after it 77.7-88.4 against 75.4-83.2, follow-ups
+the same. 66% of the drafted tokens are accepted under the model card's sampling. MTP drafts are checked by the full
+model, so the output distribution is the model's own.
+
+**With the four MTP-step switches** (the configuration above, 2026-11-14, a download running on the PC): short
+questions 119.1 and 120.8 tok/s in two runs (a third had one stalled question: 111.8) against 103.9-117.7 without them
+on the same day; one run after a 50K prompt 90.7 tok/s against 87.0, its follow-up 91.9 against 86.6, the 50K read
+unchanged (4,176 against 4,225). A step went from 22.2 to 19.5 ms with the timers on.
 
 Server runs at 262K context, two alternated runs each. "Before" is the engine before this work at 65K (its f32 cache
 did not fit 131K); llama.cpp is b8abe41a5 with `--fit on` at 131K.
@@ -195,6 +207,18 @@ in host memory; the packed Q8_0 decode copy is off. `STRATA_Q36_BLOB_CACHE=0`, `
   pool instead of streaming every expert (a 230-token follow-up 0.99 → 0.61 s). 512 was faster for 448-token
   follow-ups but slower for a cold 480-token first prompt; 1024 was 3.4x slower on a 900-token read.
 
+**MTP step** (measured 2026-11-14 with `--mtp 2`; in the configuration above and the fast setup)
+- `STRATA_Q36_SPEC_TOPK=1`: a verify row's token is drawn from the GPU's top-k candidates, as `GPU_TOPK` does for the
+  plain step, instead of copying the 248K-logit row and sorting it on the host: draws 1.05 → 0.38 ms a step. The same
+  candidates, order and draw, so the same sampled text.
+- `STRATA_Q36_COMMIT_GRAPH=1`: the delta-rule state's replay after a verify window as one graph (0.71 → 0.57 ms).
+- `STRATA_Q36_MTP_GRAPH=1`: the MTP block's passes as graphs with the CPU handoff captured (draft passes -0.1 ms).
+- `STRATA_Q36_DRAFT_VOCAB=131072` (or `--draft-vocab`): the draft head reads only the first 131,072 token ids. A draft
+  only proposes and the full model verifies it, so the model's logits are untouched: draft passes 2.63 → 1.80 ms a
+  step, 67-69% of drafts accepted either way; 65536 and 32768 lose acceptance (65% and 61%).
+- All four: a step 22.2 → 19.5 ms with the timers on. With the first three, six seeded answers and a 50K prompt with
+  its follow-up gave the same text and the same accepted drafts as without them.
+
 **Diagnostics and measured-but-not-used**
 - `STRATA_Q36_PROF=1/2/3`: prompt stage times, exact per-stage times, decode stage times. `STRATA_POOL_PHASE_TIMING=1`:
   the CPU pool's phases in the summary. `STRATA_Q36_EXPERT_HIST=1`: rows per expert in the prompt's expert passes.
@@ -217,6 +241,10 @@ in host memory; the packed Q8_0 decode copy is off. `STRATA_Q36_BLOB_CACHE=0`, `
   `STRATA_Q36_TIER_ADAPT=0`, `STRATA_Q36_TIER_SWAPS`, `STRATA_Q36_TIER_FILLS`, `STRATA_Q36_TIER_SPARE` tune it.
 - `STRATA_Q36_FAULTS=1`: the process's page faults and working set after load and after each prompt (the summary prints
   them at the end in any case).
+- `STRATA_Q36_W0=1`: after each request, a speculative step's parts (draft passes, verify window, draws, commit; a sync
+  ends each part, so the run is a little slower) and the CPU experts' time of a layer call against its expert jobs.
+  `STRATA_Q36_W0C=1`: per verify row, the probability that the main model's draw equals the draft, for the draft as it
+  is, for a draft picked after the request's penalties, and for a sampled draft kept with min(1, p/q).
 
 ## Limits
 
@@ -237,4 +265,8 @@ in host memory; the packed Q8_0 decode copy is off. `STRATA_Q36_BLOB_CACHE=0`, `
   kernels are guarded; the fast setup turns those switches off there), not run on such a card. The HIP build of this
   code was not compiled here.
 - **MTP.** A verify step of 3 rows costs about 2x a plain step, so `--mtp 2` gains ~15% on short answers and less
-  after a long prompt (each draft row reads the whole cache in attention).
+  after a long prompt (each draft row reads the whole cache in attention). Measured split of a 22.2 ms step
+  (2026-11-14): the 3-row window's GPU work 8.0 ms (the same as one plain token: the dense weights are read once), the
+  CPU experts of its three rows 9.7 ms (about 36 us for each expert not in VRAM, bound by memory bandwidth), the two
+  draft passes 2.6, the draws 1.05, the commit 0.7. The drafts are accepted with probability 0.80 and 0.75 against a
+  bound of 0.88 for any one-token draft, so the CPU experts, not the drafts, limit it.

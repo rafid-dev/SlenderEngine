@@ -88,15 +88,15 @@ In the SlenderEngine folder from [step 1](#1-download-this-fork):
 .\run-qwen36-fast.bat
 ```
 
-The first run downloads Unsloth's UD-Q4_K_M file with its MTP block (about 23 GB) and builds the engine for your card. Then it writes `run-qwen36-fast.bat` with the settings chosen for your card, RAM and CPU. The browser page and API are the same as Flash-Next's, on the same port, so run one model at a time.
+The first run downloads Unsloth's UD-Q4_K_M file with its MTP block (about 23 GB; a copy already in your Hugging Face cache is used instead) and builds the engine for your card. Then it writes `run-qwen36-fast.bat` with the settings chosen for your card, RAM and CPU. The browser page and API are the same as Flash-Next's, on the same port, so run one model at a time.
 
-Measured 2026-11-13 on the PC above, thinking on, 262K context, 8-bit cache, two runs each:
+Measured on the PC above, thinking on, 262K context, 8-bit cache. The first column is the launcher's setting since 2026-11-14 (four switches that speed up the MTP step without changing the model's output); the other two are from 2026-11-13, two runs each:
 
-| | With MTP (the launcher's setting) | Without MTP |
-|---|---:|---:|
-| Short answers | 106-119 tokens/s | 94-96 tokens/s |
-| An answer after a 50K-token prompt | 78-88 tokens/s | 75-83 tokens/s |
-| Reading a 50K-token prompt | 4,100-4,300 tokens/s | 4,400-4,560 tokens/s |
+| | With MTP, 2026-11-14 (the launcher's setting) | With MTP, 2026-11-13 | Without MTP |
+|---|---:|---:|---:|
+| Short answers | 119-121 tokens/s (two runs) | 106-119 tokens/s | 94-96 tokens/s |
+| An answer after a 50K-token prompt | 91 tokens/s (one run) | 78-88 tokens/s | 75-83 tokens/s |
+| Reading a 50K-token prompt | about 4,200 tokens/s (one run) | 4,100-4,300 tokens/s | 4,400-4,560 tokens/s |
 | A follow-up question | reads only its new tokens (about 0.2 s after a 50K prompt) | the same |
 
 The experts take about 18.7 GB of RAM as a mapped file. With a browser and a few apps open, it ran at full speed. A program above about 4 GB beside it made Windows page, and the speed fell by a third or more. Setup warns when your RAM or VRAM is short; a 16 GB PC is expected to page heavily. The switches, quality checks and limits are in [QWEN36-12GB.md](docs/fork/QWEN36-12GB.md). Like the Flash-Next setup, this path has **not yet been tested from a clean clone**.
