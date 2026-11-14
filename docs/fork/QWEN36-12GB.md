@@ -61,6 +61,11 @@ set STRATA_Q36_Q8ST=1
 set STRATA_Q36_GEMV_ILP=1
 set STRATA_POOL_FUSED=1
 set STRATA_Q36_GPU_TOPK=1
+rem the MTP step
+set STRATA_Q36_SPEC_TOPK=1
+set STRATA_Q36_COMMIT_GRAPH=1
+set STRATA_Q36_MTP_GRAPH=1
+set STRATA_Q36_DRAFT_VOCAB=131072
 rem prompts
 set STRATA_Q36_LM=1
 set STRATA_Q36_LM_TAIL=1
@@ -91,11 +96,16 @@ For output bits identical to the engine without switches, leave out `STRATA_Q36_
 
 ## Results
 
-**With MTP** (the MTP repo's UD-Q4_K_M, the configuration above, 262K, quiet PC, runs of 2026-11-13): short questions
-105.8-118.7 tok/s against 94.1-95.7 with `--mtp 0` on the same file (+15%), a 50K prompt read 4,124-4,304 against
-4,393-4,556 (-5%: the prompt also runs the MTP layer), decode after it 77.7-88.4 against 75.4-83.2, follow-ups the same.
-66% of the drafted tokens are accepted under the model card's sampling. MTP drafts are checked by the full model, so
-the output distribution is the model's own.
+**With MTP** (the MTP repo's UD-Q4_K_M, 262K, quiet PC, runs of 2026-11-13, before the four MTP-step switches): short
+questions 105.8-118.7 tok/s against 94.1-95.7 with `--mtp 0` on the same file (+15%), a 50K prompt read 4,124-4,304
+against 4,393-4,556 (-5%: the prompt also runs the MTP layer), decode after it 77.7-88.4 against 75.4-83.2, follow-ups
+the same. 66% of the drafted tokens are accepted under the model card's sampling. MTP drafts are checked by the full
+model, so the output distribution is the model's own.
+
+**With the four MTP-step switches** (the configuration above, 2026-11-14, a download running on the PC): short
+questions 119.1 and 120.8 tok/s in two runs (a third had one stalled question: 111.8) against 103.9-117.7 without them
+on the same day; one run after a 50K prompt 90.7 tok/s against 87.0, its follow-up 91.9 against 86.6, the 50K read
+unchanged (4,176 against 4,225). A step went from 22.2 to 19.5 ms with the timers on.
 
 Server runs at 262K context, two alternated runs each. "Before" is the engine before this work at 65K (its f32 cache
 did not fit 131K); llama.cpp is b8abe41a5 with `--fit on` at 131K.
@@ -195,7 +205,7 @@ in host memory; the packed Q8_0 decode copy is off. `STRATA_Q36_BLOB_CACHE=0`, `
   pool instead of streaming every expert (a 230-token follow-up 0.99 → 0.61 s). 512 was faster for 448-token
   follow-ups but slower for a cold 480-token first prompt; 1024 was 3.4x slower on a 900-token read.
 
-**MTP step, opt-in** (measured 2026-11-14 with `--mtp 2`; not yet in the configuration above or the fast setup)
+**MTP step** (measured 2026-11-14 with `--mtp 2`; in the configuration above and the fast setup)
 - `STRATA_Q36_SPEC_TOPK=1`: a verify row's token is drawn from the GPU's top-k candidates, as `GPU_TOPK` does for the
   plain step, instead of copying the 248K-logit row and sorting it on the host: draws 1.05 → 0.38 ms a step. The same
   candidates, order and draw, so the same sampled text.
