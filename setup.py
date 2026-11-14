@@ -7257,6 +7257,44 @@ def take_from_hf_cache(url: str, dst: Path, size: int):
         return src
 
 
+def ask_model_path(name: str, size: int, dst: Path, yes: bool):
+    """The model file not found here or in the Hugging Face cache: ask where it is before downloading it (a person who has it
+    elsewhere types its path, or its folder's; Enter downloads).  The answer is checked for the file and its size; a file of
+    another size is accepted only when it is a whole GGUF (the caller warns, as for --gguf-dir).  Hard-linked to `dst` on the
+    same drive, else used where it is (never moved or deleted).  None: download (also with --yes, no question)."""
+    if yes:
+        return None
+    say()
+    say(f"  {name} ({size / 1e9:.1f} GB) is not in the models folder or the Hugging Face cache.")
+    flush_typed_ahead()
+    while True:
+        try:
+            ans = input("  If you already have it, type its path (the file or its folder); press Enter to download it: ").strip()
+        except EOFError:
+            return None
+        ans = ans.strip().strip('"').strip("'")
+        if not ans:
+            return None
+        f = Path(ans).expanduser()
+        if f.is_dir():
+            f = f / name
+        if not f.is_file():
+            say(f"  not found: {f}")
+            continue
+        have = f.stat().st_size
+        if have != size and not own_gguf_is_whole(f):
+            say(f"  {f.name} is {have:,} bytes, not {size:,}, and not a whole GGUF file: another path, or Enter to download")
+            continue
+        if f.resolve() == dst.resolve():
+            return dst
+        try:
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            os.link(f.resolve(), dst)
+            return dst
+        except OSError:
+            return f
+
+
 def share_sibling_file(dst: Path, parent: Path, name: str, size: int) -> bool:
     """A shared file that sits in another model's folder under `parent` (parent/<model folder>/<name>; Qwen3.6 keeps its picture file beside each size) is made
     available at `dst` without the network: a hard link, else a copy.  Only a file of the pinned `size`; its SHA-256 is checked by the caller's download(), as for
@@ -8541,11 +8579,16 @@ def install_own_path(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopte
     part = gguf.with_name(gguf.name + ".part")
     def have(p: Path) -> bool:                         # --gguf-dir: the person's own file has no finish mark; verify_sha256 checks and writes it
         return p.exists() and (done(p) or bool(a.gguf_dir))
-    in_cache = False                                   # the model file used where the Hugging Face cache keeps it (another drive)
+    pin_name = gguf.name
+    in_cache = False                                   # the model file used where it is (the Hugging Face cache or a path given; another drive)
     if not a.gguf_dir and not have(gguf) and not part.exists():
         got = take_from_hf_cache(fam["hf"] + gguf.name, gguf, size)
+        if got is None:                                # not there either: ask for its path before downloading 23 GB
+            got = ask_model_path(gguf.name, size, gguf, a.yes)
         if got is not None and got != gguf:
             gguf, in_cache = got, True
+        elif got == gguf:
+            in_cache = not done(gguf)                  # linked here: checked below as the person's own file (never deleted)
     left = 0 if (have(gguf) or in_cache) else (size - (part.stat().st_size if part.is_file() else 0)) / 1e9
     if left and free_gb(folder) < left:
         fail(f"not enough free disk space in {folder}: need ~{left:.0f} GB, {free_gb(folder):.0f} GB free", ("use --data-dir on a bigger drive (strata launch --data-dir)" if CONTROL else "use --models-dir on a bigger drive"))
@@ -8571,14 +8614,14 @@ def install_own_path(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopte
 
     step(5, f"downloading {fam['title']} {model}")
     if in_cache:
-        ok(f"{gguf.name}: the Hugging Face cache's copy is used where it is")
+        ok(f"{gguf.name}: the copy already on this PC is used ({gguf})")
     elif have(gguf):
         ok(f"{gguf.name} already downloaded")
     else:
         if a.gguf_dir:
             fail(f"{gguf} is missing", f"put {gguf.name} in {folder}, or drop --gguf-dir to download it")
         download(fam["hf"] + gguf.name, gguf)
-    verify_sha256(gguf, *fam["sha256"][gguf.name], own=bool(a.gguf_dir) or in_cache)
+    verify_sha256(gguf, *fam["sha256"][pin_name], own=bool(a.gguf_dir) or in_cache)
     ok(f"model file: {gguf}")
     mmproj = folder / fam["mmproj"]
     if vision != "none":                               # the image encoder: Unsloth's mmproj, pinned, size + SHA-256 checked
