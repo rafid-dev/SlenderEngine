@@ -14,7 +14,8 @@ such a card, so the engine runs in its hybrid mode: some experts in VRAM, the re
 
 `FAST-SETUP-35B.bat` installs and tunes it in one go. The first run is setup's own Qwen3.6 install (`START-HERE.bat
 --family qwen36 --model UD-Q4_K_M --build --context 262144 --no-start`: the Unsloth MTP GGUF, an engine built for your
-card, the tokenizer). Then `tools/fast_setup_q36.py` reads your card (VRAM, compute capability), RAM and CPU and writes
+card, the tokenizer). A copy of the GGUF already in the Hugging Face cache (`hf download`, huggingface_hub; `HF_HUB_CACHE` /
+`HF_HOME` are honoured) is used instead of downloading it: hard-linked on the same drive, read where it is on another. Then `tools/fast_setup_q36.py` reads your card (VRAM, compute capability), RAM and CPU and writes
 `strata-qwen36-fast.json` and `run-qwen36-fast.bat` beside setup's files with the configuration below: every switch,
 `--mtp 2`, `--hybrid-rows 256`, the context by VRAM (262K from 10 GB, 128K from 6 GB, else 64K) and `--pool-workers`
 by CPU. On a card before Ampere (GTX 16, RTX 20: compute capability under 8.0) it leaves out the five tensor-core
