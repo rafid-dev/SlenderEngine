@@ -195,6 +195,18 @@ in host memory; the packed Q8_0 decode copy is off. `STRATA_Q36_BLOB_CACHE=0`, `
   pool instead of streaming every expert (a 230-token follow-up 0.99 → 0.61 s). 512 was faster for 448-token
   follow-ups but slower for a cold 480-token first prompt; 1024 was 3.4x slower on a 900-token read.
 
+**MTP step, opt-in** (measured 2026-11-14 with `--mtp 2`; not yet in the configuration above or the fast setup)
+- `STRATA_Q36_SPEC_TOPK=1`: a verify row's token is drawn from the GPU's top-k candidates, as `GPU_TOPK` does for the
+  plain step, instead of copying the 248K-logit row and sorting it on the host: draws 1.05 → 0.38 ms a step. The same
+  candidates, order and draw, so the same sampled text.
+- `STRATA_Q36_COMMIT_GRAPH=1`: the delta-rule state's replay after a verify window as one graph (0.71 → 0.57 ms).
+- `STRATA_Q36_MTP_GRAPH=1`: the MTP block's passes as graphs with the CPU handoff captured (draft passes -0.1 ms).
+- `STRATA_Q36_DRAFT_VOCAB=131072` (or `--draft-vocab`): the draft head reads only the first 131,072 token ids. A draft
+  only proposes and the full model verifies it, so the model's logits are untouched: draft passes 2.63 → 1.80 ms a
+  step, 67-69% of drafts accepted either way; 65536 and 32768 lose acceptance (65% and 61%).
+- All four: a step 22.2 → 19.5 ms with the timers on. With the first three, six seeded answers and a 50K prompt with
+  its follow-up gave the same text and the same accepted drafts as without them.
+
 **Diagnostics and measured-but-not-used**
 - `STRATA_Q36_PROF=1/2/3`: prompt stage times, exact per-stage times, decode stage times. `STRATA_POOL_PHASE_TIMING=1`:
   the CPU pool's phases in the summary. `STRATA_Q36_EXPERT_HIST=1`: rows per expert in the prompt's expert passes.
@@ -217,6 +229,10 @@ in host memory; the packed Q8_0 decode copy is off. `STRATA_Q36_BLOB_CACHE=0`, `
   `STRATA_Q36_TIER_ADAPT=0`, `STRATA_Q36_TIER_SWAPS`, `STRATA_Q36_TIER_FILLS`, `STRATA_Q36_TIER_SPARE` tune it.
 - `STRATA_Q36_FAULTS=1`: the process's page faults and working set after load and after each prompt (the summary prints
   them at the end in any case).
+- `STRATA_Q36_W0=1`: after each request, a speculative step's parts (draft passes, verify window, draws, commit; a sync
+  ends each part, so the run is a little slower) and the CPU experts' time of a layer call against its expert jobs.
+  `STRATA_Q36_W0C=1`: per verify row, the probability that the main model's draw equals the draft, for the draft as it
+  is, for a draft picked after the request's penalties, and for a sampled draft kept with min(1, p/q).
 
 ## Limits
 
@@ -237,4 +253,8 @@ in host memory; the packed Q8_0 decode copy is off. `STRATA_Q36_BLOB_CACHE=0`, `
   kernels are guarded; the fast setup turns those switches off there), not run on such a card. The HIP build of this
   code was not compiled here.
 - **MTP.** A verify step of 3 rows costs about 2x a plain step, so `--mtp 2` gains ~15% on short answers and less
-  after a long prompt (each draft row reads the whole cache in attention).
+  after a long prompt (each draft row reads the whole cache in attention). Measured split of a 22.2 ms step
+  (2026-11-14): the 3-row window's GPU work 8.0 ms (the same as one plain token: the dense weights are read once), the
+  CPU experts of its three rows 9.7 ms (about 36 us for each expert not in VRAM, bound by memory bandwidth), the two
+  draft passes 2.6, the draws 1.05, the commit 0.7. The drafts are accepted with probability 0.80 and 0.75 against a
+  bound of 0.88 for any one-token draft, so the CPU experts, not the drafts, limit it.
