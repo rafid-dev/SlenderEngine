@@ -783,6 +783,16 @@ public:
     int64_t blobs() const { return blobs_; }
     uint64_t pinned_bytes() const { return complement_pinned_ ? complement_pin_limit_ : 0; }
     uint64_t resident_bytes() const { return complement_bytes_; }
+    /// fork, STRATA_KEEP_WARM_S: read one byte of every 4 KiB page of the RAM tier, so an idle server's tier stays in
+    /// its working set (no lock: the OS may still trim it under pressure).  Read only; returns the bytes walked.
+    uint64_t touch_resident() const {
+        if (!complement_ready_ || complement_host_ == nullptr) return 0;
+        const volatile uint8_t* p = complement_host_;
+        uint8_t acc = 0;
+        for (uint64_t off = 0; off < complement_bytes_; off += 4096) acc ^= p[off];
+        keep_warm_sink_ = acc;
+        return complement_bytes_;
+    }
     bool complement_pinned() const { return complement_pinned_; }
     bool complement_ready() const { return complement_ready_; }
     uint64_t locked_bytes() const { return complement_locked_; }
@@ -1336,6 +1346,7 @@ private:
     std::vector<uint64_t> layer_offsets_, layer_blob_bytes_;
     void* complement_arena_ = nullptr;
     const uint8_t* complement_host_ = nullptr;
+    mutable volatile uint8_t keep_warm_sink_ = 0;
     const uint8_t* complement_device_ = nullptr;
     uint64_t complement_bytes_ = 0;
     std::vector<uint64_t> complement_offsets_;

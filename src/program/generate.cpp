@@ -4552,6 +4552,12 @@ int main(int argc, char** argv) {
                 strata::GgufFile pg(o.ple_gguf);
                 if (const strata::MetaValue* v = pg.get("general.architecture")) ple_only = v->s == "strata-ple";
             } catch (const std::exception&) {}
+            // an outside table (another quant's PLE shard, e.g. a Q8_0 n-gram table) when the model's own shards already
+            // hold one: its projections are the model's, so the file is read as the table only
+            if (!ple_only && std::find(o.native_shards.begin(), o.native_shards.end(), o.ple_gguf) == o.native_shards.end()) {
+                try { ple_only = strata::GgufModel(o.native_shards).find("per_layer_token_embd.weight") != nullptr; }
+                catch (const std::exception&) {}
+            }
             if (!ple_only &&
                 std::find(o.native_dense_gguf.begin(), o.native_dense_gguf.end(), o.ple_gguf) == o.native_dense_gguf.end())
                 o.native_dense_gguf.push_back(o.ple_gguf);
@@ -13970,9 +13976,24 @@ int main(int argc, char** argv) {
             st->eof = true;
             st->cv.notify_one();
         }).detach();
+        // fork, STRATA_KEEP_WARM_S=N (opt-in, 0 = off): while the engine waits for a request, every N s walk the RAM tier's
+        // pages (touch_resident) so Windows' trim of an idle process doesn't make the next request fault the tier back in.
+        static const int keep_warm_s = [] { const char* v = std::getenv("STRATA_KEEP_WARM_S"); return v ? std::max(0, std::atoi(v)) : 0; }();
         auto next_line = [&](std::string& out) -> bool {
             std::unique_lock<std::mutex> lk(in_mu);
-            in_cv.wait(lk, [&] { return !in_lines.empty() || in_eof; });
+            if (keep_warm_s > 0) {
+                while (!in_cv.wait_for(lk, std::chrono::seconds(keep_warm_s), [&] { return !in_lines.empty() || in_eof; })) {
+                    lk.unlock();
+                    const auto t_w = Clock::now();
+                    const uint64_t b = src.touch_resident();
+                    const double ms = std::chrono::duration<double, std::milli>(Clock::now() - t_w).count();
+                    if (ms >= 200.0)
+                        std::fprintf(stderr, "strata serve: keep warm: %.2f GiB walked in %.0f ms (pages came back)\n",
+                                     (double) b / 1073741824.0, ms);
+                    lk.lock();
+                }
+            } else
+                in_cv.wait(lk, [&] { return !in_lines.empty() || in_eof; });
             if (in_lines.empty()) return false;
             out = std::move(in_lines.front());
             in_lines.pop_front();
