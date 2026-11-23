@@ -177,6 +177,10 @@ in host memory; the packed Q8_0 decode copy is off. `STRATA_Q36_BLOB_CACHE=0`, `
 - `STRATA_Q36_ATT_Q8G=1`: decode attention over the 8-bit cache reading each cell once for the 8 query heads that
   share it, from 16K cells of context (`STRATA_Q36_ATT_Q8G_MIN`, 64 chunks of 256); `STRATA_Q36_ATT_TR=1`: its 8 head
   scores by a transposing butterfly.
+- `STRATA_Q36_ATT_Q8M=1`: `ATT_Q8G`'s attention with one block per chunk, KV head and pair of query rows, so an MTP
+  verify step (2 rows) reads each cell's K and V once; each (row, head) does `ATT_Q8G`'s arithmetic in its order, the
+  same bits (`=2` runs both kernels outside graphs and prints how many values differ). RTX 4060 Laptop 8 GB, `--mtp 1`,
+  server decode: 25K 41.5 → 44.4, 40K 38.3 → 42.5, 60K 32.6 → 37.6 tok/s.
 - `STRATA_Q36_Q8ST=1`: the dense Q8_0 matrix-vector products read each row as aligned 16-byte words through shared
   memory (375 → ~435 GB/s on the large matrices; `STRATA_Q36_Q8ST_BLOCKS`, default 1024).
 - `STRATA_Q36_GEMV_ILP=1`: the router's matrix-vector product with its loads issued ahead.

@@ -950,6 +950,207 @@ __global__ void __launch_bounds__(256) k_attn_part_q8g(const float* q, const int
         }
     }
 }
+/// STRATA_Q36_ATT_Q8M=1: k_attn_part_q8g<true> for NR query rows a block (grid (chunks, HKV, row groups of NR)): a cell's
+/// K and V are read once for the rows (an MTP verify step has 2), the 8 heads' scores by the transposing butterfly (as
+/// ATT_TR), and the probabilities kept cell-major so a V step loads a row's 8 with two float4 broadcasts instead of 8
+/// loads. The old kernel was bound by those shared-memory loads and the shuffles, not by DRAM. Each (row, head) does
+/// k_attn_part_q8g's arithmetic in its order: the same bits.
+template <int NR>
+__global__ void __launch_bounds__(256, NR == 1 ? 4 : 3) k_attn_part_q8m(const float* q, const int8_t* kc, const int8_t* vc, const int32_t* pos0,
+                                                       int t0, int nt, int H, int HKV, int ctx, float scale, int n_chunk,
+                                                       float* pacc, float* pm, float* pl, RowSel rs, int qb, KvTab kt, int c_base) {
+    constexpr int HD = 256, G = 8, NH = NR * G;
+    __shared__ __align__(16) float sc[kChunkCells][NH];
+    __shared__ float red[NH][kThreads];
+    const int c = blockIdx.x + c_base, kvh = blockIdx.y, r0 = blockIdx.z * NR;
+    int p0 = c * kChunkCells;
+    int nrow[NR], nmax = 0;
+#pragma unroll
+    for (int r = 0; r < NR; ++r) {
+        const int t = t0 + r0 + r;
+        nrow[r] = 0;
+        if (r0 + r < nt) {
+            const int npos = (rs.cell ? rs.cell[t] : *pos0 + t) + 1;
+            nrow[r] = max(0, min(kChunkCells, npos - p0));
+        }
+        nmax = max(nmax, nrow[r]);
+    }
+    if (nmax == 0) return;
+    const int nb = HD / qb;
+    if (kt.k) {
+        const int seg = 1 << kt.shift;
+        kc = kt.k[p0 >> kt.shift];
+        vc = kt.v[p0 >> kt.shift];
+        ctx = seg;
+        p0 &= seg - 1;
+    }
+    const __half* ks = (const __half*) (kc + (size_t) HKV * ctx * HD);
+    const __half* vs = (const __half*) (vc + (size_t) HKV * ctx * HD);
+    const int j = threadIdx.x;
+    {
+        const int lane = j & 31, grp = j >> 5, n_grp = kChunkCells / 32;
+        const int kb = lane * 8 / qb;
+        int q0[NH], q1[NH];
+        float dq[NH];
+#pragma unroll
+        for (int h = 0; h < NH; ++h) {
+            const int t = t0 + r0 + h / G;
+            float qv[8];
+            q0[h] = 0; q1[h] = 0; dq[h] = 1.f;
+            if (r0 + h / G >= nt) continue;
+            {
+                const float4* qp = (const float4*) (q + ((size_t) t * H + kvh * G + h % G) * HD + lane * 8);
+                const float4 x = qp[0], y = qp[1];
+                qv[0] = x.x; qv[1] = x.y; qv[2] = x.z; qv[3] = x.w; qv[4] = y.x; qv[5] = y.y; qv[6] = y.z; qv[7] = y.w;
+            }
+            float amax = 0.f;
+            for (int i = 0; i < 8; ++i) amax = fmaxf(amax, fabsf(qv[i]));
+            amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 1, 32));
+            amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 2, 32));
+            dq[h] = amax / 127.f;
+            const float id = dq[h] != 0.f ? 1.f / dq[h] : 0.f;
+            for (int i = 0; i < 4; ++i) {
+                q0[h] |= ((int) (uint8_t) (int8_t) roundf(qv[i] * id)) << (8 * i);
+                q1[h] |= ((int) (uint8_t) (int8_t) roundf(qv[4 + i] * id)) << (8 * i);
+            }
+        }
+        const int b16 = (lane >> 4) & 1, b8 = (lane >> 3) & 1, b4 = (lane >> 2) & 1, hd = 4 * b16 + 2 * b8 + b4;
+        constexpr int KU = 4;   // a warp's next KU cells loaded before they are scored (the loads overlap)
+        for (int cb = grp; cb < nmax; cb += KU * n_grp) {
+        int2 kqs[KU];
+        float dks[KU];
+#pragma unroll
+        for (int u = 0; u < KU; ++u) {
+            const int cc = min(cb + u * n_grp, nmax - 1);   // (past the end: a valid cell, its score unused)
+            const size_t cell = (size_t) kvh * ctx + p0 + cc;
+            kqs[u] = *(const int2*) (kc + cell * HD + lane * 8);
+            dks[u] = __half2float(ks[cell * nb + kb]);
+        }
+#pragma unroll
+        for (int u = 0; u < KU; ++u) {
+            const int cc = cb + u * n_grp;
+            if (cc >= nmax) continue;
+            const int2 kq = kqs[u];
+            const float dk = dks[u];
+#pragma unroll
+            for (int r = 0; r < NR; ++r) {
+                if (cc >= nrow[r]) continue;
+                float a8[G];
+#pragma unroll
+                for (int g = 0; g < G; ++g)
+                    a8[g] = (float) __dp4a(kq.y, q1[r * G + g], __dp4a(kq.x, q0[r * G + g], 0)) * dq[r * G + g] * dk;
+                float a4[4];
+#pragma unroll
+                for (int i = 0; i < 4; ++i) {
+                    const float send = b16 ? a8[i] : a8[4 + i], keep = b16 ? a8[4 + i] : a8[i];
+                    a4[i] = keep + __shfl_xor_sync(0xffffffffu, send, 16, 32);
+                }
+                float a2[2];
+#pragma unroll
+                for (int i = 0; i < 2; ++i) {
+                    const float send = b8 ? a4[i] : a4[2 + i], keep = b8 ? a4[2 + i] : a4[i];
+                    a2[i] = keep + __shfl_xor_sync(0xffffffffu, send, 8, 32);
+                }
+                float a1;
+                {
+                    const float send = b4 ? a2[0] : a2[1], keep = b4 ? a2[1] : a2[0];
+                    a1 = keep + __shfl_xor_sync(0xffffffffu, send, 4, 32);
+                }
+                a1 += __shfl_xor_sync(0xffffffffu, a1, 2, 32);
+                a1 += __shfl_xor_sync(0xffffffffu, a1, 1, 32);
+                if ((lane & 3) == 0) sc[cc][r * G + hd] = a1 * scale;
+            }
+        }
+        }
+        __syncthreads();
+    }
+    // the (row, head)s' softmaxes together: the max by shuffles (exact in any order), the sum on block_sum's tree (pairs
+    // i, i + s for s = 128 .. 1: shared memory down to 32, then shfl_down in warp 0), 4 barriers instead of 20 a head
+    float mg[NH], lg[NH], e_[NH];
+    {
+        const int lane = j & 31, w = j >> 5;
+#pragma unroll
+        for (int h = 0; h < NH; ++h) {
+            float m = j < nrow[h / G] ? sc[j][h] : -INFINITY;
+            e_[h] = m;
+            for (int o = 16; o > 0; o >>= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, o, 32));
+            if (lane == 0) red[h][w] = m;
+        }
+        __syncthreads();
+#pragma unroll
+        for (int h = 0; h < NH; ++h) {
+            float m = red[h][0];
+            for (int i = 1; i < kThreads / 32; ++i) m = fmaxf(m, red[h][i]);
+            mg[h] = m;
+        }
+        __syncthreads();
+#pragma unroll
+        for (int h = 0; h < NH; ++h) {
+            const float e = j < nrow[h / G] ? expf(e_[h] - mg[h]) : 0.f;
+            sc[j][h] = e;
+            red[h][j] = e;
+        }
+        __syncthreads();
+        for (int s = kThreads / 2; s >= 32; s >>= 1) {
+            if (j < s)
+#pragma unroll
+                for (int h = 0; h < NH; ++h) red[h][j] += red[h][j + s];
+            __syncthreads();
+        }
+        if (w == 0)
+#pragma unroll
+            for (int h = 0; h < NH; ++h) {
+                float v = red[h][lane];
+                for (int s = 16; s > 0; s >>= 1) v += __shfl_down_sync(0xffffffffu, v, s, 32);
+                lg[h] = v;
+            }
+    }
+    float acc[NH];
+#pragma unroll
+    for (int h = 0; h < NH; ++h) acc[h] = 0.f;
+    const size_t cell0 = (size_t) kvh * ctx + p0;
+    const int8_t* vp = vc + cell0 * HD + j;
+    const __half* vsp = vs + cell0 * nb + j / qb;
+    constexpr int VU = 8;   // V rows loaded VU at a time, then accumulated in cell order
+    for (int kb0 = 0; kb0 < nmax; kb0 += VU) {
+    float svs[VU], vvs[VU];
+#pragma unroll
+    for (int u = 0; u < VU; ++u) {
+        const int k = min(kb0 + u, nmax - 1);
+        svs[u] = __half2float(vsp[(size_t) k * nb]);
+        vvs[u] = (float) vp[(size_t) k * HD];
+    }
+#pragma unroll
+    for (int u = 0; u < VU; ++u) {
+        const int k = kb0 + u;
+        if (k >= nmax) continue;
+        const float sv = svs[u], vv = vvs[u];
+#pragma unroll
+        for (int r = 0; r < NR; ++r) {
+            if (k >= nrow[r]) continue;
+            const float4 a = *(const float4*) &sc[k][r * G], b = *(const float4*) &sc[k][r * G + 4];
+            acc[r * G + 0] += a.x * sv * vv;
+            acc[r * G + 1] += a.y * sv * vv;
+            acc[r * G + 2] += a.z * sv * vv;
+            acc[r * G + 3] += a.w * sv * vv;
+            acc[r * G + 4] += b.x * sv * vv;
+            acc[r * G + 5] += b.y * sv * vv;
+            acc[r * G + 6] += b.z * sv * vv;
+            acc[r * G + 7] += b.w * sv * vv;
+        }
+    }
+    }
+#pragma unroll
+    for (int h = 0; h < NH; ++h) {
+        if (nrow[h / G] == 0) continue;
+        const size_t o = ((size_t) (r0 + h / G) * H + kvh * G + h % G) * n_chunk + c;
+        pacc[o * HD + j] = acc[h];
+        if (j == 0) {
+            pm[o] = mg[h];
+            pl[o] = lg[h];
+        }
+    }
+}
 /// STRATA_Q36_ATT_GQA=1 (opt-in): k_attn_part_q8<true> with one block per (chunk, KV head) instead of per (chunk,
 /// query row). The query heads sharing a KV head (8) times the rows (verify windows: 3) re-read the same K / V in the
 /// old grid; here each cell is read once: its K row stays in registers (thread = cell) and is scored against all the
@@ -6507,6 +6708,41 @@ struct Engine {
                             static const int q8g_min = [] { const char* v = std::getenv("STRATA_Q36_ATT_Q8G_MIN"); return v ? std::atoi(v) : 64; }();
                             if (q8g && kv_dot8() && H == 8 * HKV && c1 - c0 >= q8g_min) {   // R6: a block per (chunk, KV head), the same bits
                                 static const bool tr = [] { const char* v = std::getenv("STRATA_Q36_ATT_TR"); return v && v[0] == '1'; }();
+                                static const int q8m = [] { const char* v = std::getenv("STRATA_Q36_ATT_Q8M"); return v ? std::atoi(v) : 0; }();
+                                if (q8m && rs.kc == nullptr) {   // the multi-row kernel (the same bits; 2: checked against the old one)
+                                    const bool chk = q8m == 2 && !graph_mode;
+                                    std::vector<float> a, b;
+                                    const size_t na = (size_t) nt * H * n_chunk;
+                                    for (int pass = 0; pass < (chk ? 2 : 1); ++pass) {
+                                        if (pass == 0 && nt == 1)
+                                            k_attn_part_q8m<1><<<dim3(c1 - c0, HKV, 1), kChunkCells, 0, st>>>(q, kq, vq, dpos, t0, nt, H,
+                                                HKV, ctx, 1.0f / sqrtf((float) HD), n_chunk, pacc, pm, pl, rs, kv_qb(), tb, c0);
+                                        else if (pass == 0)
+                                            k_attn_part_q8m<2><<<dim3(c1 - c0, HKV, (nt + 1) / 2), kChunkCells, 0, st>>>(q, kq, vq, dpos, t0,
+                                                nt, H, HKV, ctx, 1.0f / sqrtf((float) HD), n_chunk, pacc, pm, pl, rs, kv_qb(), tb, c0);
+                                        else
+                                            k_attn_part_q8g<true><<<dim3(c1 - c0, nt * HKV), kChunkCells, 0, st>>>(q, kq, vq, dpos, t0, H,
+                                                HKV, ctx, 1.0f / sqrtf((float) HD), n_chunk, pacc, pm, pl, rs, kv_qb(), tb, c0);
+                                        if (!chk) break;
+                                        std::vector<float>& d = pass == 0 ? a : b;
+                                        d.resize(na * HD + 2 * na);
+                                        cudaStreamSynchronize(st);
+                                        cudaMemcpy(d.data(), pacc, na * HD * 4, cudaMemcpyDeviceToHost);
+                                        cudaMemcpy(d.data() + na * HD, pm, na * 4, cudaMemcpyDeviceToHost);
+                                        cudaMemcpy(d.data() + na * HD + na, pl, na * 4, cudaMemcpyDeviceToHost);
+                                    }
+                                    if (chk) {
+                                        static long long n_cmp = 0, n_bad = 0;
+                                        static int calls = 0;
+                                        for (size_t i = 0; i < a.size(); ++i) n_bad += std::memcmp(&a[i], &b[i], 4) != 0;
+                                        n_cmp += (long long) a.size();
+                                        static int seen = 0;
+                                        if (++calls % 200 == 0 || n_bad || !(seen & (1 << std::min(nt, 30))))
+                                            std::fprintf(stderr, "strata-q36 q8m check: nt %d chunks %d: %lld of %lld differ\n", nt, c1 - c0, n_bad, n_cmp);
+                                        seen |= 1 << std::min(nt, 30);
+                                    }
+                                    return;
+                                }
                                 if (tr)   // D-2 SD6: the transposing butterfly for the 8 heads' scores (the same bits)
                                     k_attn_part_q8g<true, true><<<dim3(c1 - c0, nt * HKV), kChunkCells, 0, st>>>(q, kq, vq, dpos, t0, H,
                                         HKV, ctx, 1.0f / sqrtf((float) HD), n_chunk, pacc, pm, pl, rs, kv_qb(), tb, c0);
