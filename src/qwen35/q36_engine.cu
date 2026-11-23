@@ -34,6 +34,9 @@
 #endif
 
 #include <cublas_v2.h>
+#if defined(_M_X64) || defined(__x86_64__)
+#include <immintrin.h>
+#endif
 #if !defined(STRATA_USE_HIP)
 #include <algorithm>
 #include "q36_gdn_tc.cuh"
@@ -3251,6 +3254,7 @@ struct Layer {
     // MoE
     const float* router = nullptr;   // [n_expert][N] f32
     float* router_ext = nullptr;     // the same with the shared expert's gate row appended: [n_expert + 1][N]
+    std::vector<uint16_t> router_h16;   // STRATA_Q36_HO_PRED: an f16 host copy of router, for the expert prediction only
     Mat sh_gate, sh_up, sh_down;
     const float* sh_gate_inp = nullptr;   // [N]
     K::NativeExpertLayout L;
@@ -3471,6 +3475,15 @@ bool load(const std::string& path, Model& m, std::string& err, bool want_mtp) {
         CK(cudaMemcpy(y.router_ext + (size_t) g.n_expert * g.n_embd, y.sh_gate_inp, (size_t) g.n_embd * 4,
                       cudaMemcpyDeviceToDevice));
         bytes += (size_t) (g.n_expert + 1) * g.n_embd * 4;
+#if (defined(_M_X64) || defined(__x86_64__)) && (defined(_MSC_VER) || defined(__F16C__))
+        if (std::getenv("STRATA_Q36_HO_PRED")) {   // the prediction's copy (f16: half the bytes it reads a layer)
+            std::vector<float> f((size_t) g.n_expert * g.n_embd);
+            CK(cudaMemcpy(f.data(), y.router, f.size() * 4, cudaMemcpyDeviceToHost));
+            y.router_h16.resize(f.size());
+            for (size_t i = 0; i < f.size(); i += 8)
+                _mm_storeu_si128((__m128i*) (y.router_h16.data() + i), _mm256_cvtps_ph(_mm256_loadu_ps(f.data() + i), 0));
+        }
+#endif
         // the routed experts: [gate | up | down] per expert, the native expert layout
         size_t sg = 0, su = 0, sd = 0;
         const strata::TensorInfo* tg = find(L(l, "ffn_gate_exps.weight"), sg);
@@ -7466,6 +7479,67 @@ struct Engine {
         ho_pending.erase(ho_pending.begin(), ho_pending.begin() + (long) n_run);
 #endif
     }
+    /// STRATA_Q36_HO_PRED=P (opt-in, x86): while the GPU runs layer li + 1's attention / delta net, the pool reads into its
+    /// caches the CPU experts that layer will likely route to: the top P of its router (an f16 copy) applied to layer li's
+    /// MoE input, per row (rows <= 2), gate/up parts first, then the downs; stopped when li + 1's routing arrives. Only
+    /// what is in the caches changes, never a value: the real routing and the experts' arithmetic are untouched.
+    std::vector<std::pair<const uint8_t*, size_t>> pr_ranges;
+    double pr_ms = 0;
+    long long pr_calls = 0, pr_exp = 0;
+    void ho_predict(const HoJob& j) {
+#if (defined(_M_X64) || defined(__x86_64__)) && (defined(_MSC_VER) || defined(__F16C__))
+        static const int P = [] { const char* v = std::getenv("STRATA_Q36_HO_PRED"); return v ? std::min(64, std::atoi(v)) : 0; }();
+        const size_t nx = (size_t) j.li + 1;
+        if (P <= 0 || j.T > 2 || nx >= m->layers.size() || nx >= hy.size() || (ho_ns > 0 && nx >= ho_ns)) return;
+        const Layer& L = layer_at((int) nx);
+        if (L.router_h16.empty()) return;
+        const volatile unsigned* rf = (const volatile unsigned*) (ho_rflag_h + nx);
+        const unsigned r0 = *rf;
+        if (r0 == j.seq || r0 == j.seq + 1) return;   // (its routing is in already)
+        const auto t0 = Clock::now();
+        const int N = (int) m->g.n_embd, E = (int) m->g.n_expert, Kp = (int) m->top_k;
+        const float* h = ho_h[(size_t) j.li];
+        std::vector<float> lg((size_t) j.T * E);
+        for (int x = 0; x < E; ++x) {
+            const uint16_t* w = L.router_h16.data() + (size_t) x * N;
+            __m256 a0 = _mm256_setzero_ps(), a1 = _mm256_setzero_ps();
+            for (int i = 0; i < N; i += 8) {
+                const __m256 wv = _mm256_cvtph_ps(_mm_loadu_si128((const __m128i*) (w + i)));
+                a0 = _mm256_fmadd_ps(wv, _mm256_loadu_ps(h + i), a0);
+                if (j.T == 2) a1 = _mm256_fmadd_ps(wv, _mm256_loadu_ps(h + N + i), a1);
+            }
+            for (int t = 0; t < j.T; ++t) {
+                const __m256 a = t ? a1 : a0;
+                __m128 v = _mm_add_ps(_mm256_castps256_ps128(a), _mm256_extractf128_ps(a, 1));
+                v = _mm_add_ps(v, _mm_movehl_ps(v, v));
+                v = _mm_add_ss(v, _mm_shuffle_ps(v, v, 1));
+                lg[(size_t) t * E + x] = _mm_cvtss_f32(v);
+            }
+        }
+        Hy& H = hy[nx];
+        std::vector<int> pick;
+        std::vector<int> ord((size_t) E);
+        for (int t = 0; t < j.T; ++t) {
+            for (int x = 0; x < E; ++x) ord[(size_t) x] = x;
+            const float* l = lg.data() + (size_t) t * E;
+            std::partial_sort(ord.begin(), ord.begin() + P, ord.end(), [&](int a, int b) { return l[a] > l[b]; });
+            for (int k = 0; k < P; ++k) {
+                const int x = ord[(size_t) k];
+                if (H.slot_of[(size_t) x] < 0 && std::find(pick.begin(), pick.end(), x) == pick.end()) pick.push_back(x);
+            }
+        }
+        (void) Kp;
+        pr_ranges.clear();
+        for (const int x : pick) pr_ranges.push_back({hptr(nx, L, x), H.fmt.down_off});
+        for (const int x : pick) pr_ranges.push_back({hptr(nx, L, x) + H.fmt.down_off, H.fmt.bytes - H.fmt.down_off});
+        if (*rf == r0) pool->prefetch_ranges(pr_ranges.data(), (int) pr_ranges.size(), rf, r0);
+        pr_ms += ms_since(t0);
+        ++pr_calls;
+        pr_exp += (long long) pick.size();
+#else
+        (void) j;
+#endif
+    }
     /// One pending layer: wait for its routing in mapped memory, its CPU experts, then its flag.
     void ho_one(const HoJob& j) {
 #if defined(STRATA_Q36_CPU_POOL)
@@ -7487,6 +7561,7 @@ struct Engine {
                  ho_miss_h + slot, later);
         std::atomic_thread_fence(std::memory_order_seq_cst);
         *(volatile unsigned*) (ho_flag_h + j.li) = j.seq;
+        if (!later) ho_predict(j);
 #else
         (void) j;
 #endif
@@ -10689,6 +10764,10 @@ int strata::qwen35::run(int argc, char** argv) {
                          "of it %.0f ms waiting for the GPU's routing; %lld decode rebalances in %.0f ms (%.0f ms waiting for async copies)\n", E.fwd_small_n,
                          E.fwd_small_ms, E.fwd_small_n ? E.fwd_small_ms / E.fwd_small_n : 0.0, E.hy_wait_ms, E.rebal_n, E.rebal_ms,
                          E.ra_wait_ms);
+            if (E.pr_calls)
+                std::fprintf(stderr, "strata-q36: HO_PRED: %lld predictions, %.1f CPU experts each, %.3f ms each; prefetch %lld of %lld "
+                             "chunks skipped (routing came first)\n", E.pr_calls, (double) E.pr_exp / E.pr_calls, E.pr_ms / E.pr_calls,
+                             (long long) E.pool->pf_skipped, (long long) E.pool->pf_tasks);
         }
     } report{E};
     E.reset();

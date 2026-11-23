@@ -250,6 +250,10 @@ public:
     void run_split_multi_native(const NativeFmt& f, ExpertJobMulti* jobs, int n,
                                 NativeArithmetic arithmetic = NativeArithmetic::Default);
     static constexpr int kMaxSplitMulti = 96;
+    /// STRATA_Q36_HO_PRED: the n byte ranges read into the caches by all threads (64 KB tasks, mode 8), the tasks left
+    /// skipped once *cancel != cancel_val (the next layer's routing arrived). Changes no output.
+    void prefetch_ranges(const std::pair<const uint8_t*, size_t>* r, int n, const volatile unsigned* cancel, unsigned cancel_val);
+    int64_t pf_tasks = 0, pf_skipped = 0;
     /// run_split_multi's phases, accumulated ms: gate/up rows, the intermediate quantization, down rows.
     double ms_multi_gu = 0, ms_multi_q = 0, ms_multi_down = 0;
     int64_t multi_bytes = 0;
@@ -358,6 +362,11 @@ private:
     std::vector<ExpertScratch> scratch_;   // one per worker: no allocation, no false sharing of the hot data
     // run_split state: mode 0 = whole experts, 1 = gate/up row parts, 2 = down row parts
     int mode_ = 0;
+    std::vector<std::pair<const uint8_t*, size_t>> pf_chunks_;   // mode 8's tasks
+    const volatile unsigned* pf_cancel_ = nullptr;
+    unsigned pf_cancel_val_ = 0;
+    std::atomic<int64_t> pf_skip_{0};
+    std::atomic<uint64_t> pf_sink_{0};
     int parts_a_ = 1, parts_b_ = 1;
     struct SplitBuf {
         alignas(64) float ff[FF];

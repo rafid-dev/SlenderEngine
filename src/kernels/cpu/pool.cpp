@@ -1187,8 +1187,19 @@ void ExpertPool::drain(int id, ExpertScratch& scratch, uint32_t epoch) {
         const uint32_t i = (uint32_t) ci;
         if (id >= 0) wstate_[(size_t) id].store(ci, std::memory_order_relaxed);
         else { hstate_.store(ci, std::memory_order_relaxed); hstate_ms_.store(now_ms(), std::memory_order_relaxed); }
-        const int64_t pt0 = pt_on_ && mode_ >= 5 ? now_ns() : 0;
-        if (mode_ == 0) {
+        const int64_t pt0 = pt_on_ && mode_ >= 5 && mode_ != 8 ? now_ns() : 0;
+        if (mode_ == 8) {   // STRATA_Q36_HO_PRED: a chunk read into the caches, unless the next layer's routing is in
+            if (*pf_cancel_ != pf_cancel_val_) {
+                pf_skip_.fetch_add(1, std::memory_order_relaxed);
+            } else {
+                const auto& [p, n] = pf_chunks_[i];
+                {   // loads, not prefetch hints: a hint may be dropped when the miss buffers are full (hints measured -10%)
+                    uint64_t acc = 0;
+                    for (size_t o = 0; o < n; o += 64) acc += *(const volatile uint8_t*) (p + o);   // one byte a line, never past n
+                    pf_sink_.fetch_add(acc, std::memory_order_relaxed);
+                }
+            }
+        } else if (mode_ == 0) {
             const ExpertJob& j = jobs_[i];
             s2_expert_vnni_q(j.blob, *j.act, j.out, scratch);
         } else if (mode_ == 1) {
@@ -1322,8 +1333,24 @@ void ExpertPool::wait_h_ready(int e, uint32_t epoch) {
     }
 }
 
+void ExpertPool::prefetch_ranges(const std::pair<const uint8_t*, size_t>* r, int n, const volatile unsigned* cancel,
+                                 unsigned cancel_val) {
+    constexpr size_t kChunk = 64 << 10;
+    pf_chunks_.clear();
+    for (int k = 0; k < n; ++k)
+        for (size_t o = 0; o < r[k].second; o += kChunk) pf_chunks_.push_back({r[k].first + o, (std::min)(kChunk, r[k].second - o)});
+    if (pf_chunks_.empty() || n_ == 1 || numa_n_ > 0) return;   // (a NUMA split's slices are for modes 5-7 only)
+    pf_cancel_ = cancel;
+    pf_cancel_val_ = cancel_val;
+    pf_skip_.store(0, std::memory_order_relaxed);
+    run_phase(8, (int) pf_chunks_.size());
+    mode_ = 0;
+    pf_tasks += (int64_t) pf_chunks_.size();
+    pf_skipped += pf_skip_.load(std::memory_order_relaxed);
+}
+
 void ExpertPool::run_phase(int mode, int n_tasks) {
-    const bool pt = pt_on_ && mode >= 5;
+    const bool pt = pt_on_ && mode >= 5 && mode != 8;
     const int64_t p0 = pt ? now_ns() : 0;
     wait_parked("before a phase");
     const int64_t p1 = pt ? now_ns() : 0;
